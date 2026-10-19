@@ -20,9 +20,36 @@ use crate::error::Error;
 const MAX_MESSAGE_SIZE: u64 = 5_000_000;
 
 /// Read one framed message. Consumes exactly the frame: no bytes beyond it.
+///
+/// The 24-byte envelope is read here rather than by `RawNetworkMessage` so a
+/// frame we cannot (and need not) decode — in practice the deprecated `alert`,
+/// which `bitcoin` models as a length-prefixed vector while the wire carries the
+/// raw `CAlert` — can be skipped without desynchronising the stream.
 pub fn read_message<R: Read>(reader: &mut R) -> Result<RawNetworkMessage, Error> {
-    let mut framed = reader.take(MAX_MESSAGE_SIZE);
-    Ok(RawNetworkMessage::consensus_decode(&mut framed)?)
+    loop {
+        let mut header = [0u8; 24];
+        reader.read_exact(&mut header)?;
+
+        let len = u32::from_le_bytes(header[16..20].try_into().expect("4-byte length")) as u64;
+        if len > MAX_MESSAGE_SIZE {
+            return Err(Error::Protocol(format!(
+                "message payload of {len} bytes is over the {MAX_MESSAGE_SIZE}-byte cap"
+            )));
+        }
+
+        let mut frame = vec![0u8; 24 + len as usize];
+        frame[..24].copy_from_slice(&header);
+        reader.read_exact(&mut frame[24..])?;
+
+        // Bitcoin removed `alert` in 0.16; nobody needs it. `bitcoin` would
+        // decode its payload as `Vec<u8>` (a length-prefixed vector), which is
+        // not the wire format, so decoding fails with "extra bytes". Skip it.
+        if &frame[4..9] == b"alert" {
+            continue;
+        }
+
+        return Ok(RawNetworkMessage::consensus_decode(&mut frame.as_slice())?);
+    }
 }
 
 /// Read one framed message and reject it if it is not for `magic`.
@@ -133,6 +160,41 @@ mod tests {
             .expect("vec is infallible");
         let err = read_message_for(&mut bytes.as_slice(), MAGIC).unwrap_err();
         assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+        Ok(())
+    }
+
+    /// Build one frame around an arbitrary payload, with a valid checksum.
+    fn raw_frame(command: &str, payload: &[u8]) -> Vec<u8> {
+        use bitcoin::hashes::sha256d;
+        let mut out = Vec::new();
+        out.extend_from_slice(&MAGIC.to_bytes());
+        let mut cmd = [0u8; 12];
+        cmd[..command.len()].copy_from_slice(command.as_bytes());
+        out.extend_from_slice(&cmd);
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        let checksum = sha256d::Hash::hash(payload).to_byte_array();
+        out.extend_from_slice(&checksum[..4]);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// Peers still send the deprecated final `alert` right after `verack`. Its
+    /// payload is the raw `CAlert` (here starting with `0x60`, a varint 96),
+    /// which `bitcoin` would try to read as a length-prefixed `Vec<u8>` and
+    /// reject with "extra bytes". The codec must skip the frame and keep the
+    /// stream in sync.
+    #[test]
+    fn skips_a_deprecated_alert_frame() -> Result<(), Error> {
+        let mut payload = vec![0x60u8];
+        payload.resize(168, 0);
+        let mut bytes = raw_frame("alert", &payload);
+
+        let ping = RawNetworkMessage::new(MAGIC, NetworkMessage::Ping(7));
+        ping.consensus_encode(&mut bytes)
+            .expect("vec is infallible");
+
+        let decoded = read_message(&mut bytes.as_slice())?;
+        assert_eq!(decoded, ping, "the alert must be skipped, not surfaced");
         Ok(())
     }
 }
