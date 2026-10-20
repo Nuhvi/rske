@@ -2,7 +2,7 @@
 name = "rsk-cli"
 version = "0.1.0"
 edition = "2024"
-description = "Command line for the RSK One node: a thin wrapper over the `rsk` library"
+description = "Command line for the Rske node: a thin wrapper over the `rsk` library"
 
 [dependencies]
 anyhow = "1.0.104"

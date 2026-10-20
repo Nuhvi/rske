@@ -10,11 +10,11 @@ use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use bitcoin::block::{BlockHash, Header as BlockHeader};
+use bitcoin::block::{Block, BlockHash, Header as BlockHeader};
 use bitcoin::p2p::address::Address;
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message::RawNetworkMessage;
-use bitcoin::p2p::message_blockdata::GetHeadersMessage;
+use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::{Magic, ServiceFlags};
 
@@ -175,6 +175,19 @@ impl<S: Read + Write> Session<S> {
         self.request_headers(locator, stop)?;
         self.read_headers()
     }
+
+    /// One `getdata` round trip for a whole block. Blocks are large; callers
+    /// that only want the coinbase still have to fetch the block, because the
+    /// wire has no message that serves a transaction out of it.
+    pub fn get_block(&mut self, hash: BlockHash) -> Result<Block, Error> {
+        self.send(NetworkMessage::GetData(vec![Inventory::Block(hash)]))?;
+        loop {
+            let msg = self.next_message()?;
+            if let NetworkMessage::Block(block) = msg.into_payload() {
+                return Ok(block);
+            }
+        }
+    }
 }
 
 fn now_unix() -> i64 {
@@ -252,7 +265,7 @@ mod tests {
             RawNetworkMessage::new(MAGIC, NetworkMessage::Verack),
         ]);
         let mut session = Session { stream: mock };
-        let handshake = session.handshake(receiver, sender, "/rsk-one:0.1.0/", 0)?;
+        let handshake = session.handshake(receiver, sender, "/rske:0.1.0/", 0)?;
 
         assert_eq!(handshake.user_agent, "/mock:1/");
         assert_eq!(handshake.version, their.version);
@@ -296,7 +309,7 @@ mod tests {
             .collect(),
         );
         let mut session = Session { stream: mock };
-        let handshake = session.handshake(receiver, sender, "/rsk-one:0.1.0/", 0)?;
+        let handshake = session.handshake(receiver, sender, "/rske:0.1.0/", 0)?;
         assert_eq!(handshake.user_agent, "/mock:70016/");
         Ok(())
     }
@@ -327,7 +340,7 @@ mod tests {
         let mock = MockPeer::scripted(vec![RawNetworkMessage::new(MAGIC, NetworkMessage::Verack)]);
         let mut session = Session { stream: mock };
         let err = session
-            .handshake(addr(8333), addr(40000), "/rsk-one:0.1.0/", 0)
+            .handshake(addr(8333), addr(40000), "/rske:0.1.0/", 0)
             .unwrap_err();
         assert!(
             matches!(

@@ -13,7 +13,7 @@ use crate::config::{Anchor, Config};
 use crate::peers;
 use crate::sync::{self, SyncReport};
 
-/// The RSK One node: a chain store plus the configuration it was opened with.
+/// The Rske node: a chain store plus the configuration it was opened with.
 ///
 /// Nothing runs in the background — call [`Node::sync`] to make progress. The
 /// store is durable, so a later [`Node::open`] resumes from the tip.

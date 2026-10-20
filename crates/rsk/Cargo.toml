@@ -2,7 +2,7 @@
 name = "rsk"
 version = "0.1.0"
 edition = "2024"
-description = "The RSK One node as a library: Bitcoin header sync and Rootstock peer access, embeddable in any app"
+description = "The Rske node as a library: Bitcoin header sync and Rootstock peer access, embeddable in any app"
 
 [dependencies]
 alloy-primitives = { version = "1.5.4", features = ["rlp"] }

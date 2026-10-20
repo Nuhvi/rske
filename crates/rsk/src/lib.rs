@@ -1,4 +1,4 @@
-//! # rsk — the RSK One node, as a library
+//! # rsk — the Rske node, as a library
 //!
 //! The node's I/O lives here, kept out of the side-effect-free [`rsk_core`]
 //! chain engine so any application can embed it: [`Node`] owns the chain store

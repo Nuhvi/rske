@@ -1,6 +1,6 @@
 //! # rsk-core — the side-effect-free core
 //!
-//! The deterministic heart of RSK One's fast-IBD plan: keep the Bitcoin
+//! The deterministic heart of Rske's fast-IBD plan: keep the Bitcoin
 //! canonical chain, finalize it at difficulty-period boundaries, and carry
 //! Rootstock header trees rooted at trusted anchors in the same store.
 //!

@@ -9,10 +9,10 @@ use bitcoin::Network;
 /// The default data directory, relative to the working directory (the repo
 /// gitignores `data/`). Product-scoped rather than bitcoin-scoped because the
 /// same store carries RSK chain state.
-pub const DEFAULT_DATA_DIR: &str = "data/rsk-one";
+pub const DEFAULT_DATA_DIR: &str = "data/rske";
 
 /// The BIP 14 user agent the node advertises on the wire.
-pub const USER_AGENT: &str = "/rsk-one:0.1.0/";
+pub const USER_AGENT: &str = "/rske:0.1.0/";
 
 /// How an empty store is anchored before the first sync, and the ceiling for
 /// adopting a newer shipped checkpoint when resuming an existing store.

@@ -1,4 +1,4 @@
-//! rsk-cli — run the RSK One node from the command line.
+//! rsk-cli — run the Rske node from the command line.
 //!
 //! A thin wrapper over the [`rsk`] library: each command parses arguments into
 //! a [`Config`] and calls one library entry point. All the I/O lives in the
@@ -25,7 +25,7 @@ use tracing::info;
 #[command(
     name = "rsk-cli",
     version,
-    about = "The RSK One node: talk to real peers and sync headers"
+    about = "The Rske node: talk to real peers and sync headers"
 )]
 struct Cli {
     #[command(subcommand)]
