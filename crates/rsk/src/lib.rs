@@ -14,10 +14,12 @@
 
 pub mod config;
 pub mod node;
+pub mod rootstock;
 
 mod peers;
 mod sync;
 
 pub use config::{Anchor, Config, DEFAULT_DATA_DIR, USER_AGENT};
 pub use node::Node;
+pub use rootstock::Chain;
 pub use sync::SyncReport;

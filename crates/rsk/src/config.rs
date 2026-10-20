@@ -14,7 +14,8 @@ pub const DEFAULT_DATA_DIR: &str = "data/rsk-one";
 /// The BIP 14 user agent the node advertises on the wire.
 pub const USER_AGENT: &str = "/rsk-one:0.1.0/";
 
-/// How an empty store is anchored before the first sync.
+/// How an empty store is anchored before the first sync, and the ceiling for
+/// adopting a newer shipped checkpoint when resuming an existing store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Anchor {
     /// Trust the embedded checkpoint spine (one header per difficulty period),

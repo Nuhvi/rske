@@ -55,7 +55,7 @@ pub enum Error {
     #[error("chain was seeded for {seeded}, not {opened}")]
     NetworkMismatch { seeded: Network, opened: Network },
 
-    #[error("fork at height {fork} is at or below the finalized checkpoint {finalized}")]
+    #[error("fork at height {fork} is at or below the finality mark {finalized}")]
     ForkBelowFinalized { fork: u64, finalized: u64 },
 
     #[error("rootstock: {0}")]

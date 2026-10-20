@@ -626,7 +626,10 @@ mod tests {
             "merged-mining hash prefix"
         );
         // The remaining 12 bytes are not hash at all: seven bytes of
-        // commit-to-parents vector, one uncle count, then the height.
+        // commit-to-parents vector (RSKIP110: the LSBs of the Bitcoin block
+        // IDs of the 7 nearest RSK grand-parents at heights that are multiples
+        // of 64), the number of uncles created in the last 32 blocks, then the
+        // height.
         assert_eq!(
             &committed[28..32],
             &9_257_552u32.to_be_bytes(),

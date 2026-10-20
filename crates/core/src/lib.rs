@@ -23,6 +23,7 @@ pub mod error;
 pub mod rsk;
 mod store;
 
+pub use btc::finality::{FinalityStatus, REVERSAL_BLOCKS, is_checkpoint};
 pub use btc::validation::MEDIAN_TIME_PAST;
 pub use btc::{ConnectOutcome, FINALITY_MARGIN_BLOCKS, header_work};
 pub use core::Core;

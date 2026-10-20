@@ -11,6 +11,7 @@ use std::sync::Arc;
 use bitcoin::Network;
 use rsk_consensus::config::ChainConfig;
 
+use crate::btc::finality;
 use crate::error::Error;
 use crate::rsk;
 use crate::store::Store;
@@ -25,25 +26,47 @@ pub struct Core {
     pub(crate) network: Network,
     /// Rootstock consensus parameters the RSK tree validates against.
     pub(crate) rsk_chain: Arc<ChainConfig>,
+    /// The finality policy: how much work the chain since the mark must carry.
+    pub(crate) bar: finality::Bar,
 }
 
 impl Core {
     /// Open a file-backed store for the given network.
+    ///
+    /// Mainnet uses the price-law estimated-work bar; other networks use the
+    /// linear reference rule, because the price law is a mainnet calibration.
     pub fn open(path: &Path, network: Network) -> Result<Self, Error> {
         Ok(Self {
             store: Store::open(path)?,
             network,
             rsk_chain: rsk::chain_config(network),
+            bar: bar_for(network),
         })
     }
 
     /// Open an in-memory store (tests, no disk I/O) for the given network.
     #[cfg(test)]
     pub fn in_memory(network: Network) -> Result<Self, Error> {
+        Self::in_memory_with_bar(network, bar_for(network))
+    }
+
+    /// Open an in-memory store with an explicit finality policy (tests).
+    #[cfg(test)]
+    pub fn in_memory_with_bar(network: Network, bar: finality::Bar) -> Result<Self, Error> {
         Ok(Self {
             store: Store::in_memory()?,
             network,
             rsk_chain: rsk::chain_config(network),
+            bar,
         })
+    }
+}
+
+/// The finality policy for a network. The price law is calibrated on Bitcoin
+/// mainnet; other networks fall back to the linear reference rule.
+fn bar_for(network: Network) -> finality::Bar {
+    match network {
+        Network::Bitcoin => finality::estimated_work_bar,
+        _ => finality::linear_reference_bar,
     }
 }

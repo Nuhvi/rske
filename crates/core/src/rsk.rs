@@ -89,7 +89,7 @@ impl Core {
         let Some(btc_tip) = self.tip_height()? else {
             return Err(Error::Unseeded);
         };
-        let btc_tail_start = self.finalized_height()?.unwrap_or(0);
+        let btc_tail_start = self.finalized_checkpoint()?.unwrap_or(0);
         let anchor = checkpoint::anchor_height(self, &entry.header)?.ok_or_else(|| {
             Error::Rootstock(format!(
                 "checkpoint #{}: anchor is not a canonical bitcoin block",
@@ -149,7 +149,7 @@ impl Core {
     /// The Bitcoin tail a checkpoint is measured against: `(tail_start, its
     /// work)`, or `None` while no tail work is stored yet.
     fn checkpoint_tail(&self) -> Result<Option<(u64, U256)>, Error> {
-        let Some(tail_start) = self.finalized_height()? else {
+        let Some(tail_start) = self.finalized_checkpoint()? else {
             return Ok(None);
         };
         let Some(work) = self.btc_tail_work(tail_start)? else {
@@ -417,7 +417,10 @@ mod tests {
             cur = mine(cur.block_hash(), 1_600_000_002 + i);
             run.push(cur);
         }
-        core.connect_headers(&run).unwrap();
+        // A clock 1,200,000 s (~2000 blocks) past the anchor: the bar asks for
+        // 2000 blocks of work, and the tail above the anchor carries 2016.
+        core.connect_headers(&run, 1_600_000_001 + 1_200_000)
+            .unwrap();
         core
     }
 
@@ -547,7 +550,7 @@ mod tests {
     #[test]
     fn connect_rsk_headers_reports_an_established_checkpoint() {
         let core = btc_with_tail();
-        assert_eq!(core.finalized_height().unwrap(), Some(2016));
+        assert_eq!(core.finalized_checkpoint().unwrap(), Some(2016));
 
         // A single, very heavy root clears 2/3 of the (easy-target) tail work.
         let f = put(&core, &entry(0, B256::ZERO, u64::MAX, 0));

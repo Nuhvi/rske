@@ -27,6 +27,8 @@ use redb::{Database, ReadTransaction, TypeName, Value, WriteTransaction};
 mod btc;
 mod rsk;
 
+pub(crate) use btc::BtcReads;
+
 use crate::error::Error;
 
 /// Bitcoin difficulty period, in blocks. Difficulty retargets only at period

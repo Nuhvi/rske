@@ -15,11 +15,167 @@ use bitcoin::block::BlockHash;
 use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::hashes::Hash as _;
 use bitcoin::pow::Work;
-use rsk_core::{Core, DIFFICULTY_PERIOD};
+use rsk_core::{Core, DIFFICULTY_PERIOD, FINALITY_MARGIN_BLOCKS, FinalityStatus};
 use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::peers::{Peer, Pool};
+
+/// The caller's clock, in unix seconds, for the finality rule. The core keeps
+/// no clock of its own; this is where it gets one.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// An age in seconds, in the largest readable unit.
+fn fmt_age(seconds: u64) -> String {
+    const HOUR: u64 = 3_600;
+    const DAY: u64 = 86_400;
+    if seconds >= DAY {
+        format!("{:.1} d", seconds as f64 / DAY as f64)
+    } else if seconds >= HOUR {
+        format!("{:.1} h", seconds as f64 / HOUR as f64)
+    } else {
+        format!("{seconds} s")
+    }
+}
+
+/// A bar evaluation in blocks at the anchor's work per block, with `Φ` — the
+/// bar relative to the work carried. Below one the honest chain clears it; a
+/// fork with network share `s` is kept out while `Φ > s/(1-s)`.
+fn fmt_bar(status: &FinalityStatus) -> String {
+    let phi = status
+        .phi()
+        .map(|phi| format!(", Φ {phi:.3}"))
+        .unwrap_or_default();
+    format!(
+        "{}/{} blocks ({}%{phi})",
+        status.have_blocks(),
+        status.need_blocks(),
+        status.progress_percent()
+    )
+}
+
+/// The finality state a run starts from. The mark is the anchor of the next
+/// bar: a fresh store starts at the seeded checkpoint, a resumed one at the
+/// newest mark it already finalized.
+fn log_finality_start(core: &Core, now: u64) -> Result<()> {
+    let Some(mark) = core.finalized_height()? else {
+        return Ok(());
+    };
+    let Some(header) = core.header_at(mark)? else {
+        return Ok(());
+    };
+    let tip = core.tip_height()?.unwrap_or(mark);
+    let age = fmt_age(now.saturating_sub(header.time as u64));
+    if tip == mark {
+        info!(
+            "finality: mark #{mark} (age {age}) is the seed checkpoint; \
+             the first bar is measured from it"
+        );
+    } else {
+        info!(
+            "finality: mark #{mark} (age {age}), tip #{tip}; \
+             the next bar is measured from the mark, not the checkpoint"
+        );
+    }
+    if let Some(status) = core.finality_status(now)? {
+        info!(
+            "finality: bar {} at anchor #{} (estimated work since the mark)",
+            fmt_bar(&status),
+            status.anchor,
+        );
+    }
+    Ok(())
+}
+
+/// One mark advance, with the bar that cleared it and when it happened.
+/// Whether this run looks partitioned, from what the node can see: its tip
+/// against the peers' best advertised height, and how old the tip is.
+///
+/// This is evidence, not proof — a partition that leaves the node on a fresh
+/// fork at the peers' height would pass it. It is here so a timing run can say
+/// whether it was talking to the network at all.
+fn partition_note(
+    core: &Core,
+    now: u64,
+    peer_height: u64,
+    peers: usize,
+    finished: bool,
+) -> Result<String> {
+    let Some(tip) = core.tip_height()? else {
+        return Ok("no tip yet, so a partition cannot be ruled out".to_string());
+    };
+    let Some(header) = core.header_at(tip)? else {
+        return Ok("no header at the tip, so a partition cannot be ruled out".to_string());
+    };
+    let age = now.saturating_sub(header.time as u64);
+    let behind = peer_height.saturating_sub(tip);
+    // Fresh: within two hours (a block is expected every ten minutes).
+    let fresh = age <= 2 * 3_600;
+    let at_peers = peer_height > 0 && behind <= 2;
+
+    Ok(if peers < 2 {
+        format!("only {peers} peer connected, so a partition cannot be ruled out")
+    } else if peer_height == 0 {
+        "peers advertised no height, so a partition cannot be ruled out".to_string()
+    } else if at_peers && fresh {
+        format!(
+            "no sign of a partition: tip #{tip} is at the peers' best height ({peer_height}) \
+             and {} old, across {peers} peers",
+            fmt_age(age)
+        )
+    } else if !at_peers && !finished {
+        // Mid-sync this is the expected state, not evidence of a partition.
+        format!("still syncing: {behind} block(s) below the peers' best height ({peer_height})")
+    } else if !at_peers {
+        format!(
+            "the sync ended {behind} block(s) below the peers' best height ({peer_height}) \
+             — possibly partitioned"
+        )
+    } else {
+        format!("tip #{tip} is {} old — could be a partition", fmt_age(age))
+    })
+}
+
+/// One mark advance, with the bar that cleared it, when it happened, and (on
+/// the first one) whether the run looks partitioned.
+fn log_advance(
+    new: u64,
+    status: Option<FinalityStatus>,
+    nth: usize,
+    elapsed: f64,
+    now: u64,
+    partition: &str,
+) {
+    let which = if nth == 1 {
+        "first mark advance".to_string()
+    } else {
+        format!("mark advance #{nth}")
+    };
+    let note = if partition.is_empty() {
+        String::new()
+    } else {
+        format!("; {partition}")
+    };
+    match status {
+        Some(status) => {
+            let blocks = new.saturating_sub(status.anchor);
+            let checkpoints = new / DIFFICULTY_PERIOD - status.anchor / DIFFICULTY_PERIOD;
+            info!(
+                "finality: {which}: #{new} (from #{}, +{blocks} block(s), \
+                 +{checkpoints} checkpoint(s)) at {elapsed:.2}s — anchor age {}, bar {}{note}",
+                status.anchor,
+                fmt_age(now.saturating_sub(status.anchor_time)),
+                fmt_bar(&status),
+            );
+        }
+        None => info!("finality: {which}: #{new} at {elapsed:.2}s{note}"),
+    }
+}
 
 /// What a completed sync did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,7 +186,7 @@ pub struct SyncReport {
     pub batches: usize,
     /// Canonical tip height after the sync.
     pub tip: u64,
-    /// Finalized checkpoint after the sync.
+    /// Finality mark after the sync.
     pub finalized: u64,
     /// Cumulative chain work at the tip.
     pub chainwork: Work,
@@ -72,6 +228,14 @@ struct Stats {
     works: Vec<Work>,
     /// The greatest advertised height across the peers driving the sync.
     peer_height: u64,
+    /// Peers the run connected to (used for the partition note).
+    peers: usize,
+    /// Mark advances this run.
+    advances: usize,
+    /// Seconds from sync start to the first advance.
+    first_advance: Option<f64>,
+    /// The most recent bar evaluation.
+    last_status: Option<FinalityStatus>,
 }
 
 /// Download and validate the tail above the current tip, driving the pool of
@@ -102,7 +266,15 @@ pub(crate) fn run(
             .map(|p| p.handshake.start_height.max(0) as u64)
             .max()
             .unwrap_or(0),
+        peers: n,
+        advances: 0,
+        first_advance: None,
+        last_status: None,
     };
+
+    // What the first bar will be measured from: the store's mark. A fresh store
+    // starts at the checkpoint; a resumed one at its own last finalization.
+    log_finality_start(core, unix_now())?;
 
     // Every peer is a worker; `alive[i]` marks those still usable. The sync
     // round-robins across them and prefetches the next batch while the current
@@ -139,16 +311,43 @@ pub(crate) fn run(
         cur = prefetch(&mut peers, &mut alive, cur, last)?;
 
         let first = core.tip_height()?.unwrap_or(0) + 1;
-        let out = core.connect_headers(&headers)?;
+        let now = unix_now();
+        let out = core.connect_headers(&headers, now)?;
         stats.batches += 1;
         stats.total += out.connected;
+        stats.last_status = out.finality;
         stats
             .works
             .push(core.chainwork()?.context("chainwork after connect")?);
         let tip = core.tip_height()?.context("tip after connect")?;
         let seen = first + out.connected as u64 - 1;
+
+        // Every mark advance is reported, whenever it happens. The first one
+        // also says whether the run looks partitioned.
+        if let Some(finalized) = out.finalized {
+            stats.advances += 1;
+            let elapsed = stats.started.elapsed().as_secs_f64();
+            if stats.first_advance.is_none() {
+                stats.first_advance = Some(elapsed);
+            }
+            let partition = if stats.advances == 1 {
+                let live = alive.iter().filter(|a| **a).count();
+                partition_note(core, now, stats.peer_height, live, false)?
+            } else {
+                String::new()
+            };
+            log_advance(
+                finalized,
+                out.finality,
+                stats.advances,
+                elapsed,
+                now,
+                &partition,
+            );
+        }
+
         // Print the first handful, then every 20th batch, so a long run stays
-        // readable.
+        // readable. Until the first advance, show how far along the bar is.
         if stats.batches <= 10 || stats.batches.is_multiple_of(20) {
             let percent = if stats.peer_height > 0 {
                 format!(" {:>5.1}%", 100.0 * seen as f64 / stats.peer_height as f64)
@@ -157,13 +356,14 @@ pub(crate) fn run(
             };
             let rate = stats.total as f64 / stats.started.elapsed().as_secs_f64().max(0.001);
             let live = alive.iter().filter(|a| **a).count();
+            let bar = match (stats.advances, out.finalized, out.finality) {
+                (0, None, Some(status)) => format!("  bar {}", fmt_bar(&status)),
+                _ => String::new(),
+            };
             info!(
-                "[{:>4}] headers {first}..={seen}  tip {tip}{percent}  {rate:.0} h/s  peer {server} ({live}/{n} up)",
+                "[{:>4}] headers {first}..={seen}  tip {tip}{percent}  {rate:.0} h/s  peer {server} ({live}/{n} up){bar}",
                 stats.batches
             );
-            if let Some(finalized) = out.finalized {
-                info!("         ↳ auto-finalized difficulty period {finalized}");
-            }
         }
     }
 }
@@ -247,15 +447,45 @@ fn report(core: &Core, config: &Config, stats: &Stats) -> Result<SyncReport> {
         "a fork won the canonical chain"
     );
 
-    // 4. Finality advanced across real difficulty periods.
+    // 4. Finality. A lag is legitimate — the bar is allowed to deny a chain —
+    // so this reports the state rather than asserting progress.
     let finalized = core.finalized_height()?.unwrap_or(0);
-    if tip > 2 * DIFFICULTY_PERIOD {
-        let expected = ((tip - DIFFICULTY_PERIOD) / DIFFICULTY_PERIOD) * DIFFICULTY_PERIOD;
-        anyhow::ensure!(
-            finalized >= expected.saturating_sub(2 * DIFFICULTY_PERIOD),
-            "finality floor {finalized} lagged the expected boundary {expected}"
+    let expected = tip.saturating_sub(FINALITY_MARGIN_BLOCKS);
+    match stats.first_advance {
+        Some(first) => info!(
+            "finality: {} mark advance(s) this run; first at {first:.2}s, mark now #{finalized}",
+            stats.advances
+        ),
+        None => info!("finality: no mark advance this run; mark is still #{finalized}"),
+    }
+    let now = unix_now();
+    // Show the bar whenever the mark is not where it should be, including after
+    // advances: a lagging mark then says *why* (e.g. 92% of the bar, Φ above 1).
+    if (stats.advances == 0 || finalized < expected)
+        && let Some(status) = stats.last_status
+    {
+        info!(
+            "finality: bar {} at anchor #{} (age {})",
+            fmt_bar(&status),
+            status.anchor,
+            fmt_age(now.saturating_sub(status.anchor_time)),
         );
-        info!("finality: floor {finalized} (expected boundary ~{expected})");
+    }
+    if finalized < expected {
+        warn!(
+            "finality: mark #{finalized} is {} block(s) behind the expected mark \
+             #{expected} — the bar has not cleared",
+            expected - finalized
+        );
+    } else {
+        info!("finality: mark #{finalized} (expected mark ~#{expected})");
+    }
+
+    // 5. Whether this run looked partitioned. Evidence, not proof: a fork served
+    // at the peers' height would pass it, but a stale or lagging tip will not.
+    match partition_note(core, now, stats.peer_height, stats.peers, true) {
+        Ok(note) => info!("finality: {note}"),
+        Err(e) => warn!("finality: could not judge partitioning: {e}"),
     }
 
     Ok(SyncReport {

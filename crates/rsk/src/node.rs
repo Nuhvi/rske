@@ -67,11 +67,12 @@ impl Node {
         sync::run(&self.core, &self.config, &mut candidates)
     }
 
-    /// The finalized period-boundary headers as `checkpoints.txt` text (one hex
-    /// header per line, line `i` at height `i * DIFFICULTY_PERIOD`).
+    /// The **checkpoints** — period-boundary headers at or below the finality
+    /// mark — as `checkpoints.txt` text (one hex header per line, line `i` at
+    /// height `i * DIFFICULTY_PERIOD`).
     ///
-    /// Only checkpoints at or below the finalized floor are written — those
-    /// that have satisfied the finality rule and are safe to treat as
+    /// Only boundaries the mark has reached are written: a checkpoint is a
+    /// period start *and* finalized, so these are safe to treat as
     /// irreversible. The tip's nearest boundary is deliberately excluded.
     pub fn export_checkpoints(&self) -> Result<String> {
         let finalized = self
@@ -80,7 +81,7 @@ impl Node {
             .context("store is not seeded")?;
         let checkpoints = self.core.finalized_checkpoints()?;
         if checkpoints.is_empty() {
-            bail!("no finalized checkpoints at or below {finalized}");
+            bail!("no checkpoints at or below the finality mark {finalized}");
         }
 
         let mut text = String::new();
@@ -96,21 +97,12 @@ impl Node {
     }
 }
 
-/// Plant the trust anchor once and return the first height to download. On a
-/// store that is already anchored this is just the height above the tip.
-fn plant_anchor(core: &Core, config: &Config) -> Result<u64> {
-    if let Some(tip) = core.tip_height()? {
-        info!("resume: store already anchored at tip {tip}; continuing above it");
-        return Ok(tip + 1);
-    }
-
+/// The checkpoints this invocation trusts: genesis alone, or the embedded
+/// spine minus the last `cut` periods. Shared by seeding and by re-anchoring a
+/// store that was seeded by an older, shorter spine.
+fn trusted_prefix(config: &Config) -> Result<Vec<(u64, bitcoin::block::Header)>> {
     match config.anchor {
-        Anchor::Genesis => {
-            let genesis = genesis_block(config.network).header;
-            core.seed_checkpoints(&[(0, genesis)])?;
-            info!("anchor: genesis only — validating the whole chain from block 1");
-            Ok(1)
-        }
+        Anchor::Genesis => Ok(vec![(0, genesis_block(config.network).header)]),
         Anchor::Spine { cut } => {
             let spine = rsk_core::btc::checkpoints::parse()?;
             let cut = cut as usize;
@@ -119,23 +111,50 @@ fn plant_anchor(core: &Core, config: &Config) -> Result<u64> {
                 "--cut {cut} is past the end of the {}-period spine",
                 spine.len()
             );
-            let prefix = &spine[..spine.len() - cut];
-            core.seed_checkpoints(prefix)?;
-            let seed_height = prefix.last().context("non-empty spine")?.0;
-            if cut == 0 {
-                info!(
-                    "anchor: {} embedded checkpoints trusted (heights 0..={seed_height}); syncing the tail above them",
-                    prefix.len()
-                );
-            } else {
-                info!(
-                    "anchor: {} checkpoints trusted up to {seed_height}; validating {cut} period(s) of real headers above",
-                    prefix.len()
-                );
-            }
-            Ok(seed_height + 1)
+            Ok(spine[..spine.len() - cut].to_vec())
         }
     }
+}
+
+/// Plant the trust anchor once and return the first height to download. On a
+/// store that is already anchored this is just the height above the tip — after
+/// adopting the newest shipped checkpoint the store can prove it holds, so a
+/// store seeded by an older binary benefits from a newer spine instead of
+/// staying stuck on its old mark.
+fn plant_anchor(core: &Core, config: &Config) -> Result<u64> {
+    let trusted = trusted_prefix(config)?;
+
+    if let Some(tip) = core.tip_height()? {
+        if let Some((from, to)) = core.reanchor_shipped(&trusted)? {
+            info!(
+                "finality: adopted shipped checkpoint #{to} (was #{from}); \
+                 the next bar is measured from it"
+            );
+        }
+        info!("resume: store already anchored at tip {tip}; continuing above it");
+        return Ok(tip + 1);
+    }
+
+    core.seed_checkpoints(&trusted)?;
+    let seed_height = trusted.last().context("non-empty spine")?.0;
+    match config.anchor {
+        Anchor::Genesis => {
+            info!("anchor: genesis only — validating the whole chain from block 1");
+        }
+        Anchor::Spine { cut: 0 } => {
+            info!(
+                "anchor: {} embedded checkpoints trusted (heights 0..={seed_height}); syncing the tail above them",
+                trusted.len()
+            );
+        }
+        Anchor::Spine { cut } => {
+            info!(
+                "anchor: {} checkpoints trusted up to {seed_height}; validating {cut} period(s) of real headers above",
+                trusted.len()
+            );
+        }
+    }
+    Ok(seed_height + 1)
 }
 
 #[cfg(test)]

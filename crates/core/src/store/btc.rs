@@ -27,10 +27,14 @@ const BTC_FORKS: TableDefinition<u64, ForkMeta> = TableDefinition::new("btc_fork
 const BTC_CHECKPOINTS: TableDefinition<u64, BtcHeader> = TableDefinition::new("btc_checkpoints");
 const BTC_META: TableDefinition<&str, Meta> = TableDefinition::new("btc_meta");
 
-const META_SEED_HEIGHT: &str = "seed_height";
-/// The latest finalized checkpoint: a difficulty-period boundary whose
-/// above-work outweighs the period before it. Advanced only forward.
+/// The finality **mark**: the newest header settled as un-reorgable. Any height,
+/// advanced only forward; it is also the **anchor** the next bar is measured
+/// from, and the period starts at or below it are the **checkpoints**. See
+/// [`crate::btc::finality`] for the rule.
 const META_FINALIZED: &str = "finalized_height";
+/// The greatest clock ([`crate::Core::connect_headers`]'s `now`) ever seen, so
+/// a later one cannot shrink the bar by winding the clock back.
+const META_NOW: &str = "finality_now";
 const META_BEST_FORK: &str = "best_fork";
 const META_NEXT_FORK: &str = "next_fork";
 const META_NETWORK: &str = "network";
@@ -44,6 +48,46 @@ pub(super) fn open_tables(txn: &WriteTransaction) -> Result<(), Error> {
     txn.open_table(BTC_META)?;
     Ok(())
 }
+
+/// The Bitcoin reads the finality rule needs. Implemented for both transaction
+/// types so the rule runs identically in a read snapshot (status output) and in
+/// the writer (a connect).
+pub(crate) trait BtcReads {
+    fn best_fork(&self) -> Result<Option<u64>, Error>;
+    fn fork_tip(&self, fork_id: u64) -> Result<Option<(u64, BlockHash)>, Error>;
+    fn finalized_height(&self) -> Result<Option<u64>, Error>;
+    fn header_at(&self, fork_id: u64, height: u64) -> Result<Option<BitcoinHeader>, Error>;
+    fn work_at(&self, fork_id: u64, height: u64) -> Result<Option<Work>, Error>;
+}
+
+macro_rules! impl_btc_reads {
+    ($txn:ty) => {
+        impl BtcReads for $txn {
+            fn best_fork(&self) -> Result<Option<u64>, Error> {
+                <$txn>::best_fork(self)
+            }
+
+            fn fork_tip(&self, fork_id: u64) -> Result<Option<(u64, BlockHash)>, Error> {
+                <$txn>::fork_tip(self, fork_id)
+            }
+
+            fn finalized_height(&self) -> Result<Option<u64>, Error> {
+                <$txn>::finalized_height(self)
+            }
+
+            fn header_at(&self, fork_id: u64, height: u64) -> Result<Option<BitcoinHeader>, Error> {
+                <$txn>::header_at(self, fork_id, height)
+            }
+
+            fn work_at(&self, fork_id: u64, height: u64) -> Result<Option<Work>, Error> {
+                <$txn>::work_at(self, fork_id, height)
+            }
+        }
+    };
+}
+
+impl_btc_reads!(ReadTxn);
+impl_btc_reads!(WriteTxn);
 
 /// A Bitcoin header row: the header and its cumulative work on its fork.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,8 +318,8 @@ macro_rules! btc_read_methods {
             }
         }
 
-        /// The latest finalized checkpoint, if seeded. Monotonic: only the
-        /// connect path advances it, and only forward.
+        /// The finality mark, if seeded. Monotonic: only the connect path
+        /// advances it, and only forward.
         pub(crate) fn finalized_height(&self) -> Result<Option<u64>, Error> {
             self.meta_u64(META_FINALIZED)
         }
@@ -381,7 +425,6 @@ impl WriteTxn {
                 },
             )?;
         }
-        let first = sorted.first().expect("checked non-empty above").0;
         let last = sorted.last().expect("checked non-empty above").0;
         let last_hash = sorted
             .last()
@@ -397,7 +440,6 @@ impl WriteTxn {
             tip_work: cum,
         };
         forks.insert(0, root)?;
-        meta.insert(META_SEED_HEIGHT, Meta::U64(first))?;
         meta.insert(META_FINALIZED, Meta::U64(last))?;
         meta.insert(META_BEST_FORK, Meta::U64(0))?;
         meta.insert(META_NEXT_FORK, Meta::U64(1))?;
@@ -503,10 +545,23 @@ impl WriteTxn {
         Ok(())
     }
 
-    /// Record the latest finalized checkpoint.
+    /// Record the finality mark.
     pub(crate) fn set_finalized(&self, height: u64) -> Result<(), Error> {
         let mut meta = self.txn.open_table(BTC_META)?;
         meta.insert(META_FINALIZED, Meta::U64(height))?;
+        Ok(())
+    }
+
+    /// The greatest clock ever seen by the finality rule, if any.
+    pub(crate) fn now_hwm(&self) -> Result<Option<u64>, Error> {
+        let table = self.txn.open_table(BTC_META)?;
+        Ok(table.get(META_NOW)?.and_then(|v| v.value().as_u64()))
+    }
+
+    /// Record the greatest clock the finality rule has seen.
+    pub(crate) fn set_now_hwm(&self, now: u64) -> Result<(), Error> {
+        let mut meta = self.txn.open_table(BTC_META)?;
+        meta.insert(META_NOW, Meta::U64(now))?;
         Ok(())
     }
 }
