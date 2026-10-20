@@ -145,6 +145,9 @@ impl Core {
     /// for status output.
     pub fn finality_status(&self, now: u64) -> Result<Option<FinalityStatus>, Error> {
         let txn = self.store.read()?;
+        // The decision clamps to the stored high-water mark; the status must
+        // report the same bar, not the caller's raw clock.
+        let now = now.max(txn.now_hwm()?.unwrap_or(0));
         Ok(measure_finality(&txn, self.bar, now, self.genesis_time())?.map(|m| m.status))
     }
 
@@ -296,7 +299,9 @@ impl Core {
     /// - The best chain is re-selected by cumulative work; a fork only wins
     ///   when it is strictly heavier.
     /// - A fork whose `forkpoint` is at or below the finality mark is refused
-    ///   ([`Error::ForkBelowFinalized`]) — the mark's floor.
+    ///   ([`Error::ForkBelowFinalized`]) — the mark's floor. A fork created
+    ///   above the mark earlier also never becomes best once the mark has
+    ///   overtaken its `forkpoint`; it is kept stored instead.
     ///
     /// `now` is the caller's clock (unix seconds), used only by the finality
     /// rule: the mark advances when the work above the mark clears
@@ -492,8 +497,20 @@ impl Core {
             .fork_chainwork(target_fork)?
             .unwrap_or(Work::from_be_bytes([0; 32]));
         if target_fork != best && target_work > best_work {
-            txn.set_best_fork(target_fork)?;
-            best = target_fork;
+            // A fork created above the mark can outlive it. Once the mark has
+            // passed this fork's forkpoint, letting it win would reorg finalized
+            // history: the fork stays stored but never becomes the best chain.
+            let mark = txn.finalized_height()?.unwrap_or(0);
+            // Fork 0 is the spine's own chain (the mark lives on it), so it is
+            // always allowed to win back; only other forks can cross the mark.
+            let crosses_mark = target_fork != 0
+                && txn
+                    .fork_meta(target_fork)?
+                    .is_some_and(|meta| meta.forkpoint <= mark);
+            if !crosses_mark {
+                txn.set_best_fork(target_fork)?;
+                best = target_fork;
+            }
         }
 
         let tip_height = match prev_best {
@@ -1031,6 +1048,35 @@ mod tests {
         Ok(())
     }
 
+    /// The mark lives on fork 0, so the root chain must always be able to win
+    /// back when it becomes heavier than a fork that forked above the mark.
+    #[test]
+    fn the_root_chain_can_win_back() -> eyre::Result<()> {
+        let chain = seeded();
+        let genesis = canonical(&chain, 0);
+
+        // Main to 4,132 so the mark is 4,032.
+        chain.connect_headers(&easy_chain(&genesis, 4_132, 1), NOW)?;
+        assert_eq!(chain.finalized_height()?, Some(4_032));
+
+        // Prepare both runs first: once the fork is best, the canonical reads
+        // for these heights resolve to the fork.
+        let root = easy_chain(&canonical(&chain, 4_132), 4_000, 3_000);
+        // A fork above the mark (forkpoint 4,101) can still win if it is heavier.
+        let fork = easy_chain(&canonical(&chain, 4_100), 3_000, 2_000);
+        chain.connect_headers(&fork, NOW)?;
+        assert_ne!(chain.best_fork()?, Some(0), "the heavier fork is best");
+
+        // The root chain wins back once it is heavier; the guard must exempt it.
+        chain.connect_headers(&root, NOW)?;
+        assert_eq!(
+            chain.best_fork()?,
+            Some(0),
+            "the mark's own chain can always win back"
+        );
+        Ok(())
+    }
+
     #[test]
     fn fork_below_finalized_is_refused() -> eyre::Result<()> {
         let chain = seeded();
@@ -1423,6 +1469,61 @@ mod tests {
 
         // Never backwards.
         assert_eq!(chain.reanchor_shipped(&trusted)?, None);
+        Ok(())
+    }
+
+    /// A fork that was created above the mark can outlive it. Once the mark has
+    /// passed its forkpoint, the fork must never become the best chain, or it
+    /// would reorg finalized history (and the export would read its blocks).
+    #[test]
+    fn a_fork_the_mark_overtook_cannot_become_best() -> eyre::Result<()> {
+        let chain = seeded();
+        let genesis = canonical(&chain, 0);
+
+        // Build a main chain but stay below the bar, so the mark is still 0 and
+        // a fork at height 2001 is allowed to be created.
+        let main = easy_chain(&genesis, 3_000, 1);
+        chain.connect_headers(&main, NOW)?;
+        assert_eq!(chain.finalized_height()?, Some(0));
+
+        let fork = easy_chain(&main[1_999], 500, 2_000);
+        chain.connect_headers(&fork, NOW)?;
+
+        // Advance the main chain: the mark reaches 4,032, past the forkpoint.
+        let rest = easy_chain(&canonical(&chain, 3_000), 1_132, 1);
+        chain.connect_headers(&rest, NOW)?;
+        assert_eq!(chain.finalized_height()?, Some(4_032));
+
+        // Make the fork heavier than the main chain: it must not win.
+        let extension = easy_chain(&fork[499], 2_000, 3_000);
+        let out = chain.connect_headers(&extension, NOW)?;
+        assert_eq!(out.connected, 2_000);
+        assert_eq!(chain.best_fork()?, Some(0), "the finality mark is a floor");
+        assert_eq!(chain.tip_height()?, Some(4_132));
+        assert_eq!(chain.finalized_height()?, Some(4_032));
+        Ok(())
+    }
+
+    /// The status query must use the same clock high-water mark as the
+    /// decision, or it reports a smaller bar than the one that gates the mark.
+    #[test]
+    fn the_status_uses_the_finality_clock_high_water_mark() -> eyre::Result<()> {
+        let chain = seeded();
+        let genesis = canonical(&chain, 0);
+        let w = crate::btc::header_work(&genesis);
+        let high = genesis.time as u64 + 4_000 * finality::TARGET_BLOCK_SECONDS;
+
+        // A connect at the high clock stores the HWM (no finalization yet).
+        chain.connect_headers(&easy_chain(&genesis, 10, 1), high)?;
+
+        let status = chain
+            .finality_status(genesis.time as u64)?
+            .expect("the bar is measurable");
+        assert_eq!(
+            status.need,
+            finality::work_to_u256(w) * alloy_primitives::U256::from(4_000u64),
+            "the status must use the stored HWM, not the earlier clock"
+        );
         Ok(())
     }
 

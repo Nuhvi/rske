@@ -324,6 +324,11 @@ macro_rules! btc_read_methods {
             self.meta_u64(META_FINALIZED)
         }
 
+        /// The greatest clock the finality rule has seen, if any.
+        pub(crate) fn now_hwm(&self) -> Result<Option<u64>, Error> {
+            self.meta_u64(META_NOW)
+        }
+
         fn meta_u64(&self, key: &str) -> Result<Option<u64>, Error> {
             let table = self.txn.open_table(BTC_META)?;
             Ok(table.get(key)?.and_then(|v| v.value().as_u64()))
@@ -550,12 +555,6 @@ impl WriteTxn {
         let mut meta = self.txn.open_table(BTC_META)?;
         meta.insert(META_FINALIZED, Meta::U64(height))?;
         Ok(())
-    }
-
-    /// The greatest clock ever seen by the finality rule, if any.
-    pub(crate) fn now_hwm(&self) -> Result<Option<u64>, Error> {
-        let table = self.txn.open_table(BTC_META)?;
-        Ok(table.get(META_NOW)?.and_then(|v| v.value().as_u64()))
     }
 
     /// Record the greatest clock the finality rule has seen.

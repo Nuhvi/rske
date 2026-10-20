@@ -82,7 +82,12 @@ fn log_finality_start(core: &Core, now: u64) -> Result<()> {
              the next bar is measured from the mark, not the checkpoint"
         );
     }
-    if let Some(status) = core.finality_status(now)? {
+    if mark == 0 {
+        warn!(
+            "finality: genesis anchor — partition-safe finality is unavailable; \
+             ship a checkpoint"
+        );
+    } else if let Some(status) = core.finality_status(now)? {
         info!(
             "finality: bar {} at anchor #{} (estimated work since the mark)",
             fmt_bar(&status),
@@ -459,26 +464,33 @@ fn report(core: &Core, config: &Config, stats: &Stats) -> Result<SyncReport> {
         None => info!("finality: no mark advance this run; mark is still #{finalized}"),
     }
     let now = unix_now();
-    // Show the bar whenever the mark is not where it should be, including after
-    // advances: a lagging mark then says *why* (e.g. 92% of the bar, Φ above 1).
-    if (stats.advances == 0 || finalized < expected)
-        && let Some(status) = stats.last_status
-    {
-        info!(
-            "finality: bar {} at anchor #{} (age {})",
-            fmt_bar(&status),
-            status.anchor,
-            fmt_age(now.saturating_sub(status.anchor_time)),
-        );
-    }
-    if finalized < expected {
+    if finalized == 0 {
         warn!(
-            "finality: mark #{finalized} is {} block(s) behind the expected mark \
-             #{expected} — the bar has not cleared",
-            expected - finalized
+            "finality: genesis anchor — partition-safe finality is unavailable; \
+             ship a checkpoint"
         );
     } else {
-        info!("finality: mark #{finalized} (expected mark ~#{expected})");
+        // Show the bar whenever the mark is not where it should be, including
+        // after advances: a lagging mark says *why* (e.g. 92% of the bar).
+        if (stats.advances == 0 || finalized < expected)
+            && let Some(status) = stats.last_status
+        {
+            info!(
+                "finality: bar {} at anchor #{} (age {})",
+                fmt_bar(&status),
+                status.anchor,
+                fmt_age(now.saturating_sub(status.anchor_time)),
+            );
+        }
+        if finalized < expected {
+            warn!(
+                "finality: mark #{finalized} is {} block(s) behind the expected mark \
+                 #{expected} — the bar has not cleared",
+                expected - finalized
+            );
+        } else {
+            info!("finality: mark #{finalized} (expected mark ~#{expected})");
+        }
     }
 
     // 5. Whether this run looked partitioned. Evidence, not proof: a fork served

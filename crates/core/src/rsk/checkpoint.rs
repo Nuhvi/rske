@@ -14,9 +14,10 @@
 //! anchor.
 //!
 //! A checkpoint is a canonical Rootstock block whose **own** anchor is inside
-//! the trust tail `[B, tip − ANCHOR_DEPTH]`. The tail is trusted once the work
-//! built on the checkpoint (GHOST-weighted, see [`crate::rsk`]) exceeds `2/3`
-//! of the Bitcoin tail's work.
+//! the trusted, finalized Bitcoin range `[B, mark]` — at or after the last
+//! finalized checkpoint `B`, and at or below the finality mark. The tail is
+//! trusted once the work built on the checkpoint (GHOST-weighted, see
+//! [`crate::rsk`]) exceeds `2/3` of the Bitcoin tail's work.
 //!
 //! These are *ephemeral chain* checkpoints — trusted places to start syncing
 //! from — and must not be confused with the hardcoded Rootstock checkpoints
@@ -33,11 +34,6 @@ use rsk_consensus::Header as RskHeader;
 
 use crate::Core;
 use crate::error::Error;
-
-/// How deep an anchor must be buried in Bitcoin before we trust it: an anchor
-/// at `btc_tip - ANCHOR_DEPTH` or older. A fixed safety margin — we never rely
-/// on a Bitcoin block that could still be reorged.
-pub const ANCHOR_DEPTH: u64 = 100;
 
 /// The trust threshold, `2/3`: the Rootstock tail's work must exceed
 /// `CHECKPOINT_THRESHOLD_NUM / CHECKPOINT_THRESHOLD_DEN` of the Bitcoin tail's
@@ -66,10 +62,11 @@ pub fn anchor_height(btc: &Core, header: &RskHeader) -> Result<Option<u64>, Erro
     btc.height_of(&solution.prev_blockhash)
 }
 
-/// Whether a Bitcoin anchor height is inside the trust tail: at or after the
-/// tail start, and buried by at least [`ANCHOR_DEPTH`] Bitcoin blocks.
-pub fn in_tail(anchor: u64, btc_tail_start: u64, btc_tip: u64) -> bool {
-    anchor >= btc_tail_start && anchor + ANCHOR_DEPTH <= btc_tip
+/// Whether a Bitcoin anchor height is inside the trusted range: at or after the
+/// last finalized checkpoint, and at or below the finality mark. The mark is
+/// itself kept one reorg depth below the tip, so it carries the depth.
+pub fn in_tail(anchor: u64, btc_tail_start: u64, btc_mark: u64) -> bool {
+    anchor >= btc_tail_start && anchor <= btc_mark
 }
 
 /// The trust rule: the Rootstock tail's work exceeds `2/3` of the Bitcoin

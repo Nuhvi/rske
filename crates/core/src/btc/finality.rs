@@ -40,6 +40,15 @@
 //! honest work, and the bar sits above that line while staying at or below the
 //! honest work. Over-estimating only delays finalization.
 //!
+//! `r0` is implicit: the bar is the *absolute* estimated work, so it uses the
+//! anchor difficulty's target rate (`w0 / 600`), not the checkpoint period's
+//! realised rate. The difference is retarget-window luck (a few percent).
+//!
+//! The 5% figure is the largest round network share below the sampled 2016+
+//! bottom-law edge (5.18%). It is in-sample and thin: 6% is not safe. In steady
+//! state the mark is short-lived, so the 100-block floor is usually the binding
+//! term; the price-law bound applies to a stagnant anchor.
+//!
 //! The floor keeps `T = 0` from being a zero-work hole. The mark sits
 //! `FINALITY_MARGIN_BLOCKS` below the tip, so in steady state `T` is short and
 //! the floor is usually the binding term; the estimated work takes over when the
@@ -110,12 +119,19 @@ pub fn is_checkpoint(height: u64) -> bool {
 
 /// The shipped bar: the greater of the coinbase window and the estimated work
 /// the network did since the anchor.
+///
+/// A genesis anchor fails closed (`U256::MAX`): the price law is undefined at the
+/// network's birth, so a genesis-only seed cannot price modern work. Ship a
+/// checkpoint; `--from-genesis` is a development path without the guarantee.
 pub fn estimated_work_bar(
     anchor_work: Work,
     anchor_time: u64,
     genesis_time: u64,
     now: u64,
 ) -> U256 {
+    if anchor_time <= genesis_time {
+        return U256::MAX;
+    }
     let floor = work_to_u256(anchor_work).saturating_mul(U256::from(REVERSAL_BLOCKS));
     floor.max(estimated_work(anchor_time, genesis_time, now))
 }
@@ -300,6 +316,16 @@ mod tests {
             work_to_u256(w) * U256::from(REVERSAL_BLOCKS)
         );
         assert_eq!(estimated_work(t0, GENESIS, t0), U256::ZERO);
+    }
+
+    /// A genesis anchor cannot be priced: the bar fails closed.
+    #[test]
+    fn a_genesis_anchor_fails_closed() {
+        let w = work_from_bits(0x1d00_ffff);
+        assert_eq!(
+            estimated_work_bar(w, GENESIS, GENESIS, GENESIS + 1_500 * 86_400),
+            U256::MAX
+        );
     }
 
     /// The closed-form integral must match a numeric integration of the same

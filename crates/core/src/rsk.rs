@@ -86,7 +86,7 @@ impl Core {
     /// trust tail (see [`checkpoint::in_tail`]). A candidate that fails is
     /// refused, so a tree is only ever rooted at a block tied to Bitcoin.
     pub fn propose_checkpoint(&self, entry: &RskEntry) -> Result<B256, Error> {
-        let Some(btc_tip) = self.tip_height()? else {
+        let Some(btc_mark) = self.finalized_height()? else {
             return Err(Error::Unseeded);
         };
         let btc_tail_start = self.finalized_checkpoint()?.unwrap_or(0);
@@ -96,12 +96,11 @@ impl Core {
                 entry.header.number
             ))
         })?;
-        if !checkpoint::in_tail(anchor, btc_tail_start, btc_tip) {
+        if !checkpoint::in_tail(anchor, btc_tail_start, btc_mark) {
             return Err(Error::Rootstock(format!(
-                "checkpoint #{}: anchor {anchor} is not in the bitcoin tail \
-                 [{btc_tail_start}, {btc_tip} - {}]",
-                entry.header.number,
-                checkpoint::ANCHOR_DEPTH
+                "checkpoint #{}: anchor {anchor} is not in the finalized bitcoin \
+                 range [{btc_tail_start}, {btc_mark}]",
+                entry.header.number
             )));
         }
         let txn = self.store.write()?;
@@ -573,14 +572,14 @@ mod tests {
         let core = btc_with_tail();
         assert_eq!(core.tip_height().unwrap(), Some(4032));
 
-        // Height 3000 is canonical and buried well over ANCHOR_DEPTH below the tip.
+        // Height 3000 is canonical and below the finality mark (3932 here).
         let good = core.header_at(3000).unwrap().unwrap();
         assert!(
             core.propose_checkpoint(&anchored(0, good.block_hash(), 10))
                 .is_ok()
         );
 
-        // Height 4030 is too near the tip to trust.
+        // Height 4030 is above the finality mark: not finalized yet.
         let shallow = core.header_at(4030).unwrap().unwrap();
         let err = core
             .propose_checkpoint(&anchored(1, shallow.block_hash(), 10))
