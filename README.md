@@ -2,6 +2,10 @@
 
 Rske (Rootstock Edge client) is a persistent Rootstock (RSK) light client for fast sync and local verification. Like an SPV wallet, it syncs Bitcoin and RSK headers to disk and verifies only what it needs, aiming to be faster than rskj or rustock while keeping storage and initial block download small enough for an edge device.
 
+![Finality scan](finality-scan.gif)
+
+*A light client scans Bitcoin coinbases for `RSKBLOCK` tags — each names an RSK header by 20-byte prefix or falls back to its 7 CPV checkpoints. The bar tracks the worst-case endorsing share against the 67% threshold.*
+
 ## Project Structure
 
 ```
@@ -27,6 +31,8 @@ cargo run -p rsk-cli -- export-checkpoints > checkpoints.txt
 See `cargo run -p rsk-cli -- <command> --help` for the flags of each command.
 
 ## How it works
+
+![finality-scan](./docs/finality-scan.gif)
 
 ### Syncing Bitcoin headers first
 
