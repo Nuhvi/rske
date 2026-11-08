@@ -61,6 +61,15 @@ pub enum Error {
     #[error("rootstock: {0}")]
     Rootstock(String),
 
+    #[error("coinbase at height {height} is not for the canonical block {block_hash}")]
+    CoinbaseNotCanonical { height: u64, block_hash: BlockHash },
+
+    #[error("invalid coinbase/proof at height {height}: {detail}")]
+    CoinbaseInvalid { height: u64, detail: String },
+
+    #[error("stored coinbase at height {height} does not decode: {detail}")]
+    CoinbaseDecode { height: u64, detail: String },
+
     #[error("internal: {0}")]
     Internal(String),
 }

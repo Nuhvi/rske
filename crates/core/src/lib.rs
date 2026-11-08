@@ -25,7 +25,7 @@ mod store;
 
 pub use btc::finality::{FinalityStatus, REVERSAL_BLOCKS, is_checkpoint};
 pub use btc::validation::MEDIAN_TIME_PAST;
-pub use btc::{ConnectOutcome, FINALITY_MARGIN_BLOCKS, header_work};
+pub use btc::{Coinbase, ConnectOutcome, FINALITY_MARGIN_BLOCKS, bip34_height, header_work};
 pub use core::Core;
 pub use error::Error;
 pub use rsk::{EphemeralChainCheckpoint, RskConnectOutcome, RskEntry};

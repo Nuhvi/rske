@@ -25,6 +25,9 @@ const BTC_FORKS: TableDefinition<u64, ForkMeta> = TableDefinition::new("btc_fork
 /// The checkpoint spine: one trusted header per difficulty period, never
 /// pruned — the cheap whole-chain work ladder.
 const BTC_CHECKPOINTS: TableDefinition<u64, BtcHeader> = TableDefinition::new("btc_checkpoints");
+/// Canonical coinbase transactions and their BIP37 merkle proofs, keyed by
+/// height. The row carries the block hash so a reorg can be detected.
+const BTC_COINBASES: TableDefinition<u64, CoinbaseRow> = TableDefinition::new("btc_coinbases");
 const BTC_META: TableDefinition<&str, Meta> = TableDefinition::new("btc_meta");
 
 /// The finality **mark**: the newest header settled as un-reorgable. Any height,
@@ -45,6 +48,7 @@ pub(super) fn open_tables(txn: &WriteTransaction) -> Result<(), Error> {
     txn.open_table(BTC_HASH_LOC)?;
     txn.open_table(BTC_FORKS)?;
     txn.open_table(BTC_CHECKPOINTS)?;
+    txn.open_table(BTC_COINBASES)?;
     txn.open_table(BTC_META)?;
     Ok(())
 }
@@ -171,6 +175,65 @@ impl Value for BtcHeader {
 
     fn type_name() -> TypeName {
         TypeName::new("rsk_core::BtcHeader")
+    }
+}
+
+/// A stored canonical coinbase: the block it belongs to, the raw non-witness
+/// transaction, and the BIP37 `merkleblock` that proves its inclusion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CoinbaseRow {
+    pub block_hash: [u8; 32],
+    /// Raw consensus encoding of the `merkleblock` (header + partial tree).
+    pub merkle_block: Vec<u8>,
+    /// Raw consensus encoding of the coinbase transaction (no witness).
+    pub coinbase: Vec<u8>,
+}
+
+impl Value for CoinbaseRow {
+    type SelfType<'a> = CoinbaseRow;
+    type AsBytes<'a> = Vec<u8>;
+
+    fn fixed_width() -> Option<usize> {
+        None
+    }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> CoinbaseRow
+    where
+        Self: 'a,
+    {
+        assert!(data.len() >= 40, "stored coinbase row is truncated");
+        let block_hash: [u8; 32] = data[..32].try_into().expect("32-byte hash");
+        let mut at = 32;
+        let proof_len = u32::from_be_bytes(data[at..at + 4].try_into().expect("4 bytes")) as usize;
+        at += 4;
+        let merkle_block = data[at..at + proof_len].to_vec();
+        at += proof_len;
+        let coinbase_len =
+            u32::from_be_bytes(data[at..at + 4].try_into().expect("4 bytes")) as usize;
+        at += 4;
+        let coinbase = data[at..at + coinbase_len].to_vec();
+        CoinbaseRow {
+            block_hash,
+            merkle_block,
+            coinbase,
+        }
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &'a CoinbaseRow) -> Vec<u8>
+    where
+        Self: 'b,
+    {
+        let mut out = Vec::with_capacity(40 + value.merkle_block.len() + value.coinbase.len());
+        out.extend_from_slice(&value.block_hash);
+        out.extend_from_slice(&(value.merkle_block.len() as u32).to_be_bytes());
+        out.extend_from_slice(&value.merkle_block);
+        out.extend_from_slice(&(value.coinbase.len() as u32).to_be_bytes());
+        out.extend_from_slice(&value.coinbase);
+        out
+    }
+
+    fn type_name() -> TypeName {
+        TypeName::new("rsk_core::CoinbaseRow")
     }
 }
 
@@ -327,6 +390,13 @@ macro_rules! btc_read_methods {
         /// The greatest clock the finality rule has seen, if any.
         pub(crate) fn now_hwm(&self) -> Result<Option<u64>, Error> {
             self.meta_u64(META_NOW)
+        }
+
+        /// The stored coinbase row at `height`, if any.
+        #[allow(dead_code)]
+        pub(crate) fn coinbase_at(&self, height: u64) -> Result<Option<CoinbaseRow>, Error> {
+            let table = self.txn.open_table(BTC_COINBASES)?;
+            Ok(table.get(height)?.map(|v| v.value()))
         }
 
         fn meta_u64(&self, key: &str) -> Result<Option<u64>, Error> {
@@ -533,6 +603,64 @@ impl WriteTxn {
             forks.insert(fork_id, meta)?;
         }
         Ok(())
+    }
+
+    /// Store (or replace) the canonical coinbase at `height`.
+    pub(crate) fn put_coinbase(&self, height: u64, row: CoinbaseRow) -> Result<(), Error> {
+        let mut table = self.txn.open_table(BTC_COINBASES)?;
+        table.insert(height, row)?;
+        Ok(())
+    }
+
+    /// Delete every coinbase below `height`; returns how many rows went away.
+    /// This is the period-retention rule: once a new difficulty period is
+    /// finalized, the superseded period's coinbases are no longer needed.
+    pub(crate) fn delete_coinbases_below(&self, height: u64) -> Result<usize, Error> {
+        let keys = {
+            let table = self.txn.open_table(BTC_COINBASES)?;
+            let mut keys = Vec::new();
+            for item in table.iter()? {
+                let (key, _) = item?;
+                if key.value() < height {
+                    keys.push(key.value());
+                }
+            }
+            keys
+        };
+        let mut table = self.txn.open_table(BTC_COINBASES)?;
+        for key in &keys {
+            table.remove(*key)?;
+        }
+        Ok(keys.len())
+    }
+
+    /// Delete coinbase rows that no longer match the canonical chain. Called
+    /// when a fork wins: rows above the forkpoint belong to the old chain.
+    pub(crate) fn prune_non_canonical_coinbases(&self) -> Result<usize, Error> {
+        let Some(best) = self.best_fork()? else {
+            return Ok(0);
+        };
+        let stale = {
+            let table = self.txn.open_table(BTC_COINBASES)?;
+            let mut stale = Vec::new();
+            for item in table.iter()? {
+                let (key, value) = item?;
+                let height = key.value();
+                let row = value.value();
+                let canonical = self
+                    .header_at(best, height)?
+                    .map(|header| header.block_hash().to_byte_array());
+                if canonical != Some(row.block_hash) {
+                    stale.push(height);
+                }
+            }
+            stale
+        };
+        let mut table = self.txn.open_table(BTC_COINBASES)?;
+        for height in &stale {
+            table.remove(*height)?;
+        }
+        Ok(stale.len())
     }
 
     /// Mark `fork_id` as the best (heaviest) chain.

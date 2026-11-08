@@ -34,13 +34,15 @@
 
 use bitcoin::block::BlockHash;
 use bitcoin::block::Header as BitcoinHeader;
-use bitcoin::consensus::Params;
+use bitcoin::consensus::{Encodable, Params};
 use bitcoin::hashes::Hash;
+use bitcoin::merkle_tree::MerkleBlock;
 use bitcoin::pow::Work;
+use bitcoin::transaction::Transaction;
 
 use crate::Core;
 use crate::error::Error;
-use crate::store::{BtcReads, DIFFICULTY_PERIOD, ReadTxn, WriteTxn};
+use crate::store::{BtcReads, CoinbaseRow, DIFFICULTY_PERIOD, ReadTxn, WriteTxn};
 
 use self::finality::FinalityStatus;
 
@@ -53,6 +55,45 @@ pub mod validation;
 /// height; a **checkpoint** is the newest difficulty-period start at or below it
 /// ([`Core::finalized_checkpoint`]).
 pub const FINALITY_MARGIN_BLOCKS: u64 = 100;
+
+/// A canonical coinbase transaction and the partial merkle tree that proves it
+/// belongs to the block at `height`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Coinbase {
+    pub height: u64,
+    pub block_hash: BlockHash,
+    /// The full non-witness coinbase transaction.
+    pub coinbase: Transaction,
+    /// The BIP37 proof: the block header plus the partial merkle tree.
+    pub merkle_block: MerkleBlock,
+}
+
+/// The BIP34 height data element in a coinbase scriptSig, as BIP37 must insert
+/// it into a bloom filter.
+///
+/// BIP34 makes the block height the first item of the coinbase scriptSig.
+/// For every height in Rootstock's range (`> 227_836`) that is a minimally
+/// encoded little-endian script number, so a filter containing these bytes
+/// matches the coinbase's input-script data element.
+///
+/// Returns an empty vector for heights `0..=16`: BIP34 encodes those with the
+/// `OP_0..OP_16` opcodes, which are not data pushes, so a bloom filter cannot
+/// match the height. Callers in that range must fetch the full block; RSK never
+/// asks for them.
+pub fn bip34_height(height: u64) -> Vec<u8> {
+    if height <= 16 {
+        return Vec::new();
+    }
+    let mut bytes = height.to_le_bytes().to_vec();
+    while bytes.len() > 1 && bytes.last() == Some(&0) {
+        bytes.pop();
+    }
+    // Script numbers are sign-magnitude: a high bit needs a zero pad byte.
+    if bytes.last().is_some_and(|byte| byte & 0x80 != 0) {
+        bytes.push(0);
+    }
+    bytes
+}
 
 /// Outcome of a [`Core::connect_headers`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,6 +232,8 @@ impl Core {
         match adopted {
             Some(height) => {
                 txn.set_finalized(height)?;
+                let checkpoint = (height / DIFFICULTY_PERIOD) * DIFFICULTY_PERIOD;
+                txn.delete_coinbases_below(checkpoint)?;
                 txn.commit()?;
                 Ok(Some((current, height)))
             }
@@ -270,6 +313,125 @@ impl Core {
             return Ok(None);
         };
         txn.header_at(best, height)
+    }
+
+    /// The stored canonical coinbase at `height`, if it is present and still
+    /// matches the canonical header.
+    ///
+    /// The proof is re-verified on read, so a corrupted row is an error rather
+    /// than a silently wrong coinbase. A row left over from a reorg (its block
+    /// hash no longer canonical) reads as `None`; the sync refetches it.
+    pub fn coinbase_at(&self, height: u64) -> Result<Option<Coinbase>, Error> {
+        let txn = self.store.read()?;
+        let Some(best) = txn.best_fork()? else {
+            return Ok(None);
+        };
+        let Some(header) = txn.header_at(best, height)? else {
+            return Ok(None);
+        };
+        let Some(row) = txn.coinbase_at(height)? else {
+            return Ok(None);
+        };
+        if row.block_hash != header.block_hash().to_byte_array() {
+            return Ok(None);
+        }
+
+        let merkle_block: MerkleBlock = bitcoin::consensus::deserialize(&row.merkle_block)
+            .map_err(|e| Error::CoinbaseDecode {
+                height,
+                detail: e.to_string(),
+            })?;
+        let coinbase: Transaction =
+            bitcoin::consensus::deserialize(&row.coinbase).map_err(|e| Error::CoinbaseDecode {
+                height,
+                detail: e.to_string(),
+            })?;
+        verify_coinbase(height, header.block_hash(), &coinbase, &merkle_block)?;
+        Ok(Some(Coinbase {
+            height,
+            block_hash: header.block_hash(),
+            coinbase,
+            merkle_block,
+        }))
+    }
+
+    /// Store a canonical coinbase and its inclusion proof.
+    ///
+    /// The proof must be for the canonical header at `height`, and the coinbase
+    /// must be the transaction at index 0 in that block. The write is rejected
+    /// otherwise, so the table cannot be filled with a fork's coinbase or a
+    /// proof for another block.
+    pub fn store_coinbase(
+        &self,
+        height: u64,
+        block_hash: BlockHash,
+        coinbase: &Transaction,
+        merkle_block: &MerkleBlock,
+    ) -> Result<(), Error> {
+        let txn = self.store.write()?;
+        let best = txn.best_fork()?.ok_or(Error::Unseeded)?;
+        let header = txn
+            .header_at(best, height)?
+            .ok_or(Error::CoinbaseNotCanonical { height, block_hash })?;
+        if header.block_hash() != block_hash {
+            return Err(Error::CoinbaseNotCanonical { height, block_hash });
+        }
+        verify_coinbase(height, block_hash, coinbase, merkle_block)?;
+
+        let mut proof = Vec::new();
+        merkle_block
+            .consensus_encode(&mut proof)
+            .expect("encoding to vec is infallible");
+        let mut raw = Vec::new();
+        coinbase
+            .consensus_encode(&mut raw)
+            .expect("encoding to vec is infallible");
+        txn.put_coinbase(
+            height,
+            CoinbaseRow {
+                block_hash: block_hash.to_byte_array(),
+                merkle_block: proof,
+                coinbase: raw,
+            },
+        )?;
+        txn.commit()
+    }
+
+    /// The first height the coinbase table should hold: the newest finalized
+    /// difficulty-period boundary. Before the first boundary has settled (a
+    /// genesis-anchored or very fresh store), this falls back to one period
+    /// below the tip rather than asking for the whole chain.
+    ///
+    /// The retained window is `[coinbase_start_height, tip]`. When the finality
+    /// mark crosses a new boundary, the previous period is superseded and its
+    /// coinbases are deleted automatically by [`Core::connect_headers`].
+    pub fn coinbase_start_height(&self) -> Result<Option<u64>, Error> {
+        let Some(tip) = self.tip_height()? else {
+            return Ok(None);
+        };
+        Ok(Some(match self.finalized_checkpoint()? {
+            Some(checkpoint) if checkpoint > 0 => checkpoint,
+            _ => tip.saturating_sub(DIFFICULTY_PERIOD),
+        }))
+    }
+
+    /// Apply the coinbase retention policy now: drop rows below the newest
+    /// finalized checkpoint and any row whose block is no longer canonical.
+    /// Returns the number of rows removed.
+    ///
+    /// `connect_headers` does this automatically when the mark advances or the
+    /// best chain changes; this method is for a maintenance pass.
+    pub fn prune_coinbases(&self) -> Result<usize, Error> {
+        let txn = self.store.write()?;
+        let mut removed = txn.prune_non_canonical_coinbases()?;
+        if let Some(checkpoint) = txn
+            .finalized_height()?
+            .map(|mark| (mark / DIFFICULTY_PERIOD) * DIFFICULTY_PERIOD)
+        {
+            removed += txn.delete_coinbases_below(checkpoint)?;
+        }
+        txn.commit()?;
+        Ok(removed)
     }
 
     /// True if `hash` is the canonical block at `height`.
@@ -518,9 +680,23 @@ impl Core {
             None => forkpoint + (headers.len() - start) as u64 - 1,
         };
 
+        // A fork that won makes the old chain's coinbases stale. Drop them now
+        // rather than leaving rows the sync would have to distinguish later.
+        if best != prev_best.unwrap_or(0) {
+            txn.prune_non_canonical_coinbases()?;
+        }
+
         // Advancing the finality mark is part of connecting headers: move it if
         // this batch carried enough work above the anchor to clear the bar.
         let finality = finalize_in_txn(&txn, self.bar, now, self.genesis_time())?;
+        if finality.advanced.is_some()
+            && let Some(checkpoint) = txn
+                .finalized_height()?
+                .map(|mark| (mark / DIFFICULTY_PERIOD) * DIFFICULTY_PERIOD)
+        {
+            // The superseded full difficulty period is no longer needed.
+            txn.delete_coinbases_below(checkpoint)?;
+        }
         txn.commit()?;
 
         Ok(ConnectOutcome {
@@ -706,6 +882,56 @@ fn measure_finality<R: BtcReads>(
     }))
 }
 
+/// Check that `coinbase` is the transaction at index 0 and that `merkle_block`
+/// proves it against `block_hash`'s header. Shared by the write path and the
+/// read path so stored rows are held to the same standard as incoming ones.
+fn verify_coinbase(
+    height: u64,
+    block_hash: BlockHash,
+    coinbase: &Transaction,
+    merkle_block: &MerkleBlock,
+) -> Result<(), Error> {
+    if !coinbase.is_coinbase() {
+        return Err(Error::CoinbaseInvalid {
+            height,
+            detail: "transaction is not a coinbase".into(),
+        });
+    }
+    if merkle_block.header.block_hash() != block_hash {
+        return Err(Error::CoinbaseInvalid {
+            height,
+            detail: format!(
+                "proof header {} is not the block {}",
+                merkle_block.header.block_hash(),
+                block_hash
+            ),
+        });
+    }
+
+    let mut matches = Vec::new();
+    let mut indexes = Vec::new();
+    merkle_block
+        .extract_matches(&mut matches, &mut indexes)
+        .map_err(|e| Error::CoinbaseInvalid {
+            height,
+            detail: format!("merkle proof: {e}"),
+        })?;
+    let txid = coinbase.compute_txid();
+    let Some(position) = matches.iter().position(|matched| *matched == txid) else {
+        return Err(Error::CoinbaseInvalid {
+            height,
+            detail: format!("coinbase {txid} is not in the proof"),
+        });
+    };
+    if indexes[position] != 0 {
+        return Err(Error::CoinbaseInvalid {
+            height,
+            detail: format!("coinbase {txid} is at index {}, not 0", indexes[position]),
+        });
+    }
+    Ok(())
+}
+
 /// Whether a stored `(fork, height)` block lies on the canonical chain.
 fn is_canonical_at(txn: &ReadTxn, fork: u64, height: u64) -> Result<bool, Error> {
     let Some(best) = txn.best_fork()? else {
@@ -766,8 +992,10 @@ pub fn header_work(header: &BitcoinHeader) -> Work {
 mod tests {
     use super::*;
     use bitcoin::Network;
-    use bitcoin::block::Version;
+    use bitcoin::block::{Block, Version};
+    use bitcoin::blockdata::constants::genesis_block;
     use bitcoin::consensus::Decodable;
+    use bitcoin::merkle_tree::MerkleBlock;
     use bitcoin::pow::CompactTarget;
 
     /// A fixed base timestamp for synthetic headers.
@@ -844,6 +1072,41 @@ mod tests {
     /// Mine the synthetic genesis (parent is the virtual all-zero block).
     fn mine_genesis(tag: u32) -> BitcoinHeader {
         mine_at(BlockHash::all_zeros(), BASE_TIME + tag, EASY_BITS)
+    }
+
+    /// A one-transaction block (the real Bitcoin genesis coinbase) with a
+    /// matching header and a proof for that coinbase.
+    fn coinbase_fixture(
+        prev: BlockHash,
+        time: u32,
+    ) -> (BitcoinHeader, bitcoin::Transaction, MerkleBlock) {
+        let coinbase = genesis_block(Network::Bitcoin).txdata[0].clone();
+        let mut header = BitcoinHeader {
+            version: Version::ONE,
+            prev_blockhash: prev,
+            merkle_root: bitcoin::hashes::Hash::all_zeros(),
+            time,
+            bits: CompactTarget::from_consensus(EASY_BITS),
+            nonce: 0,
+        };
+        let block = Block {
+            header,
+            txdata: vec![coinbase.clone()],
+        };
+        header.merkle_root = block.compute_merkle_root().expect("one tx has a root");
+        loop {
+            if header.validate_pow(header.target()).is_ok() {
+                break;
+            }
+            header.nonce = header.nonce.wrapping_add(1);
+        }
+        let block = Block {
+            header,
+            txdata: vec![coinbase.clone()],
+        };
+        let proof =
+            MerkleBlock::from_block_with_predicate(&block, |txid| *txid == coinbase.compute_txid());
+        (header, coinbase, proof)
     }
 
     /// Easy-target chain above `parent`; `tag_offset` separates competing forks.
@@ -1690,6 +1953,87 @@ mod tests {
             chain.chainwork_at(DIFFICULTY_PERIOD)?.unwrap() - chain.chainwork_at(0)?.unwrap();
         assert_eq!(chain.btc_tail_work(DIFFICULTY_PERIOD)?, Some(after));
         assert!(after < before, "the drop makes the after-period lighter");
+        Ok(())
+    }
+
+    #[test]
+    fn bip34_height_is_the_minimal_script_number() {
+        assert!(bip34_height(0).is_empty());
+        assert!(bip34_height(16).is_empty());
+        assert_eq!(bip34_height(500_000), vec![0x20, 0xa1, 0x07]);
+        assert_eq!(bip34_height(527_857), vec![0xf1, 0x0d, 0x08]);
+        assert_eq!(bip34_height(960_000), vec![0x00, 0xa6, 0x0e]);
+        // A high bit needs the sign-padding byte.
+        assert_eq!(bip34_height(0x80_0000), vec![0x00, 0x00, 0x80, 0x00]);
+    }
+
+    #[test]
+    fn stores_and_reads_a_canonical_coinbase() -> eyre::Result<()> {
+        let chain = Core::in_memory(Network::Regtest)?;
+        let (header, coinbase, proof) = coinbase_fixture(BlockHash::all_zeros(), BASE_TIME);
+        chain.seed_checkpoints(&[(0, header)])?;
+        chain.store_coinbase(0, header.block_hash(), &coinbase, &proof)?;
+
+        let got = chain.coinbase_at(0)?.expect("stored coinbase");
+        assert_eq!(got.height, 0);
+        assert_eq!(got.block_hash, header.block_hash());
+        assert_eq!(got.coinbase, coinbase);
+        assert_eq!(got.merkle_block.header, header);
+        assert_eq!(got.merkle_block.txn.hashes(), proof.txn.hashes());
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_a_proof_for_another_block() -> eyre::Result<()> {
+        let chain = Core::in_memory(Network::Regtest)?;
+        let (header, coinbase, _) = coinbase_fixture(BlockHash::all_zeros(), BASE_TIME);
+        let (other, _, other_proof) = coinbase_fixture(BlockHash::all_zeros(), BASE_TIME + 1);
+        chain.seed_checkpoints(&[(0, header)])?;
+        let err = chain
+            .store_coinbase(0, header.block_hash(), &coinbase, &other_proof)
+            .unwrap_err();
+        assert!(matches!(err, Error::CoinbaseInvalid { .. }), "got {err:?}");
+        assert!(chain.coinbase_at(0)?.is_none());
+        // The other header is still a different block.
+        assert_ne!(other.block_hash(), header.block_hash());
+        Ok(())
+    }
+
+    #[test]
+    fn advancing_the_mark_prunes_superseded_coinbases() -> eyre::Result<()> {
+        let chain = Core::in_memory(Network::Regtest)?;
+        let (genesis, coinbase, proof) = coinbase_fixture(BlockHash::all_zeros(), BASE_TIME);
+        chain.seed_checkpoints(&[(0, genesis)])?;
+        chain.store_coinbase(0, genesis.block_hash(), &coinbase, &proof)?;
+        assert!(chain.coinbase_at(0)?.is_some());
+
+        // The same shape as `finalizes_once_the_bar_is_cleared`: 4,132 blocks
+        // clear the 4,000-block bar and settle the boundary at 4,032.
+        let run1 = easy_chain(&canonical(&chain, 0), DIFFICULTY_PERIOD as usize, 1);
+        chain.connect_headers(&run1, NOW)?;
+        let run2 = easy_chain(
+            &canonical(&chain, DIFFICULTY_PERIOD),
+            DIFFICULTY_PERIOD as usize + 100,
+            1,
+        );
+        let out = chain.connect_headers(&run2, NOW)?;
+        assert_eq!(out.finalized, Some(2 * DIFFICULTY_PERIOD));
+        assert!(chain.coinbase_at(0)?.is_none(), "superseded period pruned");
+        Ok(())
+    }
+
+    #[test]
+    fn prune_drops_coinbases_below_the_finalized_checkpoint() -> eyre::Result<()> {
+        let chain = Core::in_memory(Network::Regtest)?;
+        let (header, coinbase, proof) = coinbase_fixture(BlockHash::all_zeros(), BASE_TIME);
+        let next = mine_child(&header, EASY_BITS, 1);
+        // Two period boundaries: the mark is the second, so height 0 is a
+        // superseded full difficulty period.
+        chain.seed_checkpoints(&[(0, header), (DIFFICULTY_PERIOD, next)])?;
+        chain.store_coinbase(0, header.block_hash(), &coinbase, &proof)?;
+        assert!(chain.coinbase_at(0)?.is_some());
+        assert_eq!(chain.prune_coinbases()?, 1);
+        assert!(chain.coinbase_at(0)?.is_none());
         Ok(())
     }
 }

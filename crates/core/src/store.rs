@@ -27,7 +27,7 @@ use redb::{Database, ReadTransaction, TypeName, Value, WriteTransaction};
 mod btc;
 mod rsk;
 
-pub(crate) use btc::BtcReads;
+pub(crate) use btc::{BtcReads, CoinbaseRow};
 
 use crate::error::Error;
 
