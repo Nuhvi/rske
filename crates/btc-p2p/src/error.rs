@@ -17,4 +17,10 @@ pub enum Error {
 
     #[error("expected the `{expected}` message, got `{got}`")]
     UnexpectedMessage { expected: &'static str, got: String },
+
+    #[error("peer does not have the requested object")]
+    NotFound,
+
+    #[error("invalid merkle proof: {0}")]
+    MerkleProof(String),
 }
