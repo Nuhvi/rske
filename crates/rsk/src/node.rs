@@ -64,7 +64,9 @@ impl Node {
             bail!("no candidate peers: every DNS seed failed to resolve");
         }
         let mut candidates: VecDeque<_> = candidates.into_iter().collect();
-        sync::run(&self.core, &self.config, &mut candidates)
+        let mut report = sync::run(&self.core, &self.config, &mut candidates)?;
+        report.coinbase = crate::coinbase::sync(&self.core, &self.config)?;
+        Ok(report)
     }
 
     /// The **checkpoints** — period-boundary headers at or below the finality

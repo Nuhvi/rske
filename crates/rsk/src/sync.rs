@@ -197,6 +197,8 @@ pub struct SyncReport {
     pub chainwork: Work,
     /// The greatest height advertised by the peers that drove the sync.
     pub peer_height: u64,
+    /// Coinbase download for the retained window (empty when disabled).
+    pub coinbase: crate::CoinbaseReport,
 }
 
 /// A locator for our canonical tip: the last few headers (newest first), then
@@ -507,6 +509,7 @@ fn report(core: &Core, config: &Config, stats: &Stats) -> Result<SyncReport> {
         finalized,
         chainwork,
         peer_height: stats.peer_height,
+        coinbase: crate::CoinbaseReport::default(),
     })
 }
 

@@ -12,6 +12,7 @@
 // keep the strict lint for production code only.
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+pub mod coinbase;
 pub mod config;
 pub mod node;
 pub mod rootstock;
@@ -19,6 +20,7 @@ pub mod rootstock;
 mod peers;
 mod sync;
 
+pub use coinbase::CoinbaseReport;
 pub use config::{Anchor, Config, DEFAULT_DATA_DIR, USER_AGENT};
 pub use node::Node;
 pub use rootstock::Chain;
