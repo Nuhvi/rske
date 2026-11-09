@@ -310,6 +310,8 @@ impl AncestorSource for TxnAncestors<'_> {
     }
 }
 
+mod window;
+
 #[cfg(test)]
 mod tests {
     use super::*;
