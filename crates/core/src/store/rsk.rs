@@ -25,6 +25,8 @@ const RSK_UNCLES: TableDefinition<&[u8], BlobList> = TableDefinition::new("rsk_u
 /// Proposed checkpoint blocks: the roots of the forest, a set of hashes.
 const RSK_ROOTS: TableDefinition<&[u8], ()> = TableDefinition::new("rsk_roots");
 const RSK_META: TableDefinition<&str, Meta> = TableDefinition::new("rsk_meta");
+/// The hash of the newest RSK header this store last committed from IBD.
+const META_SYNC_TIP: &str = "sync_tip";
 
 /// Open every Rootstock table (once, when the store is created).
 pub(super) fn open_tables(txn: &WriteTransaction) -> Result<(), Error> {
@@ -227,6 +229,27 @@ macro_rules! rsk_read_methods {
             Ok(out)
         }
 
+        /// The newest RSK header an IBD pass committed, if recorded.
+        pub(crate) fn rsk_sync_tip(&self) -> Result<Option<([u8; 32], u64)>, Error> {
+            let table = self.txn.open_table(RSK_META)?;
+            let Some(raw) = table.get(META_SYNC_TIP)?.map(|v| v.value()) else {
+                return Ok(None);
+            };
+            let Meta::Text(text) = raw else {
+                return Ok(None);
+            };
+            let Ok(bytes) = hex::decode(text) else {
+                return Ok(None);
+            };
+            let Ok(hash) = <[u8; 32]>::try_from(bytes.as_slice()) else {
+                return Ok(None);
+            };
+            let Some(block) = self.rsk_block(&hash)? else {
+                return Ok(None);
+            };
+            Ok(Some((hash, block.number)))
+        }
+
         /// GHOST weight of the subtree rooted at `root`: `Σ cumulative_difficulty`
         /// over `root` and every descendant.
         pub(crate) fn rsk_subtree_work(&self, root: &[u8]) -> Result<U256, Error> {
@@ -312,6 +335,13 @@ impl WriteTxn {
     pub(crate) fn rsk_put_root(&self, hash: &[u8]) -> Result<(), Error> {
         let mut table = self.txn.open_table(RSK_ROOTS)?;
         table.insert(hash, ())?;
+        Ok(())
+    }
+
+    /// Remember the newest RSK header the IBD pass has committed.
+    pub(crate) fn set_rsk_sync_tip(&self, hash: &[u8; 32]) -> Result<(), Error> {
+        let mut table = self.txn.open_table(RSK_META)?;
+        table.insert(META_SYNC_TIP, Meta::Text(hex::encode(hash)))?;
         Ok(())
     }
 }
