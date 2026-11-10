@@ -197,8 +197,10 @@ pub struct SyncReport {
     pub chainwork: Work,
     /// The greatest height advertised by the peers that drove the sync.
     pub peer_height: u64,
-    /// Coinbase download for the retained window (empty when disabled).
+    /// Coinbase scan for the IBD tag window.
     pub coinbase: crate::CoinbaseReport,
+    /// The IBD scoring pass, when one ran.
+    pub ibd: Option<crate::IbdReport>,
 }
 
 /// A locator for our canonical tip: the last few headers (newest first), then
@@ -251,9 +253,10 @@ pub(crate) fn run(
     core: &Core,
     config: &Config,
     candidates: &mut VecDeque<SocketAddr>,
+    cache: Option<&crate::peers::PeerCache>,
 ) -> Result<SyncReport> {
     let want = config.peers.max(1);
-    let mut pool = Pool::new(config.user_agent.clone());
+    let mut pool = Pool::new(config.user_agent.clone(), cache);
     pool.fill(candidates, want, config.limit, start_height(core)?);
     if pool.is_empty() {
         bail!("could not connect to any peer");
@@ -510,6 +513,7 @@ fn report(core: &Core, config: &Config, stats: &Stats) -> Result<SyncReport> {
         chainwork,
         peer_height: stats.peer_height,
         coinbase: crate::CoinbaseReport::default(),
+        ibd: None,
     })
 }
 

@@ -11,6 +11,7 @@ use tracing::{info, warn};
 
 use crate::config::{Anchor, Config};
 use crate::peers;
+use crate::peers::PeerCache;
 use crate::sync::{self, SyncReport};
 
 /// The Rske node: a chain store plus the configuration it was opened with.
@@ -20,6 +21,8 @@ use crate::sync::{self, SyncReport};
 pub struct Node {
     core: Core,
     config: Config,
+    /// Node-level peer cache, separate from the core chain store.
+    peer_cache: PeerCache,
 }
 
 impl Node {
@@ -36,7 +39,12 @@ impl Node {
         info!("chain store:    {}", store_path.display());
 
         let core = Core::open(&store_path, config.network)?;
-        Ok(Self { core, config })
+        let peer_cache = PeerCache::load(&data_dir);
+        Ok(Self {
+            core,
+            config,
+            peer_cache,
+        })
     }
 
     /// The chain store, for reads an embedder wants to do directly.
@@ -49,14 +57,18 @@ impl Node {
         &self.config
     }
 
-    /// Plant the trust anchor if the store is empty, then download and validate
-    /// the Bitcoin tail above it. Overlaps the fetch with validation across the
+    /// Plant the trust anchor if the store is empty, sync the Bitcoin tail,
+    /// then run the pipelined IBD pass: connect an RSK peer, scan coinbases
+    /// backwards, fetch and score the headers each tag names as it arrives, and
+    /// stop at the first final root. Header sync overlaps validation across the
     /// configured peers.
     pub fn sync(&self) -> Result<SyncReport> {
         let from = plant_anchor(&self.core, &self.config)?;
         info!("syncing from height {from} …");
 
-        let (candidates, failed) = peers::candidates(self.config.addrs.clone(), &self.config.seeds);
+        let mut addrs = self.peer_cache.btc();
+        addrs.extend(self.config.addrs.iter().copied());
+        let (candidates, failed) = peers::candidates(addrs, &self.config.seeds);
         if !failed.is_empty() {
             warn!("seed(s) failed to resolve: {}", failed.join(", "));
         }
@@ -64,8 +76,44 @@ impl Node {
             bail!("no candidate peers: every DNS seed failed to resolve");
         }
         let mut candidates: VecDeque<_> = candidates.into_iter().collect();
-        let mut report = sync::run(&self.core, &self.config, &mut candidates)?;
-        report.coinbase = crate::coinbase::sync(&self.core, &self.config)?;
+        let mut report = sync::run(
+            &self.core,
+            &self.config,
+            &mut candidates,
+            Some(&self.peer_cache),
+        )?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        match runtime.block_on(crate::ibd::run(
+            &self.core,
+            &self.config,
+            Some(&self.peer_cache),
+        )) {
+            Ok(ibd) => {
+                report.coinbase = ibd.coinbase.clone();
+                let final_note = match ibd.final_root {
+                    Some(root) => format!(
+                        " — FINAL RSK header #{} 0x{}",
+                        root.number,
+                        hex::encode(root.root)
+                    ),
+                    None => String::new(),
+                };
+                info!(
+                    "ibd: {} tag(s) of {} needed, {} headers, {} roots, best {} endorse ({} required), {:.1} MB downloaded{final_note}",
+                    ibd.tags,
+                    ibd.needed,
+                    ibd.headers,
+                    ibd.roots,
+                    ibd.endorse,
+                    ibd.required,
+                    ibd.downloaded_megabytes()
+                );
+                report.ibd = Some(ibd);
+            }
+            Err(e) => warn!("ibd: {e:#}"),
+        }
         Ok(report)
     }
 
