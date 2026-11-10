@@ -43,6 +43,7 @@ use bitcoin::transaction::Transaction;
 use crate::Core;
 use crate::error::Error;
 use crate::store::{BtcReads, CoinbaseRow, DIFFICULTY_PERIOD, ReadTxn, WriteTxn};
+use rsk_consensus::validation::merged_mining::Tag;
 
 use self::finality::FinalityStatus;
 
@@ -66,6 +67,19 @@ pub struct Coinbase {
     pub coinbase: Transaction,
     /// The BIP37 proof: the block header plus the partial merkle tree.
     pub merkle_block: MerkleBlock,
+}
+
+/// The cached tag state of one stored coinbase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoinbaseTag {
+    /// No canonical coinbase row at this height.
+    Missing,
+    /// The coinbase is stored and carries no tag.
+    Untagged,
+    /// The coinbase is stored and carries this tag.
+    Tagged(Tag),
+    /// The row predates tag caching; the caller may parse and backfill it.
+    Legacy,
 }
 
 /// The BIP34 height data element in a coinbase scriptSig, as BIP37 must insert
@@ -355,6 +369,51 @@ impl Core {
         }))
     }
 
+    /// The cached tag state at `height`, without re-verifying the coinbase proof.
+    ///
+    /// The row was verified when it was written; this fast path exists so a
+    /// repeat tag scan does not re-run merkle verification for every cached
+    /// coinbase. A row written before tag caching returns
+    /// [`CoinbaseTag::Legacy`], and the caller can parse/backfill it once.
+    pub fn coinbase_tag_at(&self, height: u64) -> Result<CoinbaseTag, Error> {
+        let txn = self.store.read()?;
+        let Some(best) = txn.best_fork()? else {
+            return Ok(CoinbaseTag::Missing);
+        };
+        let Some(header) = txn.header_at(best, height)? else {
+            return Ok(CoinbaseTag::Missing);
+        };
+        let Some(row) = txn.coinbase_at(height)? else {
+            return Ok(CoinbaseTag::Missing);
+        };
+        if row.block_hash != header.block_hash().to_byte_array() {
+            return Ok(CoinbaseTag::Missing);
+        }
+        Ok(match row.tag {
+            Some(payload) => CoinbaseTag::Tagged(Tag::from_payload(&payload)),
+            None => CoinbaseTag::Legacy,
+        })
+    }
+
+    /// Cached tag states for every height in `from..=to`, in one read snapshot.
+    ///
+    /// This is the bulk form of [`Core::coinbase_tag_at`] for the backwards tag
+    /// scan: opening one transaction for the whole range avoids paying redb's
+    /// snapshot cost hundreds of times per run.
+    pub fn coinbase_tags(&self, from: u64, to: u64) -> Result<Vec<(u64, CoinbaseTag)>, Error> {
+        self.store.read()?.coinbase_tags(from, to)
+    }
+
+    /// Backfill the cached tag on an existing coinbase row.
+    pub fn set_coinbase_tag(&self, height: u64, tag: Option<Tag>) -> Result<bool, Error> {
+        let txn = self.store.write()?;
+        let updated = txn.update_coinbase_tag(height, tag.map(Tag::to_payload))?;
+        if updated {
+            txn.commit()?;
+        }
+        Ok(updated)
+    }
+
     /// Store a canonical coinbase and its inclusion proof.
     ///
     /// The proof must be for the canonical header at `height`, and the coinbase
@@ -392,20 +451,21 @@ impl Core {
                 block_hash: block_hash.to_byte_array(),
                 merkle_block: proof,
                 coinbase: raw,
+                tag: Tag::parse(coinbase).map(Tag::to_payload),
             },
         )?;
         txn.commit()
     }
 
-    /// The first height the coinbase table should hold: the newest finalized
-    /// difficulty-period boundary. Before the first boundary has settled (a
-    /// genesis-anchored or very fresh store), this falls back to one period
-    /// below the tip rather than asking for the whole chain.
+    /// The lowest height the coinbase table is allowed to hold: the newest
+    /// finalized difficulty-period boundary. Before the first boundary has
+    /// settled (a genesis-anchored or very fresh store), this falls back to one
+    /// period below the tip rather than allowing a scan to walk the whole chain.
     ///
-    /// The retained window is `[coinbase_start_height, tip]`. When the finality
-    /// mark crosses a new boundary, the previous period is superseded and its
-    /// coinbases are deleted automatically by [`Core::connect_headers`].
-    pub fn coinbase_start_height(&self) -> Result<Option<u64>, Error> {
+    /// The table is **sparse**, not a complete window: the IBD scan fetches only
+    /// the coinbases it reads. This is that scan's retention floor, and
+    /// [`Core::connect_headers`] deletes rows below a newly reached boundary.
+    pub fn coinbase_retention_floor(&self) -> Result<Option<u64>, Error> {
         let Some(tip) = self.tip_height()? else {
             return Ok(None);
         };

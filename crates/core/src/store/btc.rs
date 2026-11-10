@@ -14,6 +14,8 @@ use bitcoin::pow::Work;
 use redb::{ReadableTable, TableDefinition, TypeName, Value, WriteTransaction};
 
 use super::{DIFFICULTY_PERIOD, Meta, ReadTxn, WriteTxn};
+use crate::Tag;
+use crate::btc::CoinbaseTag;
 use crate::error::Error;
 
 /// Headers + cumulative work keyed by `(fork_id, height)`.
@@ -187,6 +189,9 @@ pub(crate) struct CoinbaseRow {
     pub merkle_block: Vec<u8>,
     /// Raw consensus encoding of the coinbase transaction (no witness).
     pub coinbase: Vec<u8>,
+    /// Cached `RSKBLOCK` payload, if the coinbase was parsed when stored.
+    /// `None` on rows written before tag caching existed.
+    pub tag: Option<[u8; 32]>,
 }
 
 impl Value for CoinbaseRow {
@@ -212,10 +217,21 @@ impl Value for CoinbaseRow {
             u32::from_be_bytes(data[at..at + 4].try_into().expect("4 bytes")) as usize;
         at += 4;
         let coinbase = data[at..at + coinbase_len].to_vec();
+        at += coinbase_len;
+        let tag = if data.len() > at && data[at] == 1 && data.len() >= at + 33 {
+            Some(
+                data[at + 1..at + 33]
+                    .try_into()
+                    .expect("32-byte tag payload"),
+            )
+        } else {
+            None
+        };
         CoinbaseRow {
             block_hash,
             merkle_block,
             coinbase,
+            tag,
         }
     }
 
@@ -223,12 +239,19 @@ impl Value for CoinbaseRow {
     where
         Self: 'b,
     {
-        let mut out = Vec::with_capacity(40 + value.merkle_block.len() + value.coinbase.len());
+        let mut out = Vec::with_capacity(73 + value.merkle_block.len() + value.coinbase.len());
         out.extend_from_slice(&value.block_hash);
         out.extend_from_slice(&(value.merkle_block.len() as u32).to_be_bytes());
         out.extend_from_slice(&value.merkle_block);
         out.extend_from_slice(&(value.coinbase.len() as u32).to_be_bytes());
         out.extend_from_slice(&value.coinbase);
+        match value.tag {
+            Some(tag) => {
+                out.push(1);
+                out.extend_from_slice(&tag);
+            }
+            None => out.push(0),
+        }
         out
     }
 
@@ -390,6 +413,30 @@ macro_rules! btc_read_methods {
         /// The greatest clock the finality rule has seen, if any.
         pub(crate) fn now_hwm(&self) -> Result<Option<u64>, Error> {
             self.meta_u64(META_NOW)
+        }
+
+        /// Cached tag states for the coinbase rows in `from..=to`.
+        ///
+        /// Rows are pruned when they stop being canonical, so the scan trusts
+        /// the stored canonicity and reads only the coinbase table.
+        #[allow(dead_code)]
+        pub(crate) fn coinbase_tags(
+            &self,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<(u64, CoinbaseTag)>, Error> {
+            let table = self.txn.open_table(BTC_COINBASES)?;
+            let mut out = Vec::new();
+            for item in table.range(from..=to)? {
+                let (height, row) = item?;
+                let row = row.value();
+                let state = match row.tag {
+                    Some(payload) => CoinbaseTag::Tagged(Tag::from_payload(&payload)),
+                    None => CoinbaseTag::Legacy,
+                };
+                out.push((height.value(), state));
+            }
+            Ok(out)
         }
 
         /// The stored coinbase row at `height`, if any.
@@ -610,6 +657,21 @@ impl WriteTxn {
         let mut table = self.txn.open_table(BTC_COINBASES)?;
         table.insert(height, row)?;
         Ok(())
+    }
+
+    /// Cache the parsed tag on an existing coinbase row.
+    pub(crate) fn update_coinbase_tag(
+        &self,
+        height: u64,
+        tag: Option<[u8; 32]>,
+    ) -> Result<bool, Error> {
+        let mut table = self.txn.open_table(BTC_COINBASES)?;
+        let Some(mut row) = table.get(height)?.map(|value| value.value()) else {
+            return Ok(false);
+        };
+        row.tag = tag;
+        table.insert(height, row)?;
+        Ok(true)
     }
 
     /// Delete every coinbase below `height`; returns how many rows went away.
