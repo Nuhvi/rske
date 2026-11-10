@@ -453,8 +453,44 @@ macro_rules! btc_read_methods {
     };
 }
 
+#[cfg(feature = "test-support")]
+impl super::Store {
+    /// Drop every Bitcoin table, so a replayed action sequence starts from an
+    /// empty store without paying for a new database.
+    pub(crate) fn reset_btc(&self) -> Result<(), Error> {
+        let txn = self.write()?;
+        txn.txn.delete_table(BTC_HEADERS)?;
+        txn.txn.delete_table(BTC_HASH_LOC)?;
+        txn.txn.delete_table(BTC_FORKS)?;
+        txn.txn.delete_table(BTC_CHECKPOINTS)?;
+        txn.txn.delete_table(BTC_COINBASES)?;
+        txn.txn.delete_table(BTC_META)?;
+        // Recreate them empty: redb only creates tables in write transactions,
+        // so a read-only view after a reset would otherwise fail.
+        txn.txn.open_table(BTC_HEADERS)?;
+        txn.txn.open_table(BTC_HASH_LOC)?;
+        txn.txn.open_table(BTC_FORKS)?;
+        txn.txn.open_table(BTC_CHECKPOINTS)?;
+        txn.txn.open_table(BTC_COINBASES)?;
+        txn.txn.open_table(BTC_META)?;
+        txn.commit()
+    }
+}
+
 impl ReadTxn {
     btc_read_methods!();
+
+    /// Every fork's metadata, by id, for the whole-state view.
+    pub(crate) fn all_forks(&self) -> Result<Vec<(u64, ForkMeta)>, Error> {
+        let forks = self.txn.open_table(BTC_FORKS)?;
+        let mut out = Vec::new();
+        for item in forks.iter()? {
+            let (id, meta) = item?;
+            out.push((id.value(), meta.value()));
+        }
+        out.sort_by_key(|(id, _)| *id);
+        Ok(out)
+    }
 
     /// Number of live forks (test-only).
     #[cfg(test)]
@@ -463,8 +499,7 @@ impl ReadTxn {
         Ok(table.iter()?.count() as u64)
     }
 
-    /// The network the chain was seeded for, if any (test-only).
-    #[cfg(test)]
+    /// The network the chain was seeded for, if any.
     pub(crate) fn network(&self) -> Result<Option<Network>, Error> {
         let table = self.txn.open_table(BTC_META)?;
         Ok(table

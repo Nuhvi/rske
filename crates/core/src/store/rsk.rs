@@ -272,6 +272,57 @@ macro_rules! rsk_read_methods {
     };
 }
 
+impl ReadTxn {
+    /// Every stored RSK header hash, sorted, for the whole-state view.
+    pub(crate) fn rsk_all_hashes(&self) -> Result<Vec<[u8; 32]>, Error> {
+        let table = self.txn.open_table(RSK_HEADERS)?;
+        let mut out = Vec::new();
+        for item in table.iter()? {
+            let (key, _) = item?;
+            if let Ok(hash) = <[u8; 32]>::try_from(key.value()) {
+                out.push(hash);
+            }
+        }
+        out.sort_unstable();
+        Ok(out)
+    }
+
+    /// The raw recorded sync-tip hash, whether or not the header is stored.
+    pub(crate) fn rsk_sync_meta(&self) -> Result<Option<[u8; 32]>, Error> {
+        let table = self.txn.open_table(RSK_META)?;
+        let Some(Meta::Text(text)) = table.get(META_SYNC_TIP)?.map(|v| v.value()) else {
+            return Ok(None);
+        };
+        Ok(hex::decode(text)
+            .ok()
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok()))
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl super::Store {
+    /// Drop every Rootstock table, so a replayed action sequence starts from an
+    /// empty forest while the Bitcoin side stays seeded.
+    pub(crate) fn reset_rsk(&self) -> Result<(), Error> {
+        let txn = self.write()?;
+        txn.txn.delete_table(RSK_HEADERS)?;
+        txn.txn.delete_table(RSK_BLOCKS)?;
+        txn.txn.delete_table(RSK_CHILDREN)?;
+        txn.txn.delete_table(RSK_UNCLES)?;
+        txn.txn.delete_table(RSK_ROOTS)?;
+        txn.txn.delete_table(RSK_META)?;
+        // Recreate them empty: redb only creates tables in write transactions,
+        // so a read-only view after a reset would otherwise fail.
+        txn.txn.open_table(RSK_HEADERS)?;
+        txn.txn.open_table(RSK_BLOCKS)?;
+        txn.txn.open_table(RSK_CHILDREN)?;
+        txn.txn.open_table(RSK_UNCLES)?;
+        txn.txn.open_table(RSK_ROOTS)?;
+        txn.txn.open_table(RSK_META)?;
+        txn.commit()
+    }
+}
+
 #[allow(dead_code)] // some reads are only used on one transaction kind
 impl ReadTxn {
     rsk_read_methods!();

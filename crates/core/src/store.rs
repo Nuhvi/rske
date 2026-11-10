@@ -121,7 +121,7 @@ impl Store {
 
     /// Create a store over the redb in-memory backend. No disk I/O: this is
     /// what tests use, and what "I control everything going on" means.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn in_memory() -> Result<Self, Error> {
         let db = Database::builder().create_with_backend(redb::backends::InMemoryBackend::new())?;
         Self::new(db)

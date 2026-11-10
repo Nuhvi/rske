@@ -136,7 +136,10 @@ impl Core {
     /// chain's work computable and creates the root chain. The network is
     /// recorded in the same transaction so a later connect with different
     /// parameters is refused.
-    pub fn seed_checkpoints(&self, entries: &[(u64, BitcoinHeader)]) -> Result<(), Error> {
+    pub(crate) fn seed_checkpoints_impl(
+        &self,
+        entries: &[(u64, BitcoinHeader)],
+    ) -> Result<(), Error> {
         let txn = self.store.write()?;
         txn.seed_checkpoints(entries)?;
         txn.set_network(self.network)?;
@@ -219,7 +222,7 @@ impl Core {
     /// Forward-only, and only to a header the store can prove it holds: the
     /// exact hash at that height on the spine's own chain. That is the same
     /// trust the seed takes, no more.
-    pub fn reanchor_shipped(
+    pub(crate) fn reanchor_shipped_impl(
         &self,
         trusted: &[(u64, BitcoinHeader)],
     ) -> Result<Option<(u64, u64)>, Error> {
@@ -405,7 +408,11 @@ impl Core {
     }
 
     /// Backfill the cached tag on an existing coinbase row.
-    pub fn set_coinbase_tag(&self, height: u64, tag: Option<Tag>) -> Result<bool, Error> {
+    pub(crate) fn set_coinbase_tag_impl(
+        &self,
+        height: u64,
+        tag: Option<Tag>,
+    ) -> Result<bool, Error> {
         let txn = self.store.write()?;
         let updated = txn.update_coinbase_tag(height, tag.map(Tag::to_payload))?;
         if updated {
@@ -420,7 +427,7 @@ impl Core {
     /// must be the transaction at index 0 in that block. The write is rejected
     /// otherwise, so the table cannot be filled with a fork's coinbase or a
     /// proof for another block.
-    pub fn store_coinbase(
+    pub(crate) fn store_coinbase_impl(
         &self,
         height: u64,
         block_hash: BlockHash,
@@ -481,7 +488,7 @@ impl Core {
     ///
     /// `connect_headers` does this automatically when the mark advances or the
     /// best chain changes; this method is for a maintenance pass.
-    pub fn prune_coinbases(&self) -> Result<usize, Error> {
+    pub(crate) fn prune_coinbases_impl(&self) -> Result<usize, Error> {
         let txn = self.store.write()?;
         let mut removed = txn.prune_non_canonical_coinbases()?;
         if let Some(checkpoint) = txn
@@ -539,7 +546,7 @@ impl Core {
     /// advance below — runs inside one write transaction, so nothing can change
     /// the store between the reads a decision is based on and the writes that
     /// act on it.
-    pub fn connect_headers(
+    pub(crate) fn connect_headers_impl(
         &self,
         headers: &[BitcoinHeader],
         now: u64,
@@ -748,7 +755,7 @@ impl Core {
 
         // Advancing the finality mark is part of connecting headers: move it if
         // this batch carried enough work above the anchor to clear the bar.
-        let finality = finalize_in_txn(&txn, self.bar, now, self.genesis_time())?;
+        let finality = finalize_in_txn(&txn, self.bar, now, self.genesis_time(), self.margin)?;
         if finality.advanced.is_some()
             && let Some(checkpoint) = txn
                 .finalized_height()?
@@ -805,7 +812,7 @@ impl Core {
     #[cfg(test)]
     pub fn finalize_period(&self, now: u64) -> Result<Option<u64>, Error> {
         let txn = self.store.write()?;
-        match finalize_in_txn(&txn, self.bar, now, self.genesis_time())?.advanced {
+        match finalize_in_txn(&txn, self.bar, now, self.genesis_time(), self.margin)?.advanced {
             Some(height) => {
                 txn.commit()?;
                 Ok(Some(height))
@@ -842,6 +849,7 @@ fn finalize_in_txn(
     bar: finality::Bar,
     now: u64,
     genesis_time: u64,
+    margin: u64,
 ) -> Result<Finality, Error> {
     // The clock may not go backwards: the bar grows with the anchor's age, so a
     // wound-back clock must not shrink it.
@@ -862,7 +870,7 @@ fn finalize_in_txn(
 
     // The mark advances freely up to the reorg-confidence depth; it is not
     // quantized to a difficulty boundary. Checkpoints are derived from it.
-    let Some(mark) = tip.checked_sub(FINALITY_MARGIN_BLOCKS) else {
+    let Some(mark) = tip.checked_sub(margin) else {
         return Ok(Finality::not_yet(status));
     };
     if mark <= status.anchor {
@@ -1046,6 +1054,92 @@ fn median_time_past_at(
 /// branches before handing them to [`Core::connect_headers`]).
 pub fn header_work(header: &BitcoinHeader) -> Work {
     header.target().to_work()
+}
+
+/// The public mutators: thin wrappers over [`Core::apply`], so the node and the
+/// tests go through the same state machine.
+impl Core {
+    /// Plant the trust anchor: the checkpoint spine, one header per difficulty
+    /// period, accepted without validating its ancestors.
+    pub fn seed_checkpoints(&self, entries: &[(u64, BitcoinHeader)]) -> Result<(), Error> {
+        expect(
+            self.apply(crate::Action::SeedCheckpoints { entries })?,
+            |outcome| matches!(outcome, crate::Outcome::Seeded),
+        )
+    }
+
+    /// Move the finality mark forward to the newest shipped checkpoint the
+    /// store already holds, if that is newer than the current mark.
+    pub fn reanchor_shipped(
+        &self,
+        trusted: &[(u64, BitcoinHeader)],
+    ) -> Result<Option<(u64, u64)>, Error> {
+        match self.apply(crate::Action::ReanchorShipped { trusted })? {
+            crate::Outcome::Reanchored(adopted) => Ok(adopted),
+            other => Err(unexpected("reanchor_shipped", other)),
+        }
+    }
+
+    /// Connect a run of Bitcoin headers at the caller's clock.
+    pub fn connect_headers(
+        &self,
+        headers: &[BitcoinHeader],
+        now: u64,
+    ) -> Result<ConnectOutcome, Error> {
+        match self.apply(crate::Action::ConnectHeaders { headers, now })? {
+            crate::Outcome::Connected(outcome) => Ok(outcome),
+            other => Err(unexpected("connect_headers", other)),
+        }
+    }
+
+    /// Store a canonical coinbase and its inclusion proof.
+    pub fn store_coinbase(
+        &self,
+        height: u64,
+        block_hash: BlockHash,
+        coinbase: &Transaction,
+        merkle_block: &MerkleBlock,
+    ) -> Result<(), Error> {
+        expect(
+            self.apply(crate::Action::StoreCoinbase {
+                height,
+                block_hash,
+                coinbase,
+                merkle_block,
+            })?,
+            |outcome| matches!(outcome, crate::Outcome::CoinbaseStored),
+        )
+    }
+
+    /// Backfill the cached tag on an existing coinbase row.
+    pub fn set_coinbase_tag(&self, height: u64, tag: Option<Tag>) -> Result<bool, Error> {
+        match self.apply(crate::Action::SetCoinbaseTag { height, tag })? {
+            crate::Outcome::CoinbaseTagUpdated(updated) => Ok(updated),
+            other => Err(unexpected("set_coinbase_tag", other)),
+        }
+    }
+
+    /// Drop coinbases below the retention floor.
+    pub fn prune_coinbases(&self) -> Result<usize, Error> {
+        match self.apply(crate::Action::PruneCoinbases)? {
+            crate::Outcome::CoinbasesPruned(pruned) => Ok(pruned),
+            other => Err(unexpected("prune_coinbases", other)),
+        }
+    }
+}
+
+fn unexpected(method: &str, outcome: crate::Outcome) -> Error {
+    Error::Internal(format!(
+        "{method} produced an unexpected outcome: {outcome:?}"
+    ))
+}
+
+fn expect(outcome: crate::Outcome, ok: impl Fn(&crate::Outcome) -> bool) -> Result<(), Error> {
+    if ok(&outcome) {
+        Ok(())
+    } else {
+        Err(Error::Internal(format!("unexpected outcome: {outcome:?}")))
+    }
 }
 
 #[cfg(test)]
@@ -1913,12 +2007,15 @@ mod tests {
 
         // Re-open the same store believing it is mainnet: the recorded network
         // wins over the caller's claim.
-        let Core { store, bar, .. } = chain;
+        let Core {
+            store, bar, margin, ..
+        } = chain;
         let chain = Core {
             store,
             network: Network::Bitcoin,
             rsk_chain: crate::rsk::chain_config(Network::Bitcoin),
             bar,
+            margin,
         };
         let header = mine_child(&canonical(&chain, 0), EASY_BITS, 1);
         let err = chain.connect_headers(&[header], NOW).unwrap_err();

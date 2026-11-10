@@ -85,7 +85,7 @@ impl Core {
     /// header's merge-mining anchor must be a canonical Bitcoin block inside the
     /// trust tail (see [`checkpoint::in_tail`]). A candidate that fails is
     /// refused, so a tree is only ever rooted at a block tied to Bitcoin.
-    pub fn propose_checkpoint(&self, entry: &RskEntry) -> Result<B256, Error> {
+    pub(crate) fn propose_checkpoint_impl(&self, entry: &RskEntry) -> Result<B256, Error> {
         let Some(btc_mark) = self.finalized_height()? else {
             return Err(Error::Unseeded);
         };
@@ -122,7 +122,10 @@ impl Core {
     /// Batches are incremental — feed them as they arrive, ascending, each
     /// parent already stored. After storing, the call attempts to establish a
     /// checkpoint and reports it in [`RskConnectOutcome::checkpoint`].
-    pub fn connect_rsk_headers(&self, entries: &[RskEntry]) -> Result<RskConnectOutcome, Error> {
+    pub(crate) fn connect_rsk_headers_impl(
+        &self,
+        entries: &[RskEntry],
+    ) -> Result<RskConnectOutcome, Error> {
         let tail = self.checkpoint_tail()?;
         let txn = self.store.write()?;
         let verifier = HeaderVerifier::default_rsk(self.rsk_chain.clone());
@@ -158,7 +161,7 @@ impl Core {
     /// difficulty understates the true chain and this call deliberately never
     /// establishes a checkpoint. Use [`Core::connect_rsk_headers`] once bodies
     /// are available.
-    pub fn connect_rsk_headers_without_uncles(
+    pub(crate) fn connect_rsk_headers_without_uncles_impl(
         &self,
         entries: &[RskEntry],
     ) -> Result<RskConnectOutcome, Error> {
@@ -232,7 +235,7 @@ impl Core {
     }
 
     /// Remember the newest RSK header an IBD pass committed.
-    pub fn set_rsk_sync_tip(&self, hash: B256) -> Result<(), Error> {
+    pub(crate) fn set_rsk_sync_tip_impl(&self, hash: B256) -> Result<(), Error> {
         let txn = self.store.write()?;
         txn.set_rsk_sync_tip(&hash.0)?;
         txn.commit()
@@ -421,6 +424,50 @@ pub use window::{
     FIVE_SIGMA_ALPHA, Share, WORK_EQUIVALENT_BLOCKS, min_tags_for_fraud_proof,
     required_endorsements,
 };
+
+/// The public Rootstock mutators: thin wrappers over [`Core::apply`].
+impl Core {
+    /// Propose a checkpoint block and mark it a root of the forest.
+    pub fn propose_checkpoint(&self, entry: &RskEntry) -> Result<B256, Error> {
+        match self.apply(crate::Action::ProposeCheckpoint { entry })? {
+            crate::Outcome::CheckpointProposed(hash) => Ok(hash),
+            other => Err(unexpected("propose_checkpoint", other)),
+        }
+    }
+
+    /// Validate and store a contiguous ascending run of RSK headers.
+    pub fn connect_rsk_headers(&self, entries: &[RskEntry]) -> Result<RskConnectOutcome, Error> {
+        match self.apply(crate::Action::ConnectRskHeaders { entries })? {
+            crate::Outcome::RskConnected(outcome) => Ok(outcome),
+            other => Err(unexpected("connect_rsk_headers", other)),
+        }
+    }
+
+    /// Validate and store an ascending run of RSK headers without uncle bodies.
+    pub fn connect_rsk_headers_without_uncles(
+        &self,
+        entries: &[RskEntry],
+    ) -> Result<RskConnectOutcome, Error> {
+        match self.apply(crate::Action::ConnectRskHeadersWithoutUncles { entries })? {
+            crate::Outcome::RskConnected(outcome) => Ok(outcome),
+            other => Err(unexpected("connect_rsk_headers_without_uncles", other)),
+        }
+    }
+
+    /// Remember the newest RSK header an IBD pass committed.
+    pub fn set_rsk_sync_tip(&self, hash: B256) -> Result<(), Error> {
+        match self.apply(crate::Action::SetRskSyncTip { hash })? {
+            crate::Outcome::SyncTipSet => Ok(()),
+            other => Err(unexpected("set_rsk_sync_tip", other)),
+        }
+    }
+}
+
+fn unexpected(method: &str, outcome: crate::Outcome) -> Error {
+    Error::Internal(format!(
+        "{method} produced an unexpected outcome: {outcome:?}"
+    ))
+}
 
 #[cfg(test)]
 mod tests {

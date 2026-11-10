@@ -28,7 +28,7 @@ pub use btc::validation::MEDIAN_TIME_PAST;
 pub use btc::{
     Coinbase, CoinbaseTag, ConnectOutcome, FINALITY_MARGIN_BLOCKS, bip34_height, header_work,
 };
-pub use core::Core;
+pub use core::{Action, Core, CoreState, ForkState, Outcome, RskState};
 pub use error::Error;
 pub use rsk::{
     EphemeralChainCheckpoint, FIVE_SIGMA_ALPHA, HeaderRef, RootScore, RskConnectOutcome, RskEntry,
