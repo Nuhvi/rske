@@ -25,8 +25,15 @@ mod store;
 
 pub use btc::finality::{FinalityStatus, REVERSAL_BLOCKS, is_checkpoint};
 pub use btc::validation::MEDIAN_TIME_PAST;
-pub use btc::{Coinbase, ConnectOutcome, FINALITY_MARGIN_BLOCKS, bip34_height, header_work};
+pub use btc::{
+    Coinbase, CoinbaseTag, ConnectOutcome, FINALITY_MARGIN_BLOCKS, bip34_height, header_work,
+};
 pub use core::Core;
 pub use error::Error;
-pub use rsk::{EphemeralChainCheckpoint, RskConnectOutcome, RskEntry};
+pub use rsk::{
+    EphemeralChainCheckpoint, FIVE_SIGMA_ALPHA, HeaderRef, RootScore, RskConnectOutcome, RskEntry,
+    Scoreboard, Share, WORK_EQUIVALENT_BLOCKS, min_tags_for_fraud_proof, oldest_checkpoint,
+    required_endorsements, score,
+};
+pub use rsk_consensus::validation::merged_mining::Tag;
 pub use store::DIFFICULTY_PERIOD;

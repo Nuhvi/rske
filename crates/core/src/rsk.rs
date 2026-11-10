@@ -145,6 +145,99 @@ impl Core {
         })
     }
 
+    /// Validate and store an ascending run of RSK headers **without their uncle
+    /// bodies**.
+    ///
+    /// This is the IBD tag-scan path: the scan needs each header's number,
+    /// canonical hash and merged-mining hash to decide which root a tag
+    /// endorses, and none of those depend on the uncles. Header rules and proof
+    /// of work are still checked; only the uncle list is unavailable, because
+    /// the plain `BlockHeaders` response carries headers alone.
+    ///
+    /// Because the stored entries have no uncle lists, their cumulative
+    /// difficulty understates the true chain and this call deliberately never
+    /// establishes a checkpoint. Use [`Core::connect_rsk_headers`] once bodies
+    /// are available.
+    pub fn connect_rsk_headers_without_uncles(
+        &self,
+        entries: &[RskEntry],
+    ) -> Result<RskConnectOutcome, Error> {
+        let txn = self.store.write()?;
+        let verifier = HeaderVerifier::default_rsk(self.rsk_chain.clone());
+        let mut connected = 0usize;
+        for entry in entries {
+            validate_header(&txn, &verifier, entry)?;
+            txn.rsk_put_entry(entry)?;
+            connected += 1;
+        }
+        txn.commit()?;
+        Ok(RskConnectOutcome {
+            connected,
+            checkpoint: None,
+        })
+    }
+
+    /// Read RSK headers backwards from a stored tip, oldest-first, stopping at
+    /// `min_bn`.
+    ///
+    /// Returns an empty vector when `tip` is not stored (for example because
+    /// the peer has advanced past the last committed header). A missing parent
+    /// stops the walk; the returned range is then the contiguous suffix that is
+    /// stored.
+    pub fn rsk_headers_back(&self, tip: B256, min_bn: u64) -> Result<Vec<RskEntry>, Error> {
+        const MAX_HEADERS: usize = 20_000;
+        let txn = self.store.read()?;
+        let mut cursor = tip.0;
+        let mut out = Vec::new();
+        while out.len() < MAX_HEADERS {
+            let Some(raw) = txn.rsk_raw_header(&cursor)? else {
+                break;
+            };
+            let Some(header) = decode_header(&raw) else {
+                break;
+            };
+            let number = header.number;
+            let parent = header.parent_hash.0;
+            let uncles = txn
+                .rsk_uncle_raw(&cursor)?
+                .into_iter()
+                .filter_map(|uncle_raw| {
+                    decode_header(&uncle_raw).map(|header| RskUncle {
+                        header,
+                        raw: uncle_raw,
+                    })
+                })
+                .collect();
+            out.push(RskEntry {
+                header,
+                raw,
+                uncles,
+            });
+            if number <= min_bn {
+                break;
+            }
+            cursor = parent;
+        }
+        out.reverse();
+        Ok(out)
+    }
+
+    /// The newest RSK header the last IBD pass committed, if recorded.
+    pub fn rsk_sync_tip(&self) -> Result<Option<(B256, u64)>, Error> {
+        Ok(self
+            .store
+            .read()?
+            .rsk_sync_tip()?
+            .map(|(hash, number)| (B256::from(hash), number)))
+    }
+
+    /// Remember the newest RSK header an IBD pass committed.
+    pub fn set_rsk_sync_tip(&self, hash: B256) -> Result<(), Error> {
+        let txn = self.store.write()?;
+        txn.set_rsk_sync_tip(&hash.0)?;
+        txn.commit()
+    }
+
     /// The Bitcoin tail a checkpoint is measured against: `(tail_start, its
     /// work)`, or `None` while no tail work is stored yet.
     fn checkpoint_tail(&self) -> Result<Option<(u64, U256)>, Error> {
@@ -234,12 +327,7 @@ fn validate_entry(
         )));
     }
 
-    let parent = txn
-        .rsk_raw_header(header.parent_hash.as_slice())?
-        .and_then(|raw| decode_header(&raw));
-    verifier
-        .verify(header, parent.as_ref())
-        .map_err(|e| Error::Rootstock(format!("header #{}: {e}", header.number)))?;
+    validate_header(txn, verifier, entry)?;
 
     if !entry.uncles.is_empty() {
         let source = TxnAncestors { txn };
@@ -260,6 +348,22 @@ fn validate_entry(
     }
 
     Ok(())
+}
+
+/// Validate the header itself against its stored parent: static rules, parent
+/// rules, and proof of work. Uncle bodies are not required here.
+fn validate_header(
+    txn: &WriteTxn,
+    verifier: &HeaderVerifier,
+    entry: &RskEntry,
+) -> Result<(), Error> {
+    let header = &entry.header;
+    let parent = txn
+        .rsk_raw_header(header.parent_hash.as_slice())?
+        .and_then(|raw| decode_header(&raw));
+    verifier
+        .verify(header, parent.as_ref())
+        .map_err(|e| Error::Rootstock(format!("header #{}: {e}", header.number)))
 }
 
 /// The RLP of the uncle list as `ommers_hash` commits to it: the wire encodings
@@ -310,7 +414,13 @@ impl AncestorSource for TxnAncestors<'_> {
     }
 }
 
+mod score;
 mod window;
+pub use score::{HeaderRef, RootScore, Scoreboard, oldest_checkpoint, score};
+pub use window::{
+    FIVE_SIGMA_ALPHA, Share, WORK_EQUIVALENT_BLOCKS, min_tags_for_fraud_proof,
+    required_endorsements,
+};
 
 #[cfg(test)]
 mod tests {
@@ -567,6 +677,63 @@ mod tests {
         assert_eq!(cp.hash, f);
         assert_eq!(cp.tail_start, 2016);
         assert_eq!(cp.work, U256::from(u64::MAX));
+    }
+
+    #[test]
+    fn stored_rsk_headers_walk_back_from_a_tip() {
+        let core = core();
+        let mut parent = B256::ZERO;
+        let mut hashes = Vec::new();
+        for number in 0..5 {
+            let hash = put(&core, &entry(number, parent, 100, 0));
+            hashes.push(hash);
+            parent = hash;
+        }
+        let tip = hashes[4];
+
+        let all = core.rsk_headers_back(tip, 0).unwrap();
+        let numbers: Vec<u64> = all.iter().map(|entry| entry.header.number).collect();
+        assert_eq!(numbers, vec![0, 1, 2, 3, 4]);
+
+        let tail = core.rsk_headers_back(tip, 3).unwrap();
+        let numbers: Vec<u64> = tail.iter().map(|entry| entry.header.number).collect();
+        assert_eq!(numbers, vec![3, 4]);
+
+        assert!(
+            core.rsk_headers_back(B256::repeat_byte(9), 0)
+                .unwrap()
+                .is_empty()
+        );
+
+        core.set_rsk_sync_tip(tip).unwrap();
+        assert_eq!(core.rsk_sync_tip().unwrap(), Some((tip, 4)));
+    }
+
+    #[test]
+    fn connect_without_uncles_stages_the_header_and_skips_the_checkpoint() {
+        let core = Core::in_memory(Network::Bitcoin).unwrap();
+        let root = put(&core, &entry(0, B256::ZERO, 100, 0));
+        let mut child = entry(1, root, 7_000_000_000_000_000, 0);
+        // The header claims an uncle; the plain header response cannot carry it.
+        child.header.uncle_count = 1;
+        child.raw.clear();
+        child.header.encode(&mut child.raw);
+
+        let out = core
+            .connect_rsk_headers_without_uncles(std::slice::from_ref(&child))
+            .unwrap();
+        assert_eq!(out.connected, 1);
+        assert!(
+            out.checkpoint.is_none(),
+            "an entry without its uncles must not establish a checkpoint"
+        );
+
+        let hash = child.header.hash();
+        let txn = core.store.read().unwrap();
+        assert!(txn.rsk_has_block(hash.as_slice()).unwrap());
+        let stored = txn.rsk_block(hash.as_slice()).unwrap().expect("stored");
+        assert_eq!(stored.number, 1);
+        assert!(txn.rsk_uncle_raw(hash.as_slice()).unwrap().is_empty());
     }
 
     #[test]
