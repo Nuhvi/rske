@@ -1,3 +1,6 @@
+use bitcoin::consensus::Encodable;
+use bitcoin::transaction::Transaction;
+
 use super::{HeaderValidator, ValidationError};
 use crate::config::ChainConfig;
 use crate::types::header::Header;
@@ -24,6 +27,88 @@ pub const MAX_RSK_TAG_POSITION_IN_TAIL: usize = 64;
 /// (30 SHA-256 hashes), enforced by `Rskip92MerkleProofValidator` from
 /// RSKIP180 (iris300).
 pub const MAX_MERGED_MINING_MERKLE_PROOF_LENGTH: usize = 960;
+
+/// A parsed `RSKBLOCK` tag.
+///
+/// This is the read side of the wire layout `compress_coinbase` produces: the
+/// 20-byte prefix of the RSK block's `hashForMergedMining`, the 7-byte CPV, the
+/// uncle count and the RSK block number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tag {
+    /// The first 20 bytes of the RSK block's merged-mining hash.
+    pub prefix: [u8; HASH_FOR_MERGED_MINING_PREFIX_LENGTH],
+    /// One byte per CPV checkpoint, newest first.
+    pub cpv: [u8; 7],
+    /// The number of uncles the RSK block included.
+    pub nu: u8,
+    /// The RSK block number.
+    pub bn: u32,
+}
+
+/// prefix (20) + cpv (7) + nu (1) + bn (4).
+const TAG_PAYLOAD_SIZE: usize = 32;
+
+impl Tag {
+    /// Parse the tag out of a coinbase transaction, if it carries one.
+    ///
+    /// The whole non-witness transaction is scanned for the **last**
+    /// `RSKBLOCK:`, matching rskj's `compress_coinbase`. The trailing-data bound
+    /// applies from the tag and hash to the end of the transaction, not just to
+    /// the script that contains the tag.
+    pub fn parse(coinbase: &Transaction) -> Option<Self> {
+        // The tag lives in the legacy transaction bytes; a witness reserved
+        // value must not be allowed to look like a later tag.
+        let mut legacy = coinbase.clone();
+        for input in &mut legacy.input {
+            input.witness.clear();
+        }
+        let mut bytes = Vec::new();
+        legacy.consensus_encode(&mut bytes).ok()?;
+        Self::from_bytes(&bytes)
+    }
+
+    /// Parse the tag out of a non-witness coinbase serialization.
+    ///
+    /// Returns the last `RSKBLOCK:` whose 32-byte payload is complete and has at
+    /// most [`MAX_BYTES_AFTER_MERGED_MINING_HASH`] bytes after it to the end of
+    /// `bytes`.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let at = find_last_subsequence(bytes, RSK_TAG)?;
+        let after = bytes.get(at + RSK_TAG.len()..)?;
+        if after.len() < TAG_PAYLOAD_SIZE
+            || after.len() - TAG_PAYLOAD_SIZE > MAX_BYTES_AFTER_MERGED_MINING_HASH
+        {
+            return None;
+        }
+        let payload: &[u8; TAG_PAYLOAD_SIZE] = after[..TAG_PAYLOAD_SIZE].try_into().ok()?;
+        Some(Self::from_payload(payload))
+    }
+
+    /// The 32-byte wire payload: prefix (20) + CPV (7) + uncle count (1) + BN (4).
+    pub fn to_payload(self) -> [u8; TAG_PAYLOAD_SIZE] {
+        let mut payload = [0u8; TAG_PAYLOAD_SIZE];
+        payload[..HASH_FOR_MERGED_MINING_PREFIX_LENGTH].copy_from_slice(&self.prefix);
+        payload[HASH_FOR_MERGED_MINING_PREFIX_LENGTH..27].copy_from_slice(&self.cpv);
+        payload[27] = self.nu;
+        payload[28..].copy_from_slice(&self.bn.to_be_bytes());
+        payload
+    }
+
+    /// Decode a 32-byte payload previously produced by [`Self::to_payload`].
+    pub fn from_payload(payload: &[u8; TAG_PAYLOAD_SIZE]) -> Self {
+        let mut prefix = [0u8; HASH_FOR_MERGED_MINING_PREFIX_LENGTH];
+        prefix.copy_from_slice(&payload[..HASH_FOR_MERGED_MINING_PREFIX_LENGTH]);
+        let mut cpv = [0u8; 7];
+        cpv.copy_from_slice(&payload[HASH_FOR_MERGED_MINING_PREFIX_LENGTH..27]);
+
+        Self {
+            prefix,
+            cpv,
+            nu: payload[27],
+            bn: u32::from_be_bytes(payload[28..32].try_into().expect("4-byte bn")),
+        }
+    }
+}
 
 pub struct MergedMiningRule {
     pub config: std::sync::Arc<ChainConfig>,
@@ -649,5 +734,146 @@ mod tests {
         // Complete from midstate with second block
         let result = sha256_from_midstate(state, 64, &data[64..]);
         assert_eq!(&result[..], &expected[..]);
+    }
+}
+
+#[cfg(test)]
+mod tag_tests {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::{OutPoint, Transaction, TxIn, TxOut, Version};
+    use bitcoin::{Amount, Sequence, Witness};
+
+    use super::Tag;
+
+    fn payload() -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out[..20].copy_from_slice(&[0x11; 20]);
+        out[20..27].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7]);
+        out[27] = 9;
+        out[28..].copy_from_slice(&1_234_567u32.to_be_bytes());
+        out
+    }
+
+    fn tag_script(tag: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x03, 0x40, 0x0d, 0x0f]; // a BIP34 height push
+        out.extend_from_slice(b"RSKBLOCK:");
+        out.extend_from_slice(tag);
+        out
+    }
+
+    /// A coinbase with a BIP34 scriptSig and the given output scripts.
+    fn coinbase(script_sig: Vec<u8>, outputs: Vec<Vec<u8>>) -> Transaction {
+        let outputs = outputs
+            .into_iter()
+            .map(|script| TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::from_bytes(script),
+            })
+            .collect();
+        Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(script_sig),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: outputs,
+        }
+    }
+
+    #[test]
+    fn parses_a_tag_in_the_script_sig() {
+        let tx = coinbase(tag_script(&payload()), Vec::new());
+        let tag = Tag::parse(&tx).expect("tag");
+        assert_eq!(tag.prefix, [0x11; 20]);
+        assert_eq!(tag.cpv, [1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(tag.nu, 9);
+        assert_eq!(tag.bn, 1_234_567);
+    }
+
+    /// The layout real miners use today: the scriptSig carries only BIP34 and
+    /// the pool name, and the tag sits in an `OP_RETURN` output.
+    #[test]
+    fn parses_a_tag_in_an_op_return_output() {
+        let mut op_return = vec![0x6a, 0x29];
+        op_return.extend_from_slice(b"RSKBLOCK:");
+        op_return.extend_from_slice(&payload());
+        let tx = coinbase(
+            vec![0x03, 0xa0, 0xdb, 0x0e, 0x0b, b'M', b'i', b'n', b'e', b'd'],
+            vec![vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed], op_return],
+        );
+        assert_eq!(Tag::parse(&tx), Some(expected()));
+    }
+
+    #[test]
+    fn the_last_tag_wins() {
+        let mut first = [0u8; 32];
+        first[..20].copy_from_slice(&[0x22; 20]);
+        first[28..].copy_from_slice(&1u32.to_be_bytes());
+
+        let mut op_return = vec![0x6a, 0x29];
+        op_return.extend_from_slice(b"RSKBLOCK:");
+        op_return.extend_from_slice(&first);
+
+        // A scriptSig tag; the output tag after it must displace it.
+        let tx = coinbase(tag_script(&payload()), vec![op_return]);
+        let tag = Tag::parse(&tx).expect("tag");
+        assert_eq!(tag.prefix, [0x22; 20]);
+        assert_eq!(tag.bn, 1);
+    }
+
+    #[test]
+    fn ignores_a_coinbase_without_a_tag() {
+        let tx = coinbase(vec![0x03, 0x40, 0x0d, 0x0f], vec![vec![0x51]]);
+        assert!(Tag::parse(&tx).is_none());
+    }
+
+    /// rskj searches the whole coinbase, not just scriptSig / `OP_RETURN`.
+    #[test]
+    fn reads_a_marker_outside_an_op_return() {
+        let mut script = vec![0x51];
+        script.extend_from_slice(b"RSKBLOCK:");
+        script.extend_from_slice(&payload());
+        let tx = coinbase(vec![0x03, 0x40, 0x0d, 0x0f], vec![script]);
+        assert_eq!(Tag::parse(&tx), Some(expected()));
+    }
+
+    /// The trailing-data bound runs to the end of the transaction: bytes in a
+    /// later output count too.
+    #[test]
+    fn trailing_data_in_a_later_output_is_rejected() {
+        let tx = coinbase(tag_script(&payload()), vec![vec![0x51; 129]]);
+        assert!(Tag::parse(&tx).is_none());
+    }
+
+    #[test]
+    fn ignores_a_truncated_tag() {
+        let full = tag_script(&payload());
+        assert!(Tag::from_bytes(&full[..full.len() - 1]).is_none());
+    }
+
+    #[test]
+    fn ignores_a_tag_with_too_much_trailing_data() {
+        let mut script = tag_script(&payload());
+        script.extend(std::iter::repeat_n(0xEF, 129));
+        assert!(Tag::from_bytes(&script).is_none());
+
+        let mut allowed = tag_script(&payload());
+        allowed.extend(std::iter::repeat_n(0xEF, 128));
+        assert!(Tag::from_bytes(&allowed).is_some());
+    }
+
+    fn expected() -> Tag {
+        let mut prefix = [0u8; 20];
+        prefix.copy_from_slice(&[0x11; 20]);
+        Tag {
+            prefix,
+            cpv: [1, 2, 3, 4, 5, 6, 7],
+            nu: 9,
+            bn: 1_234_567,
+        }
     }
 }

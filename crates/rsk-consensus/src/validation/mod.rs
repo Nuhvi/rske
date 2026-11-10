@@ -282,7 +282,7 @@ pub use header_rules::{
     BlockNumberRule, BlockParentGasLimitRule, GasLimitBoundsRule, GasUsedRule, ParentHashRule,
     TimestampRule,
 };
-pub use merged_mining::MergedMiningRule;
+pub use merged_mining::{MergedMiningRule, Tag};
 
 #[cfg(test)]
 mod tests;
