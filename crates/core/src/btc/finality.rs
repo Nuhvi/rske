@@ -2,6 +2,10 @@
 //!
 //! ## The mark
 //!
+//! In this module a **checkpoint** is always a Bitcoin period boundary (a
+//! difficulty-period start). It is never an RSK checkpoint (a trusted RSK
+//! block) and never a CPV sample.
+//!
 //! Finalization is a **mark**: a pointer to the newest header we treat as
 //! un-reorgable. Nothing is pruned when it advances, and nothing outside the
 //! crate reads it as consensus — it exists so a later Rootstock sync has a
@@ -106,10 +110,14 @@ const PRICE_P: f64 = PRICE_N / DBTC_B;
 ///
 /// Injected into [`crate::Core`] so mainnet can use the price-law
 /// [`estimated_work_bar`], while non-mainnet networks and the store-mechanics
-/// tests use the linear [`linear_reference_bar`].
+/// tests use the linear `linear_reference_bar`.
 pub type Bar = fn(anchor_work: Work, anchor_time: u64, genesis_time: u64, now: u64) -> U256;
 
-/// Whether `height` is a checkpoint: it starts a difficulty period.
+/// Whether `height` is a Bitcoin period boundary: it starts a difficulty
+/// period.
+///
+/// "Checkpoint" in this module always means this boundary — never an RSK
+/// checkpoint (a trusted RSK block) and never a CPV sample.
 ///
 /// Whether it is *finalized* is a separate question — see
 /// [`crate::Core::finalized_checkpoints`], which intersects this with the mark.

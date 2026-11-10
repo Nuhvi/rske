@@ -22,7 +22,7 @@ const RSK_BLOCKS: TableDefinition<&[u8], RskBlock> = TableDefinition::new("rsk_b
 const RSK_CHILDREN: TableDefinition<&[u8], HashList> = TableDefinition::new("rsk_children");
 /// `hash → raw uncle headers` (for the uncle rule's ancestry).
 const RSK_UNCLES: TableDefinition<&[u8], BlobList> = TableDefinition::new("rsk_uncles");
-/// Proposed checkpoint blocks: the roots of the forest, a set of hashes.
+/// Proposed RSK checkpoint blocks: the roots of the forest, a set of hashes.
 const RSK_ROOTS: TableDefinition<&[u8], ()> = TableDefinition::new("rsk_roots");
 const RSK_META: TableDefinition<&str, Meta> = TableDefinition::new("rsk_meta");
 /// The hash of the newest RSK header this store last committed from IBD.

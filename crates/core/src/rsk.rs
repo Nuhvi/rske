@@ -60,8 +60,9 @@ pub struct RskConnectOutcome {
     pub checkpoint: Option<EphemeralChainCheckpoint>,
 }
 
-/// A trusted place to start syncing from: a proposed checkpoint block whose
-/// tree carries more than `2/3` of the Bitcoin tail's work.
+/// A trusted place to start syncing from: a proposed **RSK checkpoint** — a
+/// Rootstock block whose tree carries more than `2/3` of the Bitcoin tail's
+/// work. Not a Bitcoin period boundary, and not a CPV sample.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EphemeralChainCheckpoint {
     /// The Rootstock block hash of the checkpoint.
@@ -79,7 +80,7 @@ pub struct EphemeralChainCheckpoint {
 // ── the tree on `Core` ──────────────────────────────────────────────────────
 
 impl Core {
-    /// Propose a checkpoint block and mark it a root of the forest.
+    /// Propose an RSK checkpoint block and mark it a root of the forest.
     ///
     /// The p2p layer only *finds* the candidate; the core checks it here: the
     /// header's merge-mining anchor must be a canonical Bitcoin block inside the
@@ -275,8 +276,8 @@ impl Core {
     }
 }
 
-/// The checkpoint attempt: among the proposed roots, the heaviest whose tree
-/// clears `2/3` of the Bitcoin tail's work. `None` if none does.
+/// The RSK checkpoint attempt: among the proposed roots, the heaviest whose
+/// tree clears `2/3` of the Bitcoin tail's work. `None` if none does.
 fn attempt_checkpoint(
     txn: &WriteTxn,
     tail_start: u64,
@@ -427,7 +428,7 @@ pub use window::{
 
 /// The public Rootstock mutators: thin wrappers over [`Core::apply`].
 impl Core {
-    /// Propose a checkpoint block and mark it a root of the forest.
+    /// Propose an RSK checkpoint block and mark it a root of the forest.
     pub fn propose_checkpoint(&self, entry: &RskEntry) -> Result<B256, Error> {
         match self.apply(crate::Action::ProposeCheckpoint { entry })? {
             crate::Outcome::CheckpointProposed(hash) => Ok(hash),

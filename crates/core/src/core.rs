@@ -192,9 +192,9 @@ impl Core {
 /// Every state-changing operation the node can ask the core to perform.
 #[derive(Debug)]
 pub enum Action<'a> {
-    /// Plant the trusted checkpoint spine (once).
+    /// Plant the trusted Bitcoin spine (once): one header per period boundary.
     SeedCheckpoints { entries: &'a [(u64, BitcoinHeader)] },
-    /// Adopt the newest shipped checkpoint the store already holds.
+    /// Adopt the newest shipped Bitcoin period boundary the store already holds.
     ReanchorShipped { trusted: &'a [(u64, BitcoinHeader)] },
     /// Connect a run of Bitcoin headers at the caller's clock.
     ConnectHeaders {
@@ -212,7 +212,7 @@ pub enum Action<'a> {
     SetCoinbaseTag { height: u64, tag: Option<Tag> },
     /// Drop coinbases below the retention floor.
     PruneCoinbases,
-    /// Propose a checkpoint block and make it a forest root.
+    /// Propose an RSK checkpoint block and make it a forest root.
     ProposeCheckpoint { entry: &'a RskEntry },
     /// Validate and store a contiguous RSK run with its uncle lists.
     ConnectRskHeaders { entries: &'a [RskEntry] },
@@ -263,7 +263,7 @@ pub struct ForkState {
 pub struct RskState {
     /// Every stored header hash, sorted.
     pub forest: Vec<[u8; 32]>,
-    /// Every proposed checkpoint root, sorted.
+    /// Every proposed RSK checkpoint root, sorted.
     pub roots: Vec<[u8; 32]>,
     /// The recorded sync tip exactly as stored (may name an unstored header).
     pub sync_tip: Option<[u8; 32]>,

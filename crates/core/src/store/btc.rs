@@ -24,8 +24,8 @@ const BTC_HEADERS: TableDefinition<(u64, u64), BtcRow> = TableDefinition::new("b
 const BTC_HASH_LOC: TableDefinition<&[u8], (u64, u64)> = TableDefinition::new("btc_hash_loc");
 /// Fork metadata: `fork_id → ForkMeta`.
 const BTC_FORKS: TableDefinition<u64, ForkMeta> = TableDefinition::new("btc_forks");
-/// The checkpoint spine: one trusted header per difficulty period, never
-/// pruned — the cheap whole-chain work ladder.
+/// The Bitcoin spine: one trusted header per difficulty-period boundary,
+/// never pruned — the cheap whole-chain work ladder.
 const BTC_CHECKPOINTS: TableDefinition<u64, BtcHeader> = TableDefinition::new("btc_checkpoints");
 /// Canonical coinbase transactions and their BIP37 merkle proofs, keyed by
 /// height. The row carries the block hash so a reorg can be detected.

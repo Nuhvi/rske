@@ -1,7 +1,7 @@
 //! Scoring the RSK header forest against the tags of one Bitcoin window.
 //!
 //! A tag endorses the RSK header it names: the 20-byte prefix at its `BN`, or
-//! — when no prefix matches — the header at the oldest CPV checkpoint. A tag
+//! — when no prefix matches — the header at the oldest CPV sample. A tag
 //! that names nothing is dissent. A root's score is the number of tags that
 //! resolve into its component (itself plus every descendant).
 
@@ -44,13 +44,13 @@ pub struct RootScore {
 
 /// The number of bytes in a CPV.
 const CPV_SIZE: usize = 7;
-/// The distance between CPV checkpoints, in RSK blocks.
-const CHECKPOINT: u64 = 64;
-/// The CPV carries seven checkpoints, so its oldest sample is six intervals
-/// below the newest one's section.
-const CPV_REACH: u64 = CHECKPOINT * 6;
+/// The spacing between CPV samples, in RSK blocks.
+const CPV_INTERVAL: u64 = 64;
+/// The CPV carries seven samples, so the oldest is six intervals below the
+/// newest one's section.
+const CPV_REACH: u64 = CPV_INTERVAL * 6;
 
-/// The oldest CPV checkpoint height for a tag at `bn`, if it has one.
+/// The oldest CPV sample height for a tag at `bn`, if it has one.
 ///
 /// The newest sample sits at `64 * floor((bn - 1) / 64)`; the bytes are newest
 /// first, so the last one is `CPV_REACH` blocks below it.
@@ -59,7 +59,7 @@ pub fn oldest_checkpoint(bn: u32) -> Option<u64> {
     if bn <= CPV_REACH {
         return None;
     }
-    let newest = CHECKPOINT * ((bn - 1) / CHECKPOINT);
+    let newest = CPV_INTERVAL * ((bn - 1) / CPV_INTERVAL);
     Some(newest - CPV_REACH)
 }
 
@@ -188,8 +188,8 @@ pub fn score(headers: &[HeaderRef], tags: &[Tag]) -> Vec<RootScore> {
 /// The strong pointer is the header at `BN` whose merged-mining hash starts
 /// with the tag prefix. If that block is not staged, the tag may still commit to
 /// a chain: its seven CPV bytes are the LSBs of the Bitcoin block hashes at the
-/// seven checkpoint ancestors. All seven must match one candidate chain; then
-/// the tag endorses the header at the oldest checkpoint (the deepest common
+/// seven CPV sample ancestors. All seven must match one candidate chain; then
+/// the tag endorses the header at the oldest CPV sample (the deepest common
 /// point), which is what ties an off-trunk tag back to a root.
 fn resolve(
     tag: &Tag,
@@ -232,14 +232,14 @@ fn cpv_matches(
 ) -> Option<usize> {
     let mut at = newest;
     for (i, expected) in tag.cpv.iter().enumerate() {
-        let height = oldest + (CPV_SIZE - 1 - i) as u64 * CHECKPOINT;
+        let height = oldest + (CPV_SIZE - 1 - i) as u64 * CPV_INTERVAL;
         if headers[at].number != height || headers[at].bitcoin_lsb != Some(*expected) {
             return None;
         }
         if i == CPV_SIZE - 1 {
             return Some(at);
         }
-        for _ in 0..CHECKPOINT {
+        for _ in 0..CPV_INTERVAL {
             let parent = by_hash.get(&headers[at].parent)?;
             at = *parent;
         }

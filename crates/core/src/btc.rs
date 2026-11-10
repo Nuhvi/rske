@@ -7,11 +7,13 @@
 //! whose parent is a known block but not a chain tip starts a **new fork**,
 //! which is kept (not rejected) and can later win if it becomes heavier.
 //!
-//! The trust anchor is a **checkpoint spine**: one header per difficulty period
-//! (2016 blocks), seeded from this crate's embedded `checkpoints.txt`. Because Bitcoin
-//! difficulty is constant within a period, each spine header pins the work of
-//! its whole period, so the cumulative work of the *entire* chain is known
-//! without holding every block.
+//! The trust anchor is a **Bitcoin spine**: one header per difficulty-period
+//! boundary (2016 blocks), seeded from this crate's embedded `checkpoints.txt`.
+//! "Checkpoint" in this module always means that Bitcoin period boundary —
+//! never an RSK checkpoint (a trusted RSK block) and never a CPV sample.
+//! Because Bitcoin difficulty is constant within a period, each spine header
+//! pins the work of its whole period, so the cumulative work of the *entire*
+//! chain is known without holding every block.
 //!
 //! The spine also sets the **finality mark**: a pointer to the newest header we
 //! treat as un-reorgable. The mark may be any height — the rule keeps it a
@@ -131,11 +133,11 @@ pub struct ConnectOutcome {
 }
 
 impl Core {
-    /// Plant the trust anchor: the checkpoint spine, one header per difficulty
-    /// period, accepted without validating its ancestors. This makes the whole
-    /// chain's work computable and creates the root chain. The network is
-    /// recorded in the same transaction so a later connect with different
-    /// parameters is refused.
+    /// Plant the trust anchor: the Bitcoin spine, one header per
+    /// difficulty-period boundary, accepted without validating its ancestors.
+    /// This makes the whole chain's work computable and creates the root chain.
+    /// The network is recorded in the same transaction so a later connect with
+    /// different parameters is refused.
     pub(crate) fn seed_checkpoints_impl(
         &self,
         entries: &[(u64, BitcoinHeader)],
@@ -1059,8 +1061,8 @@ pub fn header_work(header: &BitcoinHeader) -> Work {
 /// The public mutators: thin wrappers over [`Core::apply`], so the node and the
 /// tests go through the same state machine.
 impl Core {
-    /// Plant the trust anchor: the checkpoint spine, one header per difficulty
-    /// period, accepted without validating its ancestors.
+    /// Plant the trust anchor: the Bitcoin spine, one header per
+    /// difficulty-period boundary, accepted without validating its ancestors.
     pub fn seed_checkpoints(&self, entries: &[(u64, BitcoinHeader)]) -> Result<(), Error> {
         expect(
             self.apply(crate::Action::SeedCheckpoints { entries })?,

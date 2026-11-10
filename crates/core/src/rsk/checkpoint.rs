@@ -1,5 +1,10 @@
-//! The pure Rootstock checkpoint rules: where a trusted checkpoint block is,
-//! and when a Rootstock tail has enough work to trust one.
+//! The pure Rootstock checkpoint rules: where a trusted RSK checkpoint block
+//! is, and when a Rootstock tail has enough work to trust one.
+//!
+//! "Checkpoint" here is the **RSK checkpoint** — a trusted Rootstock block, an
+//! *ephemeral chain* checkpoint. It is not a Bitcoin period boundary, not a CPV
+//! sample, and not one of the hardcoded Rootstock checkpoints that mark
+//! hardfork activation.
 //!
 //! Everything here is a function of its inputs — a [`Core`] (the Bitcoin chain)
 //! and a Rootstock header — with no I/O, so it is unit testable. The *state*
@@ -13,7 +18,7 @@
 //! `prev_blockhash`: the real Bitcoin tip it was built on. That parent is the
 //! anchor.
 //!
-//! A checkpoint is a canonical Rootstock block whose **own** anchor is inside
+//! An RSK checkpoint is a canonical Rootstock block whose **own** anchor is inside
 //! the trusted, finalized Bitcoin range `[B, mark]` — at or after the last
 //! finalized checkpoint `B`, and at or below the finality mark. The tail is
 //! trusted once the work built on the checkpoint (GHOST-weighted, see
@@ -21,7 +26,8 @@
 //!
 //! These are *ephemeral chain* checkpoints — trusted places to start syncing
 //! from — and must not be confused with the hardcoded Rootstock checkpoints
-//! that mark hardfork activation.
+//! that mark hardfork activation (nor with the Bitcoin period boundaries in
+//! [`crate::btc::finality`]).
 //!
 // TODO(VETIVER-731b9d8): every block we validate is newer than the Vetiver
 // hardfork, because the checkpoint is always newer given >67% participation.
