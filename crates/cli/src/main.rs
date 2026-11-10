@@ -6,7 +6,8 @@
 //!
 //! `sync` downloads real Bitcoin headers into the store, which PoW-,
 //! continuity-, difficulty- and timestamp-validates every one and finalizes
-//! difficulty periods as it goes. `export-checkpoints` writes the store's
+//! difficulty periods as it goes; it then scans backwards for merge-mining tags
+//! and runs the RSK header IBD pass. `export-checkpoints` writes the store's
 //! period-boundary headers back out as a `checkpoints.txt`.
 //!
 //! Logs go to stderr (tracing); data (e.g. exported checkpoints) goes to
@@ -34,7 +35,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Download Bitcoin headers over P2P into the store
+    /// Sync Bitcoin headers, scan the tag window, and run the IBD
     Sync(SyncArgs),
     /// Export the store's period-boundary headers as a checkpoints.txt
     #[command(name = "export-checkpoints")]
@@ -80,6 +81,11 @@ struct SyncArgs {
     /// Maximum number of peer connections to attempt
     #[arg(long, value_name = "N", default_value_t = 8)]
     limit: usize,
+
+    /// Rootstock peer for IBD header download (repeatable; defaults to the
+    /// network's shipped bootnodes)
+    #[arg(long, value_name = "HOST:PORT")]
+    rsk_peer: Vec<String>,
 }
 
 impl SyncArgs {
@@ -92,6 +98,7 @@ impl SyncArgs {
         let config = Config {
             data_dir: self.data_dir,
             anchor,
+            rsk_peers: self.rsk_peer,
             peers: self.peers,
             limit: self.limit,
             addrs: self.addr,

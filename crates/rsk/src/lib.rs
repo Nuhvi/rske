@@ -1,8 +1,9 @@
 //! # rsk — the Rske node, as a library
 //!
 //! The node's I/O lives here, kept out of the side-effect-free [`rsk_core`]
-//! chain engine so any application can embed it: [`Node`] owns the chain store
-//! and syncs Bitcoin headers into it ([`Node::sync`]).
+//! chain engine so any application can embed it: [`Node`] owns the chain store,
+//! syncs Bitcoin headers, scans coinbases for merge-mining tags, and scores the
+//! RSK header forest ([`Node::sync`]).
 //!
 //! Nothing here runs on its own: the caller drives every operation and reads
 //! back the result. Progress is reported through [`tracing`], which the host
@@ -14,14 +15,16 @@
 
 pub mod coinbase;
 pub mod config;
+mod ibd;
 pub mod node;
 pub mod rootstock;
 
 mod peers;
 mod sync;
 
-pub use coinbase::CoinbaseReport;
+pub use coinbase::{CoinbaseReport, TagScan};
 pub use config::{Anchor, Config, DEFAULT_DATA_DIR, USER_AGENT};
+pub use ibd::IbdReport;
 pub use node::Node;
 pub use rootstock::Chain;
 pub use sync::SyncReport;

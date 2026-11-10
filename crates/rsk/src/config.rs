@@ -45,6 +45,13 @@ pub struct Config {
     pub seeds: Vec<String>,
     /// How to anchor an empty store.
     pub anchor: Anchor,
+    /// The merge-mining share the fraud proof assumes will tag honestly.
+    pub honest_share: f64,
+    /// Rootstock peers to ask for headers in IBD (`host:port`). Empty uses the
+    /// shipped bootnodes for [`Config::network`].
+    pub rsk_peers: Vec<String>,
+    /// Cap on Bitcoin blocks scanned for tags in one IBD pass.
+    pub ibd_max_blocks: u64,
 }
 
 impl Default for Config {
@@ -58,6 +65,9 @@ impl Default for Config {
             addrs: Vec::new(),
             seeds: Vec::new(),
             anchor: Anchor::Spine { cut: 0 },
+            honest_share: 0.10,
+            rsk_peers: Vec::new(),
+            ibd_max_blocks: 4_000,
         }
     }
 }
