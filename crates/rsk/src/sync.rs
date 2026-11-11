@@ -15,7 +15,7 @@ use bitcoin::block::BlockHash;
 use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::hashes::Hash as _;
 use bitcoin::pow::Work;
-use rsk_core::{Core, DIFFICULTY_PERIOD, FINALITY_MARGIN_BLOCKS, FinalityStatus};
+use rsk_core::{COINBASE_MATURITY, Core, DIFFICULTY_PERIOD, FinalityStatus};
 use tracing::{info, warn};
 
 use crate::config::Config;
@@ -44,10 +44,10 @@ fn fmt_age(seconds: u64) -> String {
     }
 }
 
-/// A bar evaluation in blocks at the anchor's work per block, with `Φ` — the
-/// bar relative to the work carried. Below one the honest chain clears it; a
+/// Network-partition safety in blocks at the anchor's work per block, with `Φ`
+/// — the requirement relative to the work carried. Below one the honest chain clears it; a
 /// fork with network share `s` is kept out while `Φ > s/(1-s)`.
-fn fmt_bar(status: &FinalityStatus) -> String {
+fn fmt_safety(status: &FinalityStatus) -> String {
     let phi = status
         .phi()
         .map(|phi| format!(", Φ {phi:.3}"))
@@ -61,7 +61,7 @@ fn fmt_bar(status: &FinalityStatus) -> String {
 }
 
 /// The finality state a run starts from. The mark is the anchor of the next
-/// bar: a fresh store starts at the seeded checkpoint, a resumed one at the
+/// requirement: a fresh store starts at the seeded checkpoint, a resumed one at the
 /// newest mark it already finalized.
 fn log_finality_start(core: &Core, now: u64) -> Result<()> {
     let Some(mark) = core.finalized_height()? else {
@@ -75,12 +75,12 @@ fn log_finality_start(core: &Core, now: u64) -> Result<()> {
     if tip == mark {
         info!(
             "finality: mark #{mark} (age {age}) is the seed checkpoint; \
-             the first bar is measured from it"
+             the first requirement is measured from it"
         );
     } else {
         info!(
             "finality: mark #{mark} (age {age}), tip #{tip}; \
-             the next bar is measured from the mark, not the checkpoint"
+             the next requirement is measured from the mark, not the checkpoint"
         );
     }
     if mark == 0 {
@@ -90,15 +90,15 @@ fn log_finality_start(core: &Core, now: u64) -> Result<()> {
         );
     } else if let Some(status) = core.finality_status(now)? {
         info!(
-            "finality: bar {} at anchor #{} (estimated work since the mark)",
-            fmt_bar(&status),
+            "finality: partition safety {} at anchor #{} (estimated work since the mark)",
+            fmt_safety(&status),
             status.anchor,
         );
     }
     Ok(())
 }
 
-/// One mark advance, with the bar that cleared it and when it happened.
+/// One mark advance, with the requirement that cleared it and when it happened.
 /// Whether this run looks partitioned, from what the node can see: its tip
 /// against the peers' best advertised height, and how old the tip is.
 ///
@@ -147,7 +147,7 @@ fn partition_note(
     })
 }
 
-/// One mark advance, with the bar that cleared it, when it happened, and (on
+/// One mark advance, with the requirement that cleared it, when it happened, and (on
 /// the first one) whether the run looks partitioned.
 fn log_advance(
     new: u64,
@@ -173,10 +173,10 @@ fn log_advance(
             let checkpoints = new / DIFFICULTY_PERIOD - status.anchor / DIFFICULTY_PERIOD;
             info!(
                 "finality: {which}: #{new} (from #{}, +{blocks} block(s), \
-                 +{checkpoints} checkpoint(s)) at {elapsed:.2}s — anchor age {}, bar {}{note}",
+                 +{checkpoints} checkpoint(s)) at {elapsed:.2}s — anchor age {}, partition safety {}{note}",
                 status.anchor,
                 fmt_age(now.saturating_sub(status.anchor_time)),
-                fmt_bar(&status),
+                fmt_safety(&status),
             );
         }
         None => info!("finality: {which}: #{new} at {elapsed:.2}s{note}"),
@@ -244,7 +244,7 @@ struct Stats {
     advances: usize,
     /// Seconds from sync start to the first advance.
     first_advance: Option<f64>,
-    /// The most recent bar evaluation.
+    /// The most recent requirement evaluation.
     last_status: Option<FinalityStatus>,
 }
 
@@ -283,7 +283,7 @@ pub(crate) fn run(
         last_status: None,
     };
 
-    // What the first bar will be measured from: the store's mark. A fresh store
+    // What the first requirement will be measured from: the store's mark. A fresh
     // starts at the checkpoint; a resumed one at its own last finalization.
     log_finality_start(core, unix_now())?;
 
@@ -358,7 +358,7 @@ pub(crate) fn run(
         }
 
         // Print the first handful, then every 20th batch, so a long run stays
-        // readable. Until the first advance, show how far along the bar is.
+        // readable. Until the first advance, show how far along the requirement is.
         if stats.batches <= 10 || stats.batches.is_multiple_of(20) {
             let percent = if stats.peer_height > 0 {
                 format!(" {:>5.1}%", 100.0 * seen as f64 / stats.peer_height as f64)
@@ -367,12 +367,12 @@ pub(crate) fn run(
             };
             let rate = stats.total as f64 / stats.started.elapsed().as_secs_f64().max(0.001);
             let live = alive.iter().filter(|a| **a).count();
-            let bar = match (stats.advances, out.finalized, out.finality) {
-                (0, None, Some(status)) => format!("  bar {}", fmt_bar(&status)),
+            let safety = match (stats.advances, out.finalized, out.finality) {
+                (0, None, Some(status)) => format!("  partition safety {}", fmt_safety(&status)),
                 _ => String::new(),
             };
             info!(
-                "[{:>4}] headers {first}..={seen}  tip {tip}{percent}  {rate:.0} h/s  peer {server} ({live}/{n} up){bar}",
+                "[{:>4}] headers {first}..={seen}  tip {tip}{percent}  {rate:.0} h/s  peer {server} ({live}/{n} up){safety}",
                 stats.batches
             );
         }
@@ -458,10 +458,10 @@ fn report(core: &Core, config: &Config, stats: &Stats) -> Result<SyncReport> {
         "a fork won the canonical chain"
     );
 
-    // 4. Finality. A lag is legitimate — the bar is allowed to deny a chain —
+    // 4. Finality. A lag is legitimate — the requirement may deny a chain —
     // so this reports the state rather than asserting progress.
     let finalized = core.finalized_height()?.unwrap_or(0);
-    let expected = tip.saturating_sub(FINALITY_MARGIN_BLOCKS);
+    let expected = tip.saturating_sub(COINBASE_MATURITY);
     match stats.first_advance {
         Some(first) => info!(
             "finality: {} mark advance(s) this run; first at {first:.2}s, mark now #{finalized}",
@@ -476,14 +476,14 @@ fn report(core: &Core, config: &Config, stats: &Stats) -> Result<SyncReport> {
              ship a checkpoint"
         );
     } else {
-        // Show the bar whenever the mark is not where it should be, including
-        // after advances: a lagging mark says *why* (e.g. 92% of the bar).
+        // Show the requirement whenever the mark is not where it should be, including
+        // after advances: a lagging mark says *why* (e.g. 92% of the requirement).
         if (stats.advances == 0 || finalized < expected)
             && let Some(status) = stats.last_status
         {
             info!(
-                "finality: bar {} at anchor #{} (age {})",
-                fmt_bar(&status),
+                "finality: partition safety {} at anchor #{} (age {})",
+                fmt_safety(&status),
                 status.anchor,
                 fmt_age(now.saturating_sub(status.anchor_time)),
             );
@@ -491,7 +491,7 @@ fn report(core: &Core, config: &Config, stats: &Stats) -> Result<SyncReport> {
         if finalized < expected {
             warn!(
                 "finality: mark #{finalized} is {} block(s) behind the expected mark \
-                 #{expected} — the bar has not cleared",
+                 #{expected} — the requirement has not cleared",
                 expected - finalized
             );
         } else {

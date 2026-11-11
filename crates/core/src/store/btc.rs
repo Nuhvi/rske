@@ -59,6 +59,7 @@ pub(super) fn open_tables(txn: &WriteTransaction) -> Result<(), Error> {
 /// types so the rule runs identically in a read snapshot (status output) and in
 /// the writer (a connect).
 pub(crate) trait BtcReads {
+    fn network(&self) -> Result<Option<Network>, Error>;
     fn best_fork(&self) -> Result<Option<u64>, Error>;
     fn fork_tip(&self, fork_id: u64) -> Result<Option<(u64, BlockHash)>, Error>;
     fn finalized_height(&self) -> Result<Option<u64>, Error>;
@@ -69,6 +70,10 @@ pub(crate) trait BtcReads {
 macro_rules! impl_btc_reads {
     ($txn:ty) => {
         impl BtcReads for $txn {
+            fn network(&self) -> Result<Option<Network>, Error> {
+                <$txn>::network(self)
+            }
+
             fn best_fork(&self) -> Result<Option<u64>, Error> {
                 <$txn>::best_fork(self)
             }

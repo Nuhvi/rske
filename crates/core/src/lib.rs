@@ -28,11 +28,11 @@ mod store;
 #[path = "../specs/mod.rs"]
 mod specs;
 
-pub use btc::finality::{FinalityStatus, REVERSAL_BLOCKS, is_checkpoint};
+pub use btc::finality::{COINBASE_MATURITY, FinalityStatus, is_checkpoint};
 pub use btc::validation::MEDIAN_TIME_PAST;
 pub use btc::{
-    Coinbase, CoinbaseTag, CoinbaseTags, ConnectOutcome, FINALITY_MARGIN_BLOCKS,
-    FinalizedCheckpoints, bip34_height, header_work,
+    Coinbase, CoinbaseTag, CoinbaseTags, ConnectOutcome, FinalizedCheckpoints, bip34_height,
+    header_work,
 };
 pub use core::{
     Action, CanonicalHeaders, Core, CoreState, ForkState, Outcome, RskState, StoredHeader,

@@ -17,14 +17,15 @@
 //!
 //! The spine also sets the **finality mark**: a pointer to the newest header we
 //! treat as un-reorgable. The mark may be any height — the rule keeps it a
-//! [`FINALITY_MARGIN_BLOCKS`] below the tip — and a **checkpoint** is the newest
+//! coinbase-maturity window below the tip — and a **checkpoint** is the newest
 //! difficulty-period start at or below it ([`finality::is_checkpoint`]). Like
-//! Electrum (which refuses forks below its hardcoded max checkpoint), we refuse
-//! forks whose `forkpoint` falls at or below the mark, but we **do not prune**
-//! the chain when it advances — headers are retained until Rootstock establishes
-//! a checkpoint, at which point pruning can occur. The spine's own table is the
-//! broader *boundary ladder*, which is what makes the whole chain's work
-//! computable. [`crate::btc::finality`] holds the rule that gates the mark.
+//! Electrum, which rejects a fork whose first height is at or below its shipped
+//! checkpoint height, we refuse forks whose `forkpoint` falls at or below the
+//! mark. We **do not prune** the chain when it advances — headers are retained
+//! until Rootstock establishes a checkpoint, at which point pruning can occur.
+//! The spine's own table is the broader *boundary ladder*, which is what makes
+//! the whole chain's work computable. [`crate::btc::finality`] holds the rule
+//! that gates the mark.
 //!
 //! Simplifications for this slice, stated explicitly so they are easy to lift:
 //!
@@ -36,7 +37,7 @@
 
 use bitcoin::block::BlockHash;
 use bitcoin::block::Header as BitcoinHeader;
-use bitcoin::consensus::{Encodable, Params};
+use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
 use bitcoin::merkle_tree::MerkleBlock;
 use bitcoin::pow::Work;
@@ -52,12 +53,6 @@ use self::finality::FinalityStatus;
 pub mod checkpoints;
 pub mod finality;
 pub mod validation;
-
-/// How far below the tip the finality mark must stay: the reorg-confidence
-/// depth. 100 blocks is the coinbase-maturity window. The mark itself may be any
-/// height; a **checkpoint** is the newest difficulty-period start at or below it
-/// ([`Core::finalized_checkpoint`]).
-pub const FINALITY_MARGIN_BLOCKS: u64 = 100;
 
 /// A canonical coinbase transaction and the partial merkle tree that proves it
 /// belongs to the block at `height`.
@@ -212,7 +207,7 @@ pub struct ConnectOutcome {
     /// The new finality mark, if this batch advanced it: the mark is advanced
     /// automatically, inside the same transaction as the connect.
     pub finalized: Option<u64>,
-    /// The finality bar as this batch left it: what the best chain carries
+    /// Network-partition safety as this batch left it: what the best chain carries
     /// above the mark and what the rule demands. `None` when the store is
     /// unseeded or a fork (not the chain the mark is measured on) is best.
     pub finality: Option<FinalityStatus>,
@@ -230,7 +225,7 @@ impl Core {
     ) -> Result<(), Error> {
         let txn = self.store.write()?;
         txn.seed_checkpoints(entries)?;
-        txn.set_network(self.network)?;
+        txn.set_network(self.params.network)?;
         txn.commit()
     }
 
@@ -268,10 +263,10 @@ impl Core {
         txn.work_at(best, height)
     }
 
-    /// The finality **mark**: the newest header that has cleared the bar and is
-    /// treated as un-reorgable. It may be any height (the rule keeps it
-    /// [`FINALITY_MARGIN_BLOCKS`] below the tip), monotonic, and `None` before
-    /// the store is seeded.
+    /// The finality **mark**: the newest header that has cleared the requirement
+    /// treated as un-reorgable. It may be any height (the rule keeps it at
+    /// least [`finality::COINBASE_MATURITY`] blocks below the tip), monotonic,
+    /// and `None` before the store is seeded.
     pub fn finalized_height(&self) -> Result<Option<u64>, Error> {
         self.store.read()?.finalized_height()
     }
@@ -285,16 +280,16 @@ impl Core {
             .map(|mark| (mark / DIFFICULTY_PERIOD) * DIFFICULTY_PERIOD))
     }
 
-    /// The finality bar as the rule sees it right now: the mark it is measured
+    /// Network-partition safety as the rule sees it right now: the mark it is measured
     /// from, the estimated work it demands, and what the best chain carries
     /// above the mark. A read-only view of the decision the connect path makes,
     /// for status output.
     pub fn finality_status(&self, now: u64) -> Result<Option<FinalityStatus>, Error> {
         let txn = self.store.read()?;
-        // The decision clamps to the stored high-water mark; the status must
-        // report the same bar, not the caller's raw clock.
-        let now = now.max(txn.now_hwm()?.unwrap_or(0));
-        Ok(measure_finality(&txn, self.bar, now, self.genesis_time())?.map(|m| m.status))
+        // Report the same requirement the decision would use: the caller's value floored
+        // by the high-water mark and the best tip's time.
+        let now = effective_clock(&txn, Some(now), txn.now_hwm()?)?;
+        Ok(measure_finality(&txn, now)?.map(|m| m.status))
     }
 
     /// Move the finality mark forward to the newest **shipped** checkpoint the
@@ -347,14 +342,6 @@ impl Core {
         }
     }
 
-    /// The network's genesis block time: the age origin for the estimated-work
-    /// power law. A Bitcoin constant, not a property of the store.
-    fn genesis_time(&self) -> u64 {
-        bitcoin::blockdata::constants::genesis_block(self.network)
-            .header
-            .time as u64
-    }
-
     /// The work of the first difficulty period after `tail_start`:
     /// `work[tail_start .. tail_start + DIFFICULTY_PERIOD)`, or `None` if that
     /// period is not stored. Rootstock's tail work is measured against 2/3 of
@@ -382,7 +369,7 @@ impl Core {
     /// ([`finality::is_checkpoint`]) *and* the mark has reached it. These are
     /// the headers safe to treat as irreversible, e.g. to embed as a trust
     /// anchor. The tip's nearest boundary is deliberately **excluded**: the
-    /// mark never reaches into the last [`FINALITY_MARGIN_BLOCKS`].
+    /// mark never reaches into the last [`finality::COINBASE_MATURITY`] blocks.
     pub fn finalized_checkpoints(&self) -> Result<FinalizedCheckpoints, Error> {
         let txn = self.store.read()?;
         let Some(finalized) = txn.finalized_height()? else {
@@ -613,8 +600,9 @@ impl Core {
     /// - The first header's parent must be a known block. If that block is a
     ///   chain tip, the run extends that chain; otherwise it starts a **new
     ///   fork** (kept, not rejected).
-    /// - Every header is PoW-, continuity-, difficulty-, median-time-past- and
-    ///   future-time-checked (see [`crate::btc::validation`]).
+    /// - Every header is PoW-, target-range-, continuity-, difficulty-,
+    ///   median-time-past- and future-time-checked
+    ///   (see [`crate::btc::validation`]).
     /// - The best chain is re-selected by cumulative work; a fork only wins
     ///   when it is strictly heavier.
     /// - A fork whose `forkpoint` is at or below the finality mark is refused
@@ -622,11 +610,12 @@ impl Core {
     ///   above the mark earlier also never becomes best once the mark has
     ///   overtaken its `forkpoint`; it is kept stored instead.
     ///
-    /// `now` is the caller's clock (unix seconds). The finality rule uses it to
-    /// measure the work above the mark, and the future-time check uses it as
-    /// the current time. The core keeps no internal clock, and the store
-    /// remembers the greatest `now` seen, so a clock wound back cannot shrink
-    /// the finality bar.
+    /// `now` is the caller's clock (unix seconds), when the caller has one. The
+    /// core keeps no internal clock. The future-time check (C7) runs only on
+    /// this value; without it, C7 is skipped. The finality rule runs on the
+    /// clock floor instead: the greatest of the supplied value, the stored
+    /// high-water mark and the best tip's header time. The store remembers the
+    /// greatest floor used on a batch that stores headers.
     ///
     /// Returns [`Error::NetworkMismatch`] if the store was seeded for a
     /// different network than this [`Core`] validates against.
@@ -638,7 +627,7 @@ impl Core {
     pub(crate) fn connect_headers_impl(
         &self,
         headers: &[BitcoinHeader],
-        now: u64,
+        now: Option<u64>,
     ) -> Result<ConnectOutcome, Error> {
         // One transaction for the entire read → validate → write → advance
         // sequence. Dropping it without committing (the early returns) aborts.
@@ -647,11 +636,11 @@ impl Core {
         // The store records the network it was seeded for; refuse to validate
         // real headers against the wrong consensus parameters.
         if let Some(seeded) = txn.network()?
-            && seeded != self.network
+            && seeded != self.params.network
         {
             return Err(Error::NetworkMismatch {
                 seeded,
-                opened: self.network,
+                opened: self.params.network,
             });
         }
 
@@ -727,8 +716,8 @@ impl Core {
         // Validate continuity, expected difficulty, median-time-past and PoW
         // for the new run. Earlier headers of this batch are visible to later
         // ones, so a long run validates itself.
-        let params = Params::new(self.network);
-        let enforce_difficulty = validation::enforces_difficulty(&params);
+        let params = &self.params;
+        let enforce_difficulty = validation::enforces_difficulty(params);
         let new_headers = &headers[start..];
         // Header at `height` on the chain being extended: a header already
         // accepted in this batch, or a stored ancestor (walking to ancestor
@@ -759,12 +748,9 @@ impl Core {
                     Some(h) => at(h)?,
                     None => None,
                 };
-                if let Some(expected) = validation::expected_bits(
-                    height,
-                    &parent_header,
-                    period_start.as_ref(),
-                    &params,
-                ) && header.bits != expected
+                if let Some(expected) =
+                    validation::expected_bits(height, &parent_header, period_start.as_ref(), params)
+                    && header.bits != expected
                 {
                     return Err(Error::BadDifficulty {
                         height,
@@ -785,7 +771,11 @@ impl Core {
             }
 
             // C7: the timestamp may lead the caller clock by at most two hours.
-            if u64::from(header.time) > now.saturating_add(validation::MAX_FUTURE_BLOCK_TIME) {
+            // Without an explicit clock there is no frame of reference for it,
+            // so the check is skipped rather than fed a chain-derived value.
+            if let Some(now) = now
+                && u64::from(header.time) > now.saturating_add(validation::MAX_FUTURE_BLOCK_TIME)
+            {
                 return Err(Error::TimestampTooNew {
                     height,
                     now,
@@ -794,6 +784,12 @@ impl Core {
                 });
             }
 
+            if !validation::target_in_range(header.bits, params) {
+                return Err(Error::BadPow {
+                    height,
+                    detail: "target out of range".into(),
+                });
+            }
             header
                 .validate_pow(header.target())
                 .map_err(|e| Error::BadPow {
@@ -861,8 +857,8 @@ impl Core {
         }
 
         // Advancing the finality mark is part of connecting headers: move it if
-        // this batch carried enough work above the anchor to clear the bar.
-        let finality = finalize_in_txn(&txn, self.bar, now, self.genesis_time(), self.margin)?;
+        // this batch carried enough work above the anchor to clear the requirement.
+        let finality = finalize_in_txn(&txn, now)?;
         if finality.advanced.is_some()
             && let Some(checkpoint) = txn
                 .finalized_height()?
@@ -897,7 +893,7 @@ impl Core {
     }
 
     /// Advance the finality mark to the newest difficulty-period boundary that
-    /// is at least a full period below the tip, if the bar allows it. Returns
+    /// is at least a full period below the tip, if the requirement allows it. Returns
     /// the new mark.
     ///
     /// This runs automatically at the end of every [`Core::connect_headers`]
@@ -905,9 +901,9 @@ impl Core {
     /// need to call it.
     ///
     /// Only advances when the work above the mark clears
-    /// [`finality::estimated_work_bar`] — the coinbase floor and the estimated
+    /// [`finality::partition_safety_required`] — the coinbase floor and the estimated
     /// work the network did since the mark. The mark is also the anchor: each
-    /// advance re-anchors, so the next bar is measured from a fresher point.
+    /// advance re-anchors, so the next requirement is measured from a fresher point.
     /// Cumulative work is known at every period boundary (the spine), so both
     /// sides are plain differences of stored cumulative work.
     ///
@@ -919,7 +915,7 @@ impl Core {
     #[cfg(test)]
     pub fn finalize_period(&self, now: u64) -> Result<Option<u64>, Error> {
         let txn = self.store.write()?;
-        match finalize_in_txn(&txn, self.bar, now, self.genesis_time(), self.margin)?.advanced {
+        match finalize_in_txn(&txn, Some(now))?.advanced {
             Some(height) => {
                 txn.commit()?;
                 Ok(Some(height))
@@ -935,12 +931,12 @@ impl Core {
 struct Finality {
     /// The new mark, if this connect advanced it.
     advanced: Option<u64>,
-    /// The bar as judged, if it could be measured.
+    /// The requirement as judged, if it could be measured.
     status: Option<FinalityStatus>,
 }
 
 impl Finality {
-    /// The bar was measured but no boundary was settled this connect.
+    /// The requirement was measured but no boundary was settled this connect.
     fn not_yet(status: FinalityStatus) -> Self {
         Self {
             advanced: None,
@@ -951,25 +947,24 @@ impl Finality {
 
 /// The finality rule, applied through an open transaction. Factored out so
 /// `connect_headers` can run it inside the same transaction as the connect.
-fn finalize_in_txn(
-    txn: &WriteTxn,
-    bar: finality::Bar,
-    now: u64,
-    genesis_time: u64,
-    margin: u64,
-) -> Result<Finality, Error> {
-    // The clock may not go backwards: the bar grows with the anchor's age, so a
-    // wound-back clock must not shrink it.
-    let hwm = txn.now_hwm()?.unwrap_or(0);
-    let now = now.max(hwm);
-    if now > hwm {
+fn finalize_in_txn(txn: &WriteTxn, now: Option<u64>) -> Result<Finality, Error> {
+    // The requirement's clock: the greatest of the caller's value (if it
+    // supplied one), the stored high-water mark and the best tip's header time.
+    // A caller with no clock therefore measures the requirement from the
+    // chain's own time, and a stale value can never put the rule behind the
+    // chain it already holds. C7 does not use this value: a chain-derived clock
+    // would reject the very headers it is meant to admit, so C7 runs only on an
+    // explicit clock.
+    let hwm = txn.now_hwm()?;
+    let now = effective_clock(txn, now, hwm)?;
+    if hwm.is_none_or(|seen| now > seen) {
         txn.set_now_hwm(now)?;
     }
 
     // Only the spine's chain settles a boundary: a fork that is best has no
     // trusted history behind it, and moving the mark onto it is exactly the
     // capture the rule exists to prevent.
-    let Some(measurement) = measure_finality(txn, bar, now, genesis_time)? else {
+    let Some(measurement) = measure_finality(txn, now)? else {
         return Ok(Finality::default());
     };
     let status = measurement.status;
@@ -977,7 +972,7 @@ fn finalize_in_txn(
 
     // The mark advances freely up to the reorg-confidence depth; it is not
     // quantized to a difficulty boundary. Checkpoints are derived from it.
-    let Some(mark) = tip.checked_sub(margin) else {
+    let Some(mark) = tip.checked_sub(finality::COINBASE_MATURITY) else {
         return Ok(Finality::not_yet(status));
     };
     if mark <= status.anchor {
@@ -998,28 +993,53 @@ fn finalize_in_txn(
     })
 }
 
-/// A bar evaluation and the tip it was taken at.
+/// The clock a connect or a status read runs on: the greatest supplied value,
+/// the stored high-water mark, and the best tip's header time.
+///
+/// The first two keep a wound-back or absent caller clock from shrinking the
+/// requirement. The third makes the chain's own time the floor, so a caller with
+/// no clock still gets a meaningful future-time bound and requirement.
+fn effective_clock<R: BtcReads>(
+    reads: &R,
+    supplied: Option<u64>,
+    hwm: Option<u64>,
+) -> Result<u64, Error> {
+    let tip_time = match reads.best_fork()? {
+        Some(fork) => match reads.fork_tip(fork)? {
+            Some((height, _)) => reads
+                .header_at(fork, height)?
+                .map_or(0, |header| u64::from(header.time)),
+            None => 0,
+        },
+        None => 0,
+    };
+    Ok(supplied.unwrap_or(0).max(hwm.unwrap_or(0)).max(tip_time))
+}
+
+/// A partition-safety evaluation and the tip it was taken at.
 struct Measurement {
     status: FinalityStatus,
     tip: u64,
 }
 
-/// The bar through an open transaction, writing nothing of its own. Shared by
-/// the connect path and [`Core::finality_status`], so a status read and a
-/// decision can never drift.
+/// The requirement through an open transaction, writing nothing of its own.
+/// Shared by the connect path and [`Core::finality_status`], so a status read
+/// and a decision can never drift.
 ///
 /// The anchor is the mark itself: any history the node has already finalized is
 /// trusted, so a returning node measures from its own chain and a fresh store
 /// measures from the seeded spine tip. Each advance re-anchors, resetting `T`.
-fn measure_finality<R: BtcReads>(
-    reads: &R,
-    bar: finality::Bar,
-    now: u64,
-    genesis_time: u64,
-) -> Result<Option<Measurement>, Error> {
+///
+/// The rule is selected by the network recorded in the store, not by the
+/// caller: mainnet prices elapsed time, every other network falls back to the
+/// tip's difficulty.
+fn measure_finality<R: BtcReads>(reads: &R, now: u64) -> Result<Option<Measurement>, Error> {
     if reads.best_fork()? != Some(0) {
         return Ok(None);
     }
+    let Some(network) = reads.network()? else {
+        return Ok(None);
+    };
     let Some((tip, _)) = reads.fork_tip(0)? else {
         return Ok(None);
     };
@@ -1029,10 +1049,26 @@ fn measure_finality<R: BtcReads>(
     let anchor_header = reads
         .header_at(0, anchor)?
         .ok_or_else(|| Error::Internal(format!("no header at the finality mark {anchor}")))?;
+    let tip_header = reads
+        .header_at(0, tip)?
+        .ok_or_else(|| Error::Internal(format!("no header at the best tip {tip}")))?;
     let anchor_time = anchor_header.time as u64;
     let anchor_work = anchor_header.target().to_work();
+    let tip_work = tip_header.target().to_work();
+    let genesis_time = u64::from(
+        bitcoin::blockdata::constants::genesis_block(network)
+            .header
+            .time,
+    );
     let now = now.max(anchor_time);
-    let need = bar(anchor_work, anchor_time, genesis_time, now);
+    let need = finality::partition_safety_required(
+        network,
+        anchor_work,
+        anchor_time,
+        genesis_time,
+        tip_work,
+        now,
+    );
 
     let work = |height: u64| -> Result<Work, Error> {
         reads
@@ -1193,6 +1229,24 @@ impl Core {
         headers: &[BitcoinHeader],
         now: u64,
     ) -> Result<ConnectOutcome, Error> {
+        self.connect_headers_with_clock(headers, Some(now))
+    }
+
+    /// Connect a run of Bitcoin headers with no caller clock. The clock is the
+    /// stored high-water mark or the best tip's header time, whichever is
+    /// greater.
+    pub fn connect_headers_clockless(
+        &self,
+        headers: &[BitcoinHeader],
+    ) -> Result<ConnectOutcome, Error> {
+        self.connect_headers_with_clock(headers, None)
+    }
+
+    fn connect_headers_with_clock(
+        &self,
+        headers: &[BitcoinHeader],
+        now: Option<u64>,
+    ) -> Result<ConnectOutcome, Error> {
         match self.apply(crate::Action::ConnectHeaders { headers, now })? {
             crate::Outcome::Connected(outcome) => Ok(outcome),
             other => Err(unexpected("connect_headers", other)),
@@ -1263,9 +1317,9 @@ mod tests {
     const BASE_TIME: u32 = 1_600_000_000;
 
     /// The clock the synthetic tests connect at: 2,400,000 s (40 days) past
-    /// [`BASE_TIME`]. The bar is then 4,000 blocks of work above the anchor, so
-    /// a chain of 4,032 synthetic blocks settles its first new boundary — the
-    /// neutral setting for tests that are not about the bar itself.
+    /// [`BASE_TIME`]. It is comfortably after every synthetic header time and
+    /// before any real clock, so it never trips C7 — the neutral setting for
+    /// tests that are not about time.
     const NOW: u64 = BASE_TIME as u64 + 2_400_000;
 
     /// The easiest valid Bitcoin target (`0x207fffff`): nearly any hash passes,
@@ -1732,9 +1786,9 @@ mod tests {
         assert!(cps.iter().all(|(h, _)| *h <= finalized));
         assert_eq!(cps.len() as u64, finalized / DIFFICULTY_PERIOD + 1);
 
-        // The mark sits FINALITY_MARGIN_BLOCKS below the tip.
+        // The mark sits finality::COINBASE_MATURITY below the tip.
         let tip = chain.tip_height()?.expect("a tip");
-        assert_eq!(tip, finalized + FINALITY_MARGIN_BLOCKS);
+        assert_eq!(tip, finalized + finality::COINBASE_MATURITY);
         Ok(())
     }
 
@@ -1813,122 +1867,146 @@ mod tests {
     }
 
     #[test]
-    fn finalizes_once_the_bar_is_cleared() -> eyre::Result<()> {
-        // At constant difficulty the bar is a number of blocks above the anchor;
-        // once the chain carries that many, the mark advances to the reorg depth.
+    fn finalizes_at_the_reorg_depth() -> eyre::Result<()> {
+        // On a non-mainnet network the requirement is the tip's own work, so the
+        // mark is the tip minus the coinbase-maturity window as soon as the tip
+        // is deeper than that window.
         let chain = seeded();
         let checkpoint = DIFFICULTY_PERIOD as usize;
 
-        // Build a chain to the checkpoint height: nothing to settle yet (the tip
-        // has not buried a boundary by the margin).
         let run1 = easy_chain(&canonical(&chain, 0), checkpoint, 1);
-        chain.connect_headers(&run1, NOW)?;
+        let out = chain.connect_headers(&run1, NOW)?;
         assert_eq!(chain.tip_height()?, Some(checkpoint as u64));
+        assert_eq!(
+            out.finalized,
+            Some(checkpoint as u64 - finality::COINBASE_MATURITY)
+        );
 
-        // Now extend past the checkpoint with blocks at the same difficulty.
         let run2 = easy_chain(&canonical(&chain, checkpoint as u64), checkpoint + 100, 1);
         let out = chain.connect_headers(&run2, NOW)?;
         assert_eq!(chain.tip_height()?, Some((2 * checkpoint + 100) as u64));
-
-        // 4,132 blocks of work above the anchor clears the 4,000-block bar.
-        assert_eq!(out.finalized, Some(2 * DIFFICULTY_PERIOD));
-        assert_eq!(chain.finalized_height()?, Some(2 * DIFFICULTY_PERIOD));
+        assert_eq!(
+            out.finalized,
+            Some((2 * checkpoint + 100) as u64 - finality::COINBASE_MATURITY)
+        );
+        assert_eq!(
+            chain.finalized_height()?,
+            Some(2 * DIFFICULTY_PERIOD + 100 - finality::COINBASE_MATURITY)
+        );
         Ok(())
     }
 
-    /// These store tests use the linear reference bar, `w0 · max(100, T/600)`;
-    /// what gates the mark is the work above the anchor, not the number of
-    /// blocks carrying it.
+    /// The depth is what gates the mark on a non-mainnet network: below it
+    /// nothing advances, above it the mark moves to `tip - COINBASE_MATURITY`.
     #[test]
-    fn the_bar_gates_finalization() -> eyre::Result<()> {
+    fn the_depth_gates_the_mark() -> eyre::Result<()> {
         let chain = seeded();
         let genesis = canonical(&chain, 0);
         let w = crate::btc::header_work(&genesis);
 
-        // A clock 4,032 blocks past the anchor: the bar asks for 4,032 blocks
-        // of work above it.
-        let now = genesis.time as u64 + 4_032 * finality::TARGET_BLOCK_SECONDS;
-
-        // 4,031 blocks of work: one short, so no boundary settles — and the
-        // status says exactly why.
-        let run = easy_chain(&genesis, 4_031, 1);
-        let short = chain.connect_headers(&run, now)?;
-        assert_eq!(chain.tip_height()?, Some(4_031));
-        assert_eq!(short.finalized, None, "one block short must not settle");
-        let status = short.finality.expect("the bar is measurable");
-        assert_eq!(status.anchor, 0);
-        assert_eq!(status.anchor_time, genesis.time as u64);
+        // 90 blocks: the tip is shallower than the window, so the candidate
+        // underflows to 0 and the mark stays where it is.
+        let short = chain.connect_headers(&easy_chain(&genesis, 90, 1), NOW)?;
+        assert_eq!(short.finalized, None);
+        assert_eq!(chain.finalized_height()?, Some(0));
+        let status = short.finality.expect("the requirement is measurable");
         assert_eq!(
             finality::work_to_u256(status.have),
-            finality::work_to_u256(w) * alloy_primitives::U256::from(4_031u64),
-            "work above the anchor, one short"
+            finality::work_to_u256(w) * alloy_primitives::U256::from(90u64)
         );
-        assert_eq!(
-            status.need,
-            finality::work_to_u256(w) * alloy_primitives::U256::from(4_032u64)
-        );
-        assert!(!status.clears());
-        assert_eq!(chain.finalized_height()?, Some(0));
+        let tip_work = crate::btc::header_work(&canonical(&chain, 90));
+        assert_eq!(status.need, finality::work_to_u256(tip_work));
+        assert!(status.clears(), "the tip carries its own work");
 
-        // The last block tips it over: the mark advances to tip - 100.
-        let last = mine_child(&canonical(&chain, 4_031), EASY_BITS, 1);
-        let out = chain.connect_headers(&[last], now)?;
-        let mark = 4_032 - FINALITY_MARGIN_BLOCKS;
-        assert_eq!(out.finalized, Some(mark));
-        assert!(out.finality.expect("the bar is measurable").clears());
-        assert_eq!(chain.finalized_height()?, Some(mark));
-        // The mark is not a boundary; the newest checkpoint is still 2,016.
-        assert_eq!(chain.finalized_checkpoint()?, Some(DIFFICULTY_PERIOD));
+        // 101 blocks: one above the window, so the mark moves to height 1.
+        let run = easy_chain(&canonical(&chain, 90), 11, 1);
+        let out = chain.connect_headers(&run, NOW)?;
+        assert_eq!(chain.tip_height()?, Some(101));
+        assert_eq!(out.finalized, Some(1));
+        assert_eq!(chain.finalized_height()?, Some(1));
         Ok(())
     }
 
-    /// A fresh anchor asks for the coinbase window only: the estimate is zero
-    /// at age zero, so the reference floor is the whole bar.
+    /// A non-mainnet network asks for the tip's difficulty only: the
+    /// requirement is the tip block's work, not a time-based window.
     #[test]
-    fn a_fresh_anchor_asks_for_the_reversal_window() -> eyre::Result<()> {
+    fn a_non_mainnet_anchor_asks_for_the_tip_work() -> eyre::Result<()> {
         let chain = seeded();
         let genesis = canonical(&chain, 0);
         let w = crate::btc::header_work(&genesis);
 
-        // Ten blocks, connected at the anchor's own timestamp (age zero).
         let run = easy_chain(&genesis, 10, 1);
         let out = chain.connect_headers(&run, genesis.time as u64)?;
-        let status = out.finality.expect("the bar is measurable");
+        let status = out.finality.expect("the requirement is measurable");
         assert_eq!(
             finality::work_to_u256(status.have),
             finality::work_to_u256(w) * alloy_primitives::U256::from(10u64)
         );
-        assert_eq!(
-            status.need,
-            finality::work_to_u256(w) * alloy_primitives::U256::from(finality::REVERSAL_BLOCKS)
-        );
-        assert!(
-            !status.clears(),
-            "10 blocks is short of the 100-block floor"
-        );
+        let tip_work = crate::btc::header_work(&canonical(&chain, 10));
+        assert_eq!(status.need, finality::work_to_u256(tip_work));
+        assert!(status.clears());
         Ok(())
     }
 
-    /// The clock is the one unhashed input, so it may only move the bar up: a
-    /// later connect with an earlier `now` sees the same bar.
+    /// A wound-back clock is floored by the high-water mark: the connect
+    /// succeeds and the stored clock is not lowered.
     #[test]
-    fn a_wound_back_clock_cannot_shrink_the_bar() -> eyre::Result<()> {
+    fn a_wound_back_clock_is_floored() -> eyre::Result<()> {
         let chain = seeded();
         let genesis = canonical(&chain, 0);
         let anchor_time = genesis.time as u64;
 
         let first = easy_chain(&genesis, 5, 1);
-        let out = chain.connect_headers(&first, anchor_time + 86_400)?;
-        let high = out.finality.expect("measurable").need;
+        let high = anchor_time + 86_400;
+        chain.connect_headers(&first, high)?;
+        assert_eq!(chain.state()?.now_hwm, Some(high));
 
         // A day earlier than the clock already seen.
         let second = mine_child(&canonical(&chain, 5), EASY_BITS, 1);
         let out = chain.connect_headers(&[second], anchor_time)?;
-        assert_eq!(
-            out.finality.expect("measurable").need,
-            high,
-            "the bar must not shrink when the clock winds back"
+        assert_eq!(out.connected, 1, "a stale clock must not refuse the batch");
+        assert_eq!(chain.state()?.now_hwm, Some(high), "the floor did not hold");
+        Ok(())
+    }
+
+    /// An explicit clock is the only basis for C7: a stale one rejects a
+    /// header that the chain itself would allow.
+    #[test]
+    fn a_stale_clock_fails_the_future_time_check() -> eyre::Result<()> {
+        let chain = seeded();
+        let genesis = canonical(&chain, 0);
+        let anchor_time = genesis.time as u64;
+
+        let child = mine_at(genesis.block_hash(), genesis.time + 600, EASY_BITS);
+        let stale = anchor_time - 86_400;
+        let err = chain.connect_headers(&[child], stale).unwrap_err();
+        assert!(
+            matches!(err, Error::TimestampTooNew { now, .. } if now == stale),
+            "got {err:?}"
         );
+        Ok(())
+    }
+
+    /// A clockless connect runs on the chain's own time and skips C7: with no
+    /// clock there is no frame of reference for the future-time check.
+    #[test]
+    fn a_clockless_connect_runs_on_the_chain_time() -> eyre::Result<()> {
+        let chain = seeded();
+        let genesis = canonical(&chain, 0);
+        let anchor_time = genesis.time as u64;
+
+        let run = easy_chain(&genesis, 3, 1);
+        let out = chain.connect_headers_clockless(&run)?;
+        assert_eq!(out.connected, 3);
+        // The clock is the new tip's time, recorded as the mark.
+        assert_eq!(chain.state()?.now_hwm, Some(anchor_time + 3));
+
+        // C7 is skipped without an explicit clock, so a future header is not
+        // rejected for its timestamp alone.
+        let tip = canonical(&chain, 3);
+        let ahead = mine_at(tip.block_hash(), (anchor_time + 10_000) as u32, EASY_BITS);
+        let out = chain.connect_headers_clockless(&[ahead])?;
+        assert_eq!(out.connected, 1, "no future-time bound without a clock");
         Ok(())
     }
 
@@ -1947,31 +2025,33 @@ mod tests {
         assert_eq!(out.finalized, None);
         assert_eq!(
             out.finality, None,
-            "the bar is not measured on a fork's chain"
+            "the requirement is not measured on a fork's chain"
         );
         assert_eq!(chain.finalized_height()?, Some(0));
         Ok(())
     }
 
-    /// The shipped estimated-work bar through the store: seed the real spine
-    /// tip, ask for the bar a month later, and check it is a few thousand
-    /// blocks — the model's value — rather than the linear age term.
+    /// Mainnet network-partition safety through the store: seed the real spine
+    /// tip, ask a month later, and check the requirement is a few thousand
+    /// blocks — the price law's value.
     #[test]
-    fn the_estimated_work_bar_is_used_by_the_store() -> eyre::Result<()> {
+    fn the_mainnet_requirement_is_used_by_the_store() -> eyre::Result<()> {
         let spine = crate::btc::checkpoints::parse()?;
         let (height, header) = *spine.last().expect("non-empty spine");
-        let chain = Core::in_memory_with_bar(Network::Bitcoin, finality::estimated_work_bar)?;
+        let chain = Core::in_memory(Network::Bitcoin)?;
         chain.seed_checkpoints(&[(height, header)])?;
 
         let now = header.time as u64 + 31 * 86_400;
-        let status = chain.finality_status(now)?.expect("the bar is measurable");
+        let status = chain
+            .finality_status(now)?
+            .expect("the requirement is measurable");
         assert_eq!(status.anchor, height);
         assert_eq!(status.have_blocks(), alloy_primitives::U256::ZERO);
         let blocks = status.need_blocks();
         assert!(
             blocks > alloy_primitives::U256::from(2_000u64)
                 && blocks < alloy_primitives::U256::from(3_500u64),
-            "bar {blocks} blocks"
+            "requirement {blocks} blocks"
         );
         Ok(())
     }
@@ -1985,7 +2065,7 @@ mod tests {
         let run = easy_chain(&canonical(&chain, 0), 4_032, 1);
         chain.connect_headers(&run, NOW)?;
         // The mark is at the reorg depth, not quantized to a boundary.
-        let mark = 4_032 - FINALITY_MARGIN_BLOCKS;
+        let mark = 4_032 - finality::COINBASE_MATURITY;
         assert_eq!(chain.finalized_height()?, Some(mark));
 
         // A newer spine whose tip the store holds: adopt it.
@@ -2022,55 +2102,64 @@ mod tests {
         let chain = seeded();
         let genesis = canonical(&chain, 0);
 
-        // Build a main chain but stay below the bar, so the mark is still 0 and
-        // a fork at height 2001 is allowed to be created.
-        let main = easy_chain(&genesis, 3_000, 1);
+        // Build the main chain to 2,100: the mark is 2,000, so a fork at 2,001
+        // is still above it and may be created.
+        let main = easy_chain(&genesis, 2_100, 1);
         chain.connect_headers(&main, NOW)?;
-        assert_eq!(chain.finalized_height()?, Some(0));
+        assert_eq!(chain.finalized_height()?, Some(2_000));
 
-        let fork = easy_chain(&main[1_999], 500, 2_000);
+        // Keep the branch lighter than the trunk for now, so the trunk stays
+        // the best chain and the mark can advance.
+        let fork = easy_chain(&main[1_999], 50, 2_000);
         chain.connect_headers(&fork, NOW)?;
+        assert_eq!(chain.best_fork()?, Some(0));
 
-        // Advance the main chain: the mark reaches 4,032, past the forkpoint.
-        let rest = easy_chain(&canonical(&chain, 3_000), 1_132, 1);
+        // Advance the main chain past the forkpoint: the mark reaches 3,132.
+        let rest = easy_chain(&canonical(&chain, 2_100), 1_132, 1);
         chain.connect_headers(&rest, NOW)?;
-        assert_eq!(chain.finalized_height()?, Some(4_032));
+        assert_eq!(chain.tip_height()?, Some(3_232));
+        assert_eq!(chain.finalized_height()?, Some(3_132));
 
         // Make the fork heavier than the main chain: it must not win.
-        let extension = easy_chain(&fork[499], 2_000, 3_000);
+        let extension = easy_chain(&fork[49], 2_000, 3_000);
         let out = chain.connect_headers(&extension, NOW)?;
         assert_eq!(out.connected, 2_000);
         assert_eq!(chain.best_fork()?, Some(0), "the finality mark is a floor");
-        assert_eq!(chain.tip_height()?, Some(4_132));
-        assert_eq!(chain.finalized_height()?, Some(4_032));
+        assert_eq!(chain.tip_height()?, Some(3_232));
+        assert_eq!(chain.finalized_height()?, Some(3_132));
         Ok(())
     }
 
     /// The status query must use the same clock high-water mark as the
-    /// decision, or it reports a smaller bar than the one that gates the mark.
+    /// decision, or it reports a smaller requirement than the one that gates the
+    /// mark. The mainnet policy is the one that reads the clock; its pow limit
+    /// is relaxed so the synthetic headers are easy to mine.
     #[test]
     fn the_status_uses_the_finality_clock_high_water_mark() -> eyre::Result<()> {
-        let chain = seeded();
-        let genesis = canonical(&chain, 0);
-        let w = crate::btc::header_work(&genesis);
+        let mut params = bitcoin::consensus::Params::new(Network::Bitcoin);
+        params.max_attainable_target =
+            bitcoin::pow::Target::from_compact(CompactTarget::from_consensus(EASY_BITS));
+        let chain = Core::in_memory_with_params(params)?;
+        let genesis = mine_genesis(0);
+        chain.seed_checkpoints(&[(0, genesis)])?;
         let high = genesis.time as u64 + 4_000 * finality::TARGET_BLOCK_SECONDS;
 
         // A connect at the high clock stores the HWM (no finalization yet).
-        chain.connect_headers(&easy_chain(&genesis, 10, 1), high)?;
+        let out = chain.connect_headers(&easy_chain(&genesis, 10, 1), high)?;
+        let need = out.finality.expect("the requirement is measurable").need;
 
         let status = chain
             .finality_status(genesis.time as u64)?
-            .expect("the bar is measurable");
+            .expect("the requirement is measurable");
         assert_eq!(
-            status.need,
-            finality::work_to_u256(w) * alloy_primitives::U256::from(4_000u64),
+            status.need, need,
             "the status must use the stored HWM, not the earlier clock"
         );
         Ok(())
     }
 
     /// The anchor *is* the mark: a returning node measures from its own
-    /// finalized chain, and each advance re-anchors, so the bar is never
+    /// finalized chain, and each advance re-anchors, so the requirement is never
     /// measured from a stale fixed checkpoint.
     #[test]
     fn the_anchor_follows_the_mark() -> eyre::Result<()> {
@@ -2080,12 +2169,12 @@ mod tests {
         chain.seed_checkpoints(&[(0, g0), (DIFFICULTY_PERIOD, g2016)])?;
 
         // A clock 4,000 blocks past the seeded tip's time, and a run of 4,100
-        // blocks: the bar asks for 4,000 blocks above the seeded mark (2016)
-        // and the run carries 4,100, so the mark advances to 2016 + 4,100 - 100.
+        // blocks: the mark advances to the tip minus the depth, 2016 + 4,100 -
+        // 100.
         let now = g2016.time as u64 + 4_000 * finality::TARGET_BLOCK_SECONDS;
         let run = easy_chain(&g2016, 4_100, 1);
         let out = chain.connect_headers(&run, now)?;
-        let status = out.finality.expect("the bar is measurable");
+        let status = out.finality.expect("the requirement is measurable");
         assert_eq!(status.anchor, DIFFICULTY_PERIOD);
         assert_eq!(status.anchor_time, g2016.time as u64);
         assert!(status.clears());
@@ -2124,6 +2213,75 @@ mod tests {
         Ok(())
     }
 
+    /// The boundary retarget is enforced through the store: a period mined in a
+    /// quarter of the target timespan must compute a fourfold harder target, and
+    /// the header at the boundary must carry it.
+    #[test]
+    fn the_boundary_retarget_is_enforced() -> eyre::Result<()> {
+        // Regtest parameters with the expected-bits rule switched on. The pow
+        // limit is the easy target, so a fourfold retarget stays mineable.
+        let mut params = bitcoin::consensus::Params::new(Network::Regtest);
+        params.allow_min_difficulty_blocks = false;
+        params.no_pow_retargeting = false;
+        let chain = Core::in_memory_with_params(params.clone())?;
+
+        let genesis = mine_genesis(0);
+        chain.seed_checkpoints(&[(0, genesis)])?;
+
+        // 2,015 blocks at 150 s each: a quarter of the two-week timespan.
+        let mut parent = genesis;
+        let mut run = Vec::with_capacity(2_015);
+        for i in 1..=2_015u32 {
+            let header = mine_at(parent.block_hash(), BASE_TIME + i * 150, EASY_BITS);
+            run.push(header);
+            parent = header;
+        }
+        chain.connect_headers_clockless(&run)?;
+        assert_eq!(chain.tip_height()?, Some(2_015));
+
+        // The boundary header must carry the recomputed bits.
+        let expected = CompactTarget::from_header_difficulty_adjustment(genesis, parent, &params);
+        assert_ne!(
+            expected.to_consensus(),
+            EASY_BITS,
+            "a quarter-length period must retarget"
+        );
+        let boundary = mine_at(
+            parent.block_hash(),
+            BASE_TIME + 2_016 * 150,
+            expected.to_consensus(),
+        );
+        chain.connect_headers_clockless(&[boundary])?;
+        assert_eq!(chain.tip_height()?, Some(2_016));
+
+        // A sibling that keeps the old bits is refused at the boundary.
+        let wrong = mine_at(parent.block_hash(), BASE_TIME + 2_016 * 150 + 1, EASY_BITS);
+        let err = chain.connect_headers_clockless(&[wrong]).unwrap_err();
+        assert!(
+            matches!(err, Error::BadDifficulty { height: 2_016, .. }),
+            "got {err:?}"
+        );
+
+        // Inside the new period the expected bits are the boundary's bits.
+        let after = mine_at(
+            boundary.block_hash(),
+            BASE_TIME + 2_017 * 150,
+            expected.to_consensus(),
+        );
+        chain.connect_headers_clockless(&[after])?;
+        let stale = mine_at(
+            boundary.block_hash(),
+            BASE_TIME + 2_017 * 150 + 1,
+            EASY_BITS,
+        );
+        let err = chain.connect_headers_clockless(&[stale]).unwrap_err();
+        assert!(
+            matches!(err, Error::BadDifficulty { height: 2_017, .. }),
+            "got {err:?}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn connecting_with_the_wrong_network_is_refused() -> eyre::Result<()> {
         let chain = Core::in_memory(Network::Regtest)?;
@@ -2132,15 +2290,11 @@ mod tests {
 
         // Re-open the same store believing it is mainnet: the recorded network
         // wins over the caller's claim.
-        let Core {
-            store, bar, margin, ..
-        } = chain;
+        let Core { store, .. } = chain;
         let chain = Core {
             store,
-            network: Network::Bitcoin,
+            params: bitcoin::consensus::Params::new(Network::Bitcoin),
             rsk_chain: crate::rsk::chain_config(Network::Bitcoin),
-            bar,
-            margin,
         };
         let header = mine_child(&canonical(&chain, 0), EASY_BITS, 1);
         let err = chain.connect_headers(&[header], NOW).unwrap_err();
@@ -2211,9 +2365,8 @@ mod tests {
         let period = DIFFICULTY_PERIOD as usize;
 
         // Genesis has easy-target work. Period 0 blocks use work 22.
-        // Keep the clock close enough to the synthetic header times that the
-        // linear bar stays below the tail work, and above the header times so
-        // the future-time check does not reject them.
+        // Keep the clock above the synthetic header times so the future-time
+        // check does not reject them.
         let now = canonical(&chain, 0).time as u64 + 1_000 * finality::TARGET_BLOCK_SECONDS;
         let run1 = mine_chain_from(&canonical(&chain, 0), period, WORK22_BITS, 1);
         chain.connect_headers(&run1, now)?;
@@ -2231,7 +2384,7 @@ mod tests {
 
         assert_eq!(
             chain.finalized_height()?.unwrap(),
-            (period + tail_needed) as u64 - FINALITY_MARGIN_BLOCKS
+            (period + tail_needed) as u64 - finality::COINBASE_MATURITY
         );
         let after = chain.chainwork_at(2 * DIFFICULTY_PERIOD)?.unwrap()
             - chain.chainwork_at(DIFFICULTY_PERIOD)?.unwrap();
@@ -2293,8 +2446,8 @@ mod tests {
         chain.store_coinbase(0, genesis.block_hash(), &coinbase, &proof)?;
         assert!(chain.coinbase_at(0)?.is_some());
 
-        // The same shape as `finalizes_once_the_bar_is_cleared`: 4,132 blocks
-        // clear the 4,000-block bar and settle the boundary at 4,032.
+        // The same shape as `finalizes_at_the_reorg_depth`: 4,132 blocks put
+        // the mark at 4,032.
         let run1 = easy_chain(&canonical(&chain, 0), DIFFICULTY_PERIOD as usize, 1);
         chain.connect_headers(&run1, NOW)?;
         let run2 = easy_chain(

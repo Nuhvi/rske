@@ -20,31 +20,31 @@
 //! which is what makes the whole chain's work computable from the spine; only
 //! the part of it at or below the mark is a checkpoint.
 //!
-//! ## The bar
+//! ## Network-partition safety
 //!
 //! The mark advances only once the work above it (the **anchor**) reaches
 //!
 //! ```text
-//! need = max( REVERSAL_BLOCKS · w0 , W_est(t0, now) )
+//! need = max( COINBASE_MATURITY · w0 , W_est(t0, now) )
 //! ```
 //!
 //! where `w0` is the work of one block at the anchor's difficulty,
-//! [`REVERSAL_BLOCKS`] is the coinbase-maturity floor, and `W_est` is the
-//! **estimated work the network did since t0**, in hashes, from the Bitcoin
+//! [`COINBASE_MATURITY`] is Bitcoin's coinbase-maturity window, and `W_est` is
+//! the **estimated work the network did since t0**, in hashes, from the Bitcoin
 //! price power law converted to hashrate with the dbtc relation
 //! ([`estimated_work`]).
 //!
-//! The bar is *absolute*: it does not depend on how much work the candidate
+//! The requirement is *absolute*: it does not depend on how much work the candidate
 //! happens to carry, only on the trusted anchor's age and the power law. The
 //! price law is the **bottom** variant, the low end of the estimate; over the
 //! sampled 2016+ history it sits below the realised work, so the honest chain
 //! clears it while a fork with a small network share does not (before 2014 it is
 //! above the realised work, so an ancient anchor simply waits). The sampled
 //! guarantee is about a **5% network share**: a fork holds `s/(1-s)` of the
-//! honest work, and the bar sits above that line while staying at or below the
+//! honest work, and the requirement sits above that line while staying at or below the
 //! honest work. Over-estimating only delays finalization.
 //!
-//! `r0` is implicit: the bar is the *absolute* estimated work, so it uses the
+//! `r0` is implicit: the requirement is the *absolute* estimated work, so it uses the
 //! anchor difficulty's target rate (`w0 / 600`), not the checkpoint period's
 //! realised rate. The difference is retarget-window luck (a few percent).
 //!
@@ -53,8 +53,8 @@
 //! state the mark is short-lived, so the 100-block floor is usually the binding
 //! term; the price-law bound applies to a stagnant anchor.
 //!
-//! The floor keeps `T = 0` from being a zero-work hole. The mark sits
-//! `FINALITY_MARGIN_BLOCKS` below the tip, so in steady state `T` is short and
+//! The floor keeps `T = 0` from being a zero-work hole. The mark is held a
+//! coinbase-maturity window below the tip, so in steady state `T` is short and
 //! the floor is usually the binding term; the estimated work takes over when the
 //! mark has been stagnant. Re-anchoring resets `T` but not the floor.
 //!
@@ -69,19 +69,25 @@
 //! ## The clock
 //!
 //! `T = now − t0` comes from the node's clock, which is therefore a trust input:
-//! a backward clock skew lowers the bar. The store remembers the greatest
-//! `now` it has seen, so winding it back cannot shrink the bar. The work of a
+//! a backward clock skew lowers the requirement. The store remembers the greatest
+//! `now` it has seen, so winding it back cannot shrink the requirement. The work of a
 //! chain is `Σ D · 2³²` over its blocks, so the mark tracks exactly the work the
 //! network had to hash.
 
 use alloy_primitives::U256;
+use bitcoin::Network;
 use bitcoin::pow::Work;
 
 use crate::store::DIFFICULTY_PERIOD;
 
-/// The coinbase-maturity floor: a boundary never settles for less than the work
-/// of this many blocks at the anchor's difficulty.
-pub const REVERSAL_BLOCKS: u64 = 100;
+/// Bitcoin's coinbase maturity: a coinbase output is spendable this many blocks
+/// after the block that creates it.
+///
+/// Two rules use the same window. Network-partition safety never settles a
+/// boundary for less work than this many blocks at the anchor's difficulty. The finality mark
+/// stays at least this many blocks below the tip, so no header inside the window
+/// is ever treated as settled.
+pub const COINBASE_MATURITY: u64 = 100;
 
 /// Bitcoin's target block interval, in seconds.
 pub const TARGET_BLOCK_SECONDS: u64 = 600;
@@ -104,15 +110,6 @@ const DBTC_B: f64 = 0.673_473_301_558_825_5;
 /// hashrate is `H(t) ∝ age(t)^p`, so its cumulative integral is closed-form.
 const PRICE_P: f64 = PRICE_N / DBTC_B;
 
-/// The finality policy: the work a chain must carry above the anchor, given the
-/// anchor's work per block, its header time, the network genesis time and the
-/// caller's clock.
-///
-/// Injected into [`crate::Core`] so mainnet can use the price-law
-/// [`estimated_work_bar`], while non-mainnet networks and the store-mechanics
-/// tests use the linear `linear_reference_bar`.
-pub type Bar = fn(anchor_work: Work, anchor_time: u64, genesis_time: u64, now: u64) -> U256;
-
 /// Whether `height` is a Bitcoin period boundary: it starts a difficulty
 /// period.
 ///
@@ -125,22 +122,35 @@ pub fn is_checkpoint(height: u64) -> bool {
     height.is_multiple_of(DIFFICULTY_PERIOD)
 }
 
-/// The shipped bar: the greater of the coinbase window and the estimated work
-/// the network did since the anchor.
+/// Work that network-partition safety requires above the finality mark.
 ///
-/// A genesis anchor fails closed (`U256::MAX`): the price law is undefined at the
-/// network's birth, so a genesis-only seed cannot price modern work. Ship a
-/// checkpoint; `--from-genesis` is a development path without the guarantee.
-pub fn estimated_work_bar(
+/// On mainnet the requirement is the estimated work the network did since the
+/// anchor — the bottom of the price law — floored by the coinbase-maturity
+/// window. A genesis anchor fails closed (`U256::MAX`): the price law is
+/// undefined at the network's birth, so a genesis-only seed cannot price modern
+/// work. Ship a checkpoint; `--from-genesis` is a development path without the
+/// guarantee.
+///
+/// Every other network permits minimum-difficulty blocks, so elapsed time is not
+/// a reliable measure of the work done. There the rule falls back to the latest
+/// known difficulty: the requirement is the work of the tip block itself. The
+/// tip always carries that much work above the mark, so on those networks
+/// finality is decided by the depth alone.
+pub fn partition_safety_required(
+    network: Network,
     anchor_work: Work,
     anchor_time: u64,
     genesis_time: u64,
+    tip_work: Work,
     now: u64,
 ) -> U256 {
+    if network != Network::Bitcoin {
+        return work_to_u256(tip_work);
+    }
     if anchor_time <= genesis_time {
         return U256::MAX;
     }
-    let floor = work_to_u256(anchor_work).saturating_mul(U256::from(REVERSAL_BLOCKS));
+    let floor = work_to_u256(anchor_work).saturating_mul(U256::from(COINBASE_MATURITY));
     floor.max(estimated_work(anchor_time, genesis_time, now))
 }
 
@@ -184,42 +194,26 @@ fn estimated_hashrate(t: u64, genesis_time: u64) -> f64 {
     difficulty * (1u64 << 32) as f64 / TARGET_BLOCK_SECONDS as f64
 }
 
-/// The linear reference rule, `w0 · max(100, T/600)`.
-///
-/// Used for non-mainnet networks — the price law is a mainnet calibration — and
-/// by the store-mechanics tests, whose synthetic chains at trivial difficulty
-/// could never clear an absolute real-world bar. It is a development policy, not
-/// the 5% guarantee; the mechanics (mark monotonicity, re-anchoring, fork
-/// refusal, adoption) are policy-independent.
-pub(crate) fn linear_reference_bar(
-    anchor_work: Work,
-    anchor_time: u64,
-    _genesis_time: u64,
-    now: u64,
-) -> U256 {
-    let blocks = (now.saturating_sub(anchor_time) / TARGET_BLOCK_SECONDS).max(REVERSAL_BLOCKS);
-    work_to_u256(anchor_work).saturating_mul(U256::from(blocks))
-}
-
-/// The bar as seen from one connect: what the best chain carries above the
-/// anchor and what the rule demands. Reported on [`crate::ConnectOutcome`] so a
-/// driver can say *why* a boundary has not settled yet.
+/// Network-partition safety as seen from one connect: what the best chain
+/// carries above the anchor and what the rule demands. Reported on
+/// [`crate::ConnectOutcome`] so a driver can say *why* a boundary has not
+/// settled yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FinalityStatus {
-    /// The anchor height the bar is measured from.
+    /// The anchor height the requirement is measured from.
     pub anchor: u64,
     /// The anchor's header time.
     pub anchor_time: u64,
-    /// Work of one block at the anchor's difficulty — the unit of the bar.
+    /// Work of one block at the anchor's difficulty — the unit of the requirement.
     pub anchor_work: Work,
     /// Work of the best chain above the anchor.
     pub have: Work,
-    /// Work the bar requires above the anchor.
+    /// Work network-partition safety requires above the anchor.
     pub need: U256,
 }
 
 impl FinalityStatus {
-    /// Whether the candidate chain clears the bar.
+    /// Whether the candidate chain clears the requirement.
     pub fn clears(&self) -> bool {
         work_to_u256(self.have) >= self.need
     }
@@ -255,7 +249,7 @@ impl FinalityStatus {
         }
     }
 
-    /// `Φ = need / have`: the bar relative to the work carried. Below one the
+    /// `Φ = need / have`: the requirement relative to the work carried. Below one the
     /// honest chain clears it; a fork with network share `s` is kept out while
     /// `Φ > s/(1-s)`. `None` when the chain carries no work yet.
     pub fn phi(&self) -> Option<f64> {
@@ -265,7 +259,7 @@ impl FinalityStatus {
 }
 
 /// A [`Work`] as a [`U256`], for arithmetic [`Work`] does not carry (it has no
-/// `Mul`, and the bar multiplies by a block count).
+/// `Mul`, and the requirement multiplies by a block count).
 pub fn work_to_u256(work: Work) -> U256 {
     U256::from_be_bytes(work.to_be_bytes())
 }
@@ -314,24 +308,31 @@ mod tests {
     }
 
     /// At the anchor instant the estimate is zero, so the coinbase floor is the
-    /// whole bar.
+    /// whole requirement.
     #[test]
     fn the_coinbase_floor_binds_at_zero_age() {
         let w = work_from_bits(0x1702_1ec5);
         let t0 = 1_789_801_745;
         assert_eq!(
-            estimated_work_bar(w, t0, GENESIS, t0),
-            work_to_u256(w) * U256::from(REVERSAL_BLOCKS)
+            partition_safety_required(Network::Bitcoin, w, t0, GENESIS, w, t0),
+            work_to_u256(w) * U256::from(COINBASE_MATURITY)
         );
         assert_eq!(estimated_work(t0, GENESIS, t0), U256::ZERO);
     }
 
-    /// A genesis anchor cannot be priced: the bar fails closed.
+    /// A genesis anchor cannot be priced: the requirement fails closed.
     #[test]
     fn a_genesis_anchor_fails_closed() {
         let w = work_from_bits(0x1d00_ffff);
         assert_eq!(
-            estimated_work_bar(w, GENESIS, GENESIS, GENESIS + 1_500 * 86_400),
+            partition_safety_required(
+                Network::Bitcoin,
+                w,
+                GENESIS,
+                GENESIS,
+                w,
+                GENESIS + 1_500 * 86_400
+            ),
             U256::MAX
         );
     }
@@ -357,7 +358,7 @@ mod tests {
         );
     }
 
-    /// A month after the shipped spine tip the bar is a few thousand checkpoint
+    /// A month after the shipped spine tip the requirement is a few thousand
     /// blocks — well below the `T/600` age term, because the bottom law prices
     /// the network below its realised work.
     #[test]
@@ -368,11 +369,12 @@ mod tests {
         let t0 = header.time as u64;
         let now = t0 + 31 * 86_400;
 
-        let blocks = estimated_work_bar(w0, t0, GENESIS, now) / work_to_u256(w0);
+        let blocks = partition_safety_required(Network::Bitcoin, w0, t0, GENESIS, w0, now)
+            / work_to_u256(w0);
         let age_blocks = 31 * 86_400 / TARGET_BLOCK_SECONDS;
         assert!(
             blocks > U256::from(2_000u64) && blocks < U256::from(3_500u64),
-            "bar {blocks} blocks"
+            "requirement {blocks} blocks"
         );
         assert!(
             blocks < U256::from(age_blocks),
@@ -386,27 +388,27 @@ mod tests {
         let t0 = 1_789_801_745;
         let day = 86_400u64;
         assert!(
-            estimated_work_bar(w, t0, GENESIS, t0 + 30 * day)
-                < estimated_work_bar(w, t0, GENESIS, t0 + 60 * day)
+            partition_safety_required(Network::Bitcoin, w, t0, GENESIS, w, t0 + 30 * day)
+                < partition_safety_required(Network::Bitcoin, w, t0, GENESIS, w, t0 + 60 * day)
         );
         assert!(
-            estimated_work_bar(w, t0, GENESIS, t0 + 60 * day)
-                < estimated_work_bar(w, t0, GENESIS, t0 + 365 * day)
+            partition_safety_required(Network::Bitcoin, w, t0, GENESIS, w, t0 + 60 * day)
+                < partition_safety_required(Network::Bitcoin, w, t0, GENESIS, w, t0 + 365 * day)
         );
     }
 
-    /// The reference bar used by the store tests is the old linear rule.
+    /// A non-mainnet network does not price elapsed time: the requirement is the
+    /// work of the tip block, so finality there is decided by the depth alone.
     #[test]
-    fn the_linear_reference_is_the_old_rule() {
-        let w = work_from_bits(0x207f_ffff);
+    fn a_non_mainnet_network_falls_back_to_the_tip_work() {
+        let anchor = work_from_bits(0x207f_ffff);
+        let tip = work_from_bits(0x1d00_ffff);
         let t0 = 1_600_000_000;
-        assert_eq!(
-            linear_reference_bar(w, t0, GENESIS, t0),
-            work_to_u256(w) * U256::from(REVERSAL_BLOCKS)
-        );
-        assert_eq!(
-            linear_reference_bar(w, t0, GENESIS, t0 + 30 * 86_400),
-            work_to_u256(w) * U256::from(4_320u64)
-        );
+        for network in [Network::Testnet, Network::Testnet4, Network::Regtest] {
+            assert_eq!(
+                partition_safety_required(network, anchor, t0, GENESIS, tip, t0 + 30 * 86_400),
+                work_to_u256(tip)
+            );
+        }
     }
 }

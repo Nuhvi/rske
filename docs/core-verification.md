@@ -33,25 +33,38 @@ bad-PoW header, a stale-timestamp header, duplicate batches and an empty batch:
   `UnknownAncestor`, `LinkBreak`, `BadPow` and `BadTimestamp`.
 - C7: a header more than two hours after `now` gives `TimestampTooNew`.
 - R3–R4: the exact stored header set and canonical-chain linkage.
-- R5–R6: maximum-work fork choice and strict-heavier switching. The
-  mark-crossing half of R6 is not covered.
+- R5–R6: maximum-work fork choice and strict-heavier switching.
 
 `finality_and_fork_gate_matches_the_spec` checks the finality mark and the fork
-gate on a 120-block trunk with an injected bar and margin:
+gate on a 240-block trunk with the production depth, delivered in short runs:
 
 - R7: the mark never regresses, never passes the tip, and never moves a
   finalized block;
-- R8: the mark advances to `tip - margin` exactly when the model predicts it;
+- R8: the mark is exactly `tip - depth`, and `finalized` reports each move;
 - R9: forks at or below the mark are refused, while lighter forks above it are
   stored and never become best.
 
-`difficulty_matches_the_spec` checks C5 through `Core` on signet, where the
-retarget rule applies: a child with the parent's bits is accepted, a sibling
-with different bits is `BadDifficulty`. The seed is not validated and the
-target is easy; C6, the target-range and pow-limit check, is not implemented
-and not covered.
+`difficulty_matches_the_spec` checks C5 through `Core` with custom regtest
+parameters that enforce the retarget rule: a child with the parent's bits is
+accepted, a sibling with different bits is `BadDifficulty`. C6, the target-range
+and pow-limit check, is covered by the delivery machine and by unit tests that
+pin the mainnet pow limit. `the_boundary_retarget_is_enforced` covers the
+period-boundary retarget through `Core`, which the machine does not reach.
 
 `future_time_matches_the_spec` checks C7 against the caller clock.
+
+Not yet checked by any machine:
+
+- the clock floor and clockless connects (R10), which only unit tests cover;
+- a heavier fork that crosses the mark (the mark-crossing half of R6, and the
+  election path it exercises);
+- median-time-past with fewer than 11 stored headers, and at a height where an
+  ancestor header is missing;
+- coinbase and Rootstock actions;
+- fork trees deeper than the fixed delivery universe.
+
+A requirement added to `specs/` should come with a matching transition or
+invariant in the executable form, or an entry in this list.
 
 ### Rootstock checkpoints (`rootstock-checkpoints.md`)
 

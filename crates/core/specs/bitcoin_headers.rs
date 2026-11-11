@@ -7,14 +7,15 @@
 //!
 //! Three machines:
 //!
-//! - `bitcoin_headers_match_the_spec` checks R1–R2, C1–C4 and R3–R6 over a
+//! - `bitcoin_headers_match_the_spec` checks R1–R2, C1–C6 and R3–R6 over a
 //!   delivery universe with a trunk, a competing fork, a fork of a fork, a
-//!   bad-PoW header, a stale-timestamp header, duplicates and empty batches.
+//!   bad-PoW header, a stale-timestamp header, an out-of-range target header,
+//!   duplicates and empty batches.
 //! - `finality_and_fork_gate_matches_the_spec` checks R7–R9 on a long trunk
-//!   with an injected bar and mark depth, including light forks below/above the
-//!   mark.
-//! - `difficulty_matches_the_spec` checks C5 on signet, where the expected-bits
-//!   rule is enforced.
+//!   delivered in runs, at the production depth, including light forks
+//!   below/above the mark.
+//! - `difficulty_matches_the_spec` checks C5 with custom regtest params that
+//!   enforce the expected-bits rule.
 //! - `future_time_matches_the_spec` checks C7 against the caller clock.
 //!
 //! Run just this document's spec:
@@ -31,7 +32,7 @@ use bitcoin::Network;
 use bitcoin::TxMerkleNode;
 use bitcoin::block::{BlockHash, Header as BitcoinHeader, Version};
 use bitcoin::hashes::Hash as _;
-use bitcoin::pow::{CompactTarget, Work};
+use bitcoin::pow::CompactTarget;
 use proptest::prelude::*;
 use proptest_state_machine::{ReferenceStateMachine, StateMachineTest, prop_state_machine};
 
@@ -40,14 +41,9 @@ use crate::{Action, Core, Error, Outcome, RskState};
 /// The easiest valid Bitcoin target, so synthetic headers mine immediately.
 const EASY_BITS: u32 = 0x207f_ffff;
 const BASE_TIME: u32 = 1_600_000_000;
-/// A fixed synthetic clock. The injected bar ignores it; it only has to be
-/// after the headers' timestamps.
+/// The clock the future-time machine connects at. It only has to be after the
+/// headers' timestamps; the other machines pass no clock at all.
 const NOW: u64 = 1_700_000_000;
-
-/// The injected finality bar: three blocks of work above the mark.
-fn tiny_bar(_: Work, _: u64, _: u64, _: u64) -> U256 {
-    U256::from(3)
-}
 
 fn mine(prev: BlockHash, time: u32, tag: u32) -> BitcoinHeader {
     let target = CompactTarget::from_consensus(EASY_BITS);
@@ -124,6 +120,7 @@ enum HeaderKind {
     Valid,
     BadPow,
     BadTime,
+    BadTarget,
 }
 
 #[derive(Clone, Debug)]
@@ -185,6 +182,12 @@ fn header_universe() -> HeaderUniverse {
     headers.push(q12);
     kinds.push(HeaderKind::BadTime);
 
+    // T2: a valid hash at a target above the regtest proof-of-work limit
+    // (index 21).
+    let t2 = mine_with_bits(a1.block_hash(), BASE_TIME + 2, 88, 0x2100_ffff);
+    headers.push(t2);
+    kinds.push(HeaderKind::BadTarget);
+
     let mut batches = Vec::new();
     for i in 0..headers.len() {
         batches.push(vec![i]);
@@ -203,6 +206,7 @@ fn header_universe() -> HeaderUniverse {
     }
     batches.push(vec![0, 2]); // A1 then A3: link break
     batches.push(vec![0, 19]); // A1 then P4: bad PoW
+    batches.push(vec![0, 21]); // A1 then T2: target above the pow limit
     batches.push(vec![0, 0]); // duplicate inside one batch
     batches.push(Vec::new()); // empty batch
 
@@ -223,6 +227,7 @@ enum HeaderPrediction {
     LinkBreak,
     BadPow,
     BadTimestamp,
+    BadTarget,
 }
 
 #[derive(Clone, Debug)]
@@ -241,7 +246,7 @@ struct HeaderTransition {
 /// step, the parent lookup, then link and PoW validation in the same order as
 /// the implementation, so it can predict the exact error variant.
 ///
-/// The finality mark is out of reach in this universe (the margin is the
+/// The finality mark is out of reach in this universe (the depth is the
 /// production 100 and the deepest header is height 12), so
 /// `ForkBelowFinalized` cannot occur here. A machine that models the mark has
 /// to add that branch.
@@ -281,12 +286,13 @@ fn predict(
         }
         // C4: with eleven ancestors available, the timestamp must beat their
         // median. Q12 is positioned so that its parent implies the full window.
-        // C6: the target range and pow limit are not checked (known gap).
+        // C6: the target must be in range and at or below the pow limit.
         // C3: the header must satisfy its own target.
         match universe.kinds[batch[start + offset]] {
             HeaderKind::Valid => {}
             HeaderKind::BadPow => return (HeaderPrediction::BadPow, Vec::new()),
             HeaderKind::BadTime => return (HeaderPrediction::BadTimestamp, Vec::new()),
+            HeaderKind::BadTarget => return (HeaderPrediction::BadTarget, Vec::new()),
         }
         prev = header.block_hash();
     }
@@ -348,8 +354,7 @@ impl StateMachineTest for HeaderMachine {
     type Reference = HeaderMachine;
 
     fn init_test(model: &HeaderModel) -> HeaderSut {
-        let core = Core::in_memory_with(Network::Regtest, tiny_bar, crate::FINALITY_MARGIN_BLOCKS)
-            .expect("in-memory store");
+        let core = Core::in_memory(Network::Regtest).expect("in-memory store");
         core.seed_checkpoints(&[(0, model.universe.genesis)])
             .expect("seed");
         let last_work = work(&core);
@@ -369,7 +374,7 @@ impl StateMachineTest for HeaderMachine {
         let before = sut.core.state().expect("state");
         let outcome = sut.core.apply(Action::ConnectHeaders {
             headers: &headers,
-            now: NOW,
+            now: None,
         });
         let after = sut.core.state().expect("state");
 
@@ -414,6 +419,11 @@ impl StateMachineTest for HeaderMachine {
             | (HeaderPrediction::BadPow, Err(Error::BadPow { .. }))
             | (HeaderPrediction::BadTimestamp, Err(Error::BadTimestamp { .. })) => {
                 assert_eq!(before, after, "a rejected batch changed the store");
+            }
+            (HeaderPrediction::BadTarget, Err(Error::BadPow { detail, .. }))
+                if detail.contains("target") =>
+            {
+                assert_eq!(before, after, "a rejected target changed the store");
             }
             (expected, other) => panic!("model expected {expected:?}, core returned {other:?}"),
         }
@@ -497,7 +507,7 @@ impl StateMachineTest for HeaderMachine {
             Some(best_fork.tip_height)
         );
 
-        // R5: no fork can be blocked by the mark here (margin 100, tip at most
+        // R5: no fork can be blocked by the mark here (depth 100, tip at most
         // 12), so the best fork must carry the maximum work. Ties are
         // allowed to stay with the incumbent; `apply` checks that a *switch*
         // only ever goes to a strictly heavier fork.
@@ -531,10 +541,13 @@ impl StateMachineTest for HeaderMachine {
     }
 }
 
-// ── 2. Finality: a trunk, an injected bar and mark depth ────────────────────
+// ── 2. Finality: a trunk, the production depth and a fork gate ──────────────
 
-const FINALITY_MARGIN: u64 = 2;
-const FINALITY_BLOCKS: usize = 120;
+/// Long enough that a batch-driven run buries a mark at the production depth.
+const FINALITY_BLOCKS: usize = 240;
+/// Trunk headers delivered per `Advance`, so a short proptest sequence can
+/// still reach the coinbase-maturity depth.
+const FINALITY_BATCH: usize = 12;
 
 #[derive(Clone, Debug)]
 struct FinalityUniverse {
@@ -576,7 +589,7 @@ fn finality_universe() -> FinalityUniverse {
 enum FinalityPrediction {
     Noop,
     UnknownAncestor,
-    Connected { advanced: bool },
+    Connected { connected: usize, advanced: bool },
     ForkStored,
     ForkBelowFinalized { forkpoint: u64, finalized: u64 },
 }
@@ -592,7 +605,13 @@ struct FinalityModel {
 
 #[derive(Clone, Debug)]
 enum FinalityTransition {
+    /// One header by index: a duplicate, an orphan, or the next trunk header.
     Deliver(usize),
+    /// A contiguous run of fresh trunk headers, the way a sync delivers them.
+    Advance {
+        start: usize,
+        len: usize,
+    },
     Fork(usize),
 }
 
@@ -617,14 +636,34 @@ impl ReferenceStateMachine for FinalityMachine {
     }
 
     fn transitions(state: &Self::State) -> BoxedStrategy<Self::Transition> {
-        let deliver = (0..state.universe.headers.len()).prop_map(FinalityTransition::Deliver);
+        let len = state.universe.headers.len();
+        let frontier = state.tip as usize;
+        let any_deliver = (0..len).prop_map(FinalityTransition::Deliver);
+        if frontier >= len {
+            // The trunk is exhausted: only duplicates and forks remain.
+            let parents = 0..(state.tip as usize - 1);
+            return prop_oneof![
+                1 => any_deliver,
+                2 => parents.prop_map(FinalityTransition::Fork),
+            ]
+            .boxed();
+        }
+        let advance = (1usize..=FINALITY_BATCH).prop_map(move |n| FinalityTransition::Advance {
+            start: frontier,
+            len: n.min(len - frontier),
+        });
         if state.tip < 3 {
-            return deliver.boxed();
+            return prop_oneof![3 => advance, 1 => any_deliver].boxed();
         }
         // A branch must leave the current tip as the tip: parents are kept one
         // below it, so the fork can at most tie the trunk's work.
         let parents = 0..(state.tip as usize - 1);
-        prop_oneof![deliver, parents.prop_map(FinalityTransition::Fork),].boxed()
+        prop_oneof![
+            3 => advance,
+            1 => any_deliver,
+            2 => parents.prop_map(FinalityTransition::Fork),
+        ]
+        .boxed()
     }
 
     fn apply(mut state: Self::State, transition: &Self::Transition) -> Self::State {
@@ -639,17 +678,28 @@ impl ReferenceStateMachine for FinalityMachine {
                 } else {
                     state.stored.insert(header.block_hash());
                     state.tip = state.tip.max(height);
-                    // Uniform work and a three-work-unit bar: once
-                    // `tip - margin` is past the mark, the work above the mark
-                    // can clear the bar, so the model advances to
-                    // `tip - margin` when the bar permits it.
-                    let candidate = state.tip.saturating_sub(FINALITY_MARGIN);
-                    let advanced = candidate > state.mark;
-                    if advanced {
-                        state.mark = candidate;
-                    }
-                    state.last = FinalityPrediction::Connected { advanced };
+                    let before = state.mark;
+                    advance_mark(&mut state);
+                    state.last = FinalityPrediction::Connected {
+                        connected: 1,
+                        advanced: state.mark > before,
+                    };
                 }
+            }
+            FinalityTransition::Advance { start, len } => {
+                let before = state.mark;
+                for offset in 0..*len {
+                    let header = state.universe.headers[start + offset];
+                    state.stored.insert(header.block_hash());
+                    state.tip = state.tip.max((start + offset) as u64 + 1);
+                }
+                // One finality step per batch, like the core: the rule runs after
+                // the whole run is stored.
+                advance_mark(&mut state);
+                state.last = FinalityPrediction::Connected {
+                    connected: *len,
+                    advanced: state.mark > before,
+                };
             }
             FinalityTransition::Fork(index) => {
                 let fork = state.universe.forks[*index];
@@ -675,6 +725,17 @@ impl ReferenceStateMachine for FinalityMachine {
     }
 }
 
+/// R7/R8: the mark follows the tip at the production depth.
+///
+/// On a non-mainnet network the requirement is the tip block's own work, which
+/// the tip always carries above the mark, so nothing else gates the advance.
+fn advance_mark(state: &mut FinalityModel) {
+    let candidate = state.tip.saturating_sub(crate::COINBASE_MATURITY);
+    if candidate > state.mark {
+        state.mark = candidate;
+    }
+}
+
 struct FinalitySut {
     core: Core,
     finalized_prefix: Vec<BlockHash>,
@@ -686,8 +747,7 @@ impl StateMachineTest for FinalityMachine {
     type Reference = FinalityMachine;
 
     fn init_test(model: &FinalityModel) -> FinalitySut {
-        let core =
-            Core::in_memory_with(Network::Regtest, tiny_bar, FINALITY_MARGIN).expect("in-memory");
+        let core = Core::in_memory(Network::Regtest).expect("in-memory");
         core.seed_checkpoints(&[(0, model.universe.genesis)])
             .expect("seed");
         let last_work = work(&core);
@@ -703,19 +763,23 @@ impl StateMachineTest for FinalityMachine {
         model: &FinalityModel,
         transition: FinalityTransition,
     ) -> FinalitySut {
-        let header = match transition {
-            FinalityTransition::Deliver(index) => model.universe.headers[index],
-            FinalityTransition::Fork(index) => model.universe.forks[index],
+        let headers: &[BitcoinHeader] = match transition {
+            FinalityTransition::Deliver(index) => {
+                std::slice::from_ref(&model.universe.headers[index])
+            }
+            FinalityTransition::Advance { start, len } => {
+                &model.universe.headers[start..start + len]
+            }
+            FinalityTransition::Fork(index) => std::slice::from_ref(&model.universe.forks[index]),
         };
         let before = sut.core.state().expect("state");
-        let outcome = sut.core.apply(Action::ConnectHeaders {
-            headers: std::slice::from_ref(&header),
-            now: NOW,
-        });
+        let outcome = sut
+            .core
+            .apply(Action::ConnectHeaders { headers, now: None });
         let after = sut.core.state().expect("state");
 
-        // R8: `ConnectOutcome::finalized` reports exactly the mark movement
-        // the model predicted.
+        // R8: `ConnectOutcome::finalized` reports exactly the mark movement the
+        // model predicted.
         match (&model.last, &outcome) {
             (FinalityPrediction::Noop, Ok(Outcome::Connected(result))) => {
                 assert_eq!(result.connected, 0, "model expected a no-op");
@@ -724,8 +788,14 @@ impl StateMachineTest for FinalityMachine {
             (FinalityPrediction::UnknownAncestor, Err(Error::UnknownAncestor(_))) => {
                 assert_eq!(before, after, "a rejected header changed the store");
             }
-            (FinalityPrediction::Connected { advanced: true }, Ok(Outcome::Connected(result))) => {
-                assert_eq!(result.connected, 1);
+            (
+                FinalityPrediction::Connected {
+                    connected,
+                    advanced: true,
+                },
+                Ok(Outcome::Connected(result)),
+            ) => {
+                assert_eq!(result.connected, *connected);
                 assert_eq!(result.tip_height, model.tip);
                 assert_eq!(
                     result.finalized,
@@ -733,8 +803,14 @@ impl StateMachineTest for FinalityMachine {
                     "the connect did not report the new mark"
                 );
             }
-            (FinalityPrediction::Connected { advanced: false }, Ok(Outcome::Connected(result))) => {
-                assert_eq!(result.connected, 1);
+            (
+                FinalityPrediction::Connected {
+                    connected,
+                    advanced: false,
+                },
+                Ok(Outcome::Connected(result)),
+            ) => {
+                assert_eq!(result.connected, *connected);
                 assert_eq!(result.tip_height, model.tip);
                 assert_eq!(result.finalized, None, "the mark advanced unexpectedly");
             }
@@ -777,15 +853,14 @@ impl StateMachineTest for FinalityMachine {
 
     fn check_invariants(sut: &FinalitySut, model: &FinalityModel) {
         let state = sut.core.state().expect("state");
-        // R7/R8: the mark is the model's mark, stays below the tip, and is
-        // exactly `tip - margin` on this uniform-work trunk.
+        // R7/R8: the mark is the model's mark and sits exactly at the depth.
         assert_eq!(state.finalized, Some(model.mark));
         assert_eq!(state.best_fork, Some(0));
         assert_eq!(sut.core.tip_height().expect("read"), Some(model.tip));
         assert_eq!(
             model.mark,
-            model.tip.saturating_sub(FINALITY_MARGIN),
-            "the model and the margin disagree"
+            model.tip.saturating_sub(crate::COINBASE_MATURITY),
+            "the mark is not tip - depth"
         );
 
         // R3 (shared): the stored set includes the branches.
@@ -845,9 +920,9 @@ struct DifficultyUniverse {
 fn difficulty_universe() -> DifficultyUniverse {
     let genesis = mine(BlockHash::all_zeros(), BASE_TIME, 0);
     let good = mine(genesis.block_hash(), BASE_TIME + 1, 0);
-    // A valid header at a different target. The rule is checked before PoW, so
-    // this is rejected for its bits, not for its hash.
-    let wrong = mine_with_bits(genesis.block_hash(), BASE_TIME + 1, 1, 0x207f_fffe);
+    // A valid header at a slightly different target. C5 rejects it for the bits,
+    // before C6 or PoW.
+    let wrong = mine_with_bits(genesis.block_hash(), BASE_TIME + 1, 1, EASY_BITS - 1);
     DifficultyUniverse {
         genesis,
         good,
@@ -915,8 +990,8 @@ impl ReferenceStateMachine for DifficultyMachine {
                 state.last = if state.stored.contains(&state.universe.wrong.block_hash()) {
                     DifficultyPrediction::Noop
                 } else {
-                    // C5: Signet enforces the retarget schedule. At height 1
-                    // the child must carry the parent's bits.
+                    // C5: these params enforce the retarget schedule. At
+                    // height 1 the child must carry the parent's bits.
                     DifficultyPrediction::BadDifficulty
                 };
             }
@@ -934,9 +1009,13 @@ impl StateMachineTest for DifficultyMachine {
     type Reference = DifficultyMachine;
 
     fn init_test(model: &DifficultyModel) -> DifficultySut {
-        // Signet enables the expected-bits rule; the seed is not validated, so
-        // the test can use an easy synthetic target instead of mainnet work.
-        let core = Core::in_memory(Network::Signet).expect("in-memory store");
+        // Regtest normally permits minimum-difficulty blocks. These params
+        // enable the expected-bits rule while keeping the easy target, so the
+        // test can mine without mainnet work.
+        let mut params = bitcoin::consensus::Params::new(Network::Regtest);
+        params.no_pow_retargeting = false;
+        params.allow_min_difficulty_blocks = false;
+        let core = Core::in_memory_with_params(params).expect("in-memory store");
         core.seed_checkpoints(&[(0, model.universe.genesis)])
             .expect("seed");
         DifficultySut { core }
@@ -954,7 +1033,7 @@ impl StateMachineTest for DifficultyMachine {
         let before = sut.core.state().expect("state");
         let outcome = sut.core.apply(Action::ConnectHeaders {
             headers: std::slice::from_ref(&header),
-            now: NOW,
+            now: None,
         });
         let after = sut.core.state().expect("state");
 
@@ -977,7 +1056,7 @@ impl StateMachineTest for DifficultyMachine {
             ) => {
                 assert_eq!(*height, 1);
                 assert_eq!(*expected, EASY_BITS);
-                assert_eq!(*got, 0x207f_fffe);
+                assert_eq!(*got, EASY_BITS - 1);
                 assert_eq!(before, after, "a bad header changed the store");
             }
             (expected, other) => panic!("model expected {expected:?}, core returned {other:?}"),
@@ -1124,7 +1203,7 @@ impl StateMachineTest for FutureMachine {
         let before = sut.core.state().expect("state");
         let outcome = sut.core.apply(Action::ConnectHeaders {
             headers: std::slice::from_ref(&header),
-            now: NOW,
+            now: Some(NOW),
         });
         let after = sut.core.state().expect("state");
 
@@ -1191,7 +1270,7 @@ prop_state_machine! {
         .. ProptestConfig::default()
     })]
 
-    /// R1–R2, C1–C4, R3–R6: acceptance, storage and fork choice on the delivery universe.
+    /// R1–R2, C1–C6, R3–R6: acceptance, storage and fork choice on the delivery universe.
     #[test]
     fn bitcoin_headers_match_the_spec(sequential 1..32 => HeaderMachine);
 }
@@ -1204,7 +1283,7 @@ prop_state_machine! {
 
     /// R7–R9: mark safety/advancement and the fork gate on a trunk.
     #[test]
-    fn finality_and_fork_gate_matches_the_spec(sequential 1..40 => FinalityMachine);
+    fn finality_and_fork_gate_matches_the_spec(sequential 1..64 => FinalityMachine);
 }
 
 prop_state_machine! {
@@ -1213,7 +1292,7 @@ prop_state_machine! {
         .. ProptestConfig::default()
     })]
 
-    /// C5: on signet, a child must carry the parent's expected bits.
+    /// C5: with enforced retarget, a child must carry the parent's expected bits.
     #[test]
     fn difficulty_matches_the_spec(sequential 1..8 => DifficultyMachine);
 }

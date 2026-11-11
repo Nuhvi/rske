@@ -49,9 +49,7 @@ pub enum Error {
     #[error("timestamp {got} at height {height} is not above the median-time-past {median}")]
     BadTimestamp { height: u64, median: u32, got: u32 },
 
-    #[error(
-        "timestamp {got} at height {height} is more than {max_ahead} s after the caller clock {now}"
-    )]
+    #[error("timestamp {got} at height {height} is more than {max_ahead} s after the clock {now}")]
     TimestampTooNew {
         height: u64,
         now: u64,

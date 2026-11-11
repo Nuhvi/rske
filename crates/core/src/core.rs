@@ -18,12 +18,12 @@ use std::sync::Arc;
 use alloy_primitives::B256;
 use bitcoin::Network;
 use bitcoin::block::{BlockHash, Header as BitcoinHeader};
+use bitcoin::consensus::Params;
 use bitcoin::hashes::Hash as _;
 use bitcoin::merkle_tree::MerkleBlock;
 use bitcoin::transaction::Transaction;
 use rsk_consensus::config::ChainConfig;
 
-use crate::btc::finality;
 use crate::error::Error;
 use crate::rsk;
 use crate::store::{ForkMeta, ReadTxn, Store};
@@ -36,55 +36,44 @@ use crate::{ConnectOutcome, RskConnectOutcome, RskEntry, Tag};
 /// supplies data, time and reads back outcomes.
 pub struct Core {
     pub(crate) store: Store,
-    pub(crate) network: Network,
+    /// Bitcoin consensus parameters used for header validation. The network
+    /// they name also selects the finality policy, so there is no second copy
+    /// of the network on the handle.
+    pub(crate) params: Params,
     /// Rootstock consensus parameters the RSK tree validates against.
     pub(crate) rsk_chain: Arc<ChainConfig>,
-    /// The finality policy: how much work the chain since the mark must carry.
-    pub(crate) bar: finality::Bar,
-    /// How far below the tip the finality mark is kept. Production always uses
-    /// [`crate::btc::FINALITY_MARGIN_BLOCKS`]; tests may shorten it so a small
-    /// chain reaches the mark.
-    pub(crate) margin: u64,
 }
 
 impl Core {
     /// Open a file-backed store for the given network.
     ///
-    /// Mainnet uses the price-law estimated-work bar; other networks use the
-    /// linear reference rule, because the price law is a mainnet calibration.
+    /// The finality rule is selected by the network recorded in the store:
+    /// mainnet prices elapsed time, every other network falls back to the tip's
+    /// difficulty.
     pub fn open(path: &Path, network: Network) -> Result<Self, Error> {
         Ok(Self {
             store: Store::open(path)?,
-            network,
+            params: Params::new(network),
             rsk_chain: rsk::chain_config(network),
-            bar: bar_for(network),
-            margin: crate::btc::FINALITY_MARGIN_BLOCKS,
         })
     }
 
     /// Open an in-memory store (no disk I/O) for the given network.
     pub fn in_memory(network: Network) -> Result<Self, Error> {
-        Self::in_memory_with_bar(network, bar_for(network))
-    }
-
-    /// Open an in-memory store with an explicit finality policy.
-    pub fn in_memory_with_bar(network: Network, bar: finality::Bar) -> Result<Self, Error> {
-        Self::in_memory_with(network, bar, crate::btc::FINALITY_MARGIN_BLOCKS)
-    }
-
-    /// Open an in-memory store with an explicit finality policy and mark depth.
-    /// A short margin lets a small chain exercise finality.
-    pub fn in_memory_with(
-        network: Network,
-        bar: finality::Bar,
-        margin: u64,
-    ) -> Result<Self, Error> {
         Ok(Self {
             store: Store::in_memory()?,
-            network,
+            params: Params::new(network),
             rsk_chain: rsk::chain_config(network),
-            bar,
-            margin,
+        })
+    }
+
+    /// Open an in-memory store with explicit consensus parameters. The network
+    /// they name selects the finality policy and the Rootstock configuration.
+    pub fn in_memory_with_params(params: Params) -> Result<Self, Error> {
+        Ok(Self {
+            store: Store::in_memory()?,
+            rsk_chain: rsk::chain_config(params.network),
+            params,
         })
     }
 
@@ -245,7 +234,10 @@ pub enum Action<'a> {
     /// Connect a run of Bitcoin headers at the caller's clock.
     ConnectHeaders {
         headers: &'a [BitcoinHeader],
-        now: u64,
+        /// The caller's clock, when it has one. `None` skips the future-time
+        /// check and runs the requirement on the stored high-water mark and
+        /// the best tip's header time.
+        now: Option<u64>,
     },
     /// Store a canonical coinbase and its inclusion proof.
     StoreCoinbase {
@@ -417,13 +409,4 @@ pub struct RskState {
     pub sync_tip: Option<[u8; 32]>,
     /// What `rsk_sync_tip` resolves to: a stored header, or nothing.
     pub sync_tip_header: Option<([u8; 32], u64)>,
-}
-
-/// The finality policy for a network. The price law is calibrated on Bitcoin
-/// mainnet; other networks fall back to the linear reference rule.
-fn bar_for(network: Network) -> finality::Bar {
-    match network {
-        Network::Bitcoin => finality::estimated_work_bar,
-        _ => finality::linear_reference_bar,
-    }
 }

@@ -8,6 +8,8 @@
 //!
 //! - **Proof of work** — the block hash meets the target encoded in `bits`
 //!   (`Header::validate_pow`).
+//! - **Target range** — `bits` decodes without a negative, zero or overflowing
+//!   target, and the target is at or below the network proof-of-work limit.
 //! - **Expected difficulty** — `bits` is exactly the target the retarget
 //!   schedule calls for at this height. Within a difficulty period every block
 //!   carries its period's target; at a period boundary the target is recomputed
@@ -22,22 +24,40 @@
 //!
 //! Deliberately **not** checked:
 //!
-//! - **Target range and proof-of-work limit** — `validate_pow` compares only the
-//!   hash with the target. See C6 in `specs/bitcoin-headers.md`.
 //! - **Transaction / merkle validity** — not visible in a header; out of scope.
 //! - **Version rules** (BIP34/65/66/9) — height-activated and of no SPV value.
 //! - **Retargeting on testnet/regtest** — those networks permit
 //!   minimum-difficulty blocks, so "`bits` equals the schedule" does not hold.
 //!   Electrum skips them entirely; so do we (see [`enforces_difficulty`]).
+//!   Electrum goes further: on testnet its `verify_header` returns before the
+//!   `bits` and proof-of-work checks. This crate still requires every header to
+//!   meet its own target.
 
 use bitcoin::block::Header as BitcoinHeader;
 use bitcoin::consensus::Params;
-use bitcoin::pow::CompactTarget;
+use bitcoin::pow::{CompactTarget, Target};
 
 use crate::store::DIFFICULTY_PERIOD;
 
 /// Number of prior blocks whose timestamps form the median-time-past.
 pub const MEDIAN_TIME_PAST: usize = 11;
+
+/// Whether `bits` decodes to a valid target at or below the network limit.
+///
+/// This mirrors Bitcoin Core's `DeriveTarget`: reject a negative mantissa, a
+/// zero target, an overflowing exponent and a target above `params.pow_limit`.
+pub fn target_in_range(bits: CompactTarget, params: &Params) -> bool {
+    let raw = bits.to_consensus();
+    let size = raw >> 24;
+    let mantissa = raw & 0x007f_ffff;
+    if raw & 0x0080_0000 != 0 || mantissa == 0 {
+        return false;
+    }
+    if size > 34 || (mantissa > 0xff && size > 33) || (mantissa > 0xffff && size > 32) {
+        return false;
+    }
+    Target::from_compact(bits) <= params.max_attainable_target
+}
 
 /// The maximum time a header may lead the caller's clock, in seconds.
 ///
@@ -48,8 +68,10 @@ pub const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
 /// Whether the retarget rule (expected `bits`) is enforced on this network.
 ///
 /// Testnet and regtest allow minimum-difficulty blocks, so their `bits` do not
-/// follow the schedule; like Electrum we skip the difficulty rule there. The
-/// production network (mainnet) and signet are enforced.
+/// follow the schedule; like Electrum we skip the difficulty rule there. Only
+/// that rule is skipped: the proof-of-work check still runs, where Electrum
+/// omits it on testnet. The production network (mainnet) and signet are
+/// enforced.
 pub fn enforces_difficulty(params: &Params) -> bool {
     !params.no_pow_retargeting && !params.allow_min_difficulty_blocks
 }
@@ -137,6 +159,50 @@ mod tests {
             expected_bits(DIFFICULTY_PERIOD, &parent, None, &params),
             None,
         );
+    }
+
+    #[test]
+    fn the_mainnet_pow_limit_rejects_easier_targets() {
+        let mainnet = Params::new(Network::Bitcoin);
+        // Difficulty 1 is exactly the mainnet limit.
+        assert!(target_in_range(
+            CompactTarget::from_consensus(0x1d00_ffff),
+            &mainnet
+        ));
+        // The next representable step up is above it.
+        assert!(!target_in_range(
+            CompactTarget::from_consensus(0x1d01_0000),
+            &mainnet
+        ));
+        // A target regtest accepts is refused on mainnet.
+        assert!(!target_in_range(
+            CompactTarget::from_consensus(0x207f_ffff),
+            &mainnet
+        ));
+        assert!(target_in_range(
+            CompactTarget::from_consensus(0x207f_ffff),
+            &Params::new(Network::Regtest)
+        ));
+    }
+
+    #[test]
+    fn malformed_targets_are_refused() {
+        let params = Params::new(Network::Regtest);
+        // The sign bit is set.
+        assert!(!target_in_range(
+            CompactTarget::from_consensus(0x1d80_0000),
+            &params
+        ));
+        // A zero mantissa is not a target.
+        assert!(!target_in_range(
+            CompactTarget::from_consensus(0x1d00_0000),
+            &params
+        ));
+        // An exponent past the 256-bit range overflows.
+        assert!(!target_in_range(
+            CompactTarget::from_consensus(0x2300_0001),
+            &params
+        ));
     }
 
     #[test]
