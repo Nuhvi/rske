@@ -30,9 +30,9 @@
 //!
 //! - The spine is trusted wholesale. Nothing before the first checkpoint is
 //!   ever validated.
-//! - Future-time, version and transaction/merkle checks are not made: the core
-//!   has no clock (the caller hands the finality rule one), and the first two
-//!   add no SPV value. See [`crate::btc::validation`] for the exact rule set.
+//! - Version and transaction/merkle checks are not made: the core has no
+//!   internal clock (the caller supplies `now`), and those checks add no SPV
+//!   value. See [`crate::btc::validation`] for the exact rule set.
 
 use bitcoin::block::BlockHash;
 use bitcoin::block::Header as BitcoinHeader;
@@ -613,8 +613,8 @@ impl Core {
     /// - The first header's parent must be a known block. If that block is a
     ///   chain tip, the run extends that chain; otherwise it starts a **new
     ///   fork** (kept, not rejected).
-    /// - Every header is PoW-, continuity-, difficulty- and
-    ///   median-time-past-checked (see [`crate::btc::validation`]).
+    /// - Every header is PoW-, continuity-, difficulty-, median-time-past- and
+    ///   future-time-checked (see [`crate::btc::validation`]).
     /// - The best chain is re-selected by cumulative work; a fork only wins
     ///   when it is strictly heavier.
     /// - A fork whose `forkpoint` is at or below the finality mark is refused
@@ -622,12 +622,11 @@ impl Core {
     ///   above the mark earlier also never becomes best once the mark has
     ///   overtaken its `forkpoint`; it is kept stored instead.
     ///
-    /// `now` is the caller's clock (unix seconds), used only by the finality
-    /// rule: the mark advances when the work above the mark clears
-    /// [`finality::estimated_work_bar`], the estimated work the network did
-    /// since the mark. The core keeps no clock of its own, and the store
+    /// `now` is the caller's clock (unix seconds). The finality rule uses it to
+    /// measure the work above the mark, and the future-time check uses it as
+    /// the current time. The core keeps no internal clock, and the store
     /// remembers the greatest `now` seen, so a clock wound back cannot shrink
-    /// the bar.
+    /// the finality bar.
     ///
     /// Returns [`Error::NetworkMismatch`] if the store was seeded for a
     /// different network than this [`Core`] validates against.
@@ -782,6 +781,16 @@ impl Core {
                     height,
                     median,
                     got: header.time,
+                });
+            }
+
+            // C7: the timestamp may lead the caller clock by at most two hours.
+            if u64::from(header.time) > now.saturating_add(validation::MAX_FUTURE_BLOCK_TIME) {
+                return Err(Error::TimestampTooNew {
+                    height,
+                    now,
+                    got: header.time,
+                    max_ahead: validation::MAX_FUTURE_BLOCK_TIME,
                 });
             }
 
@@ -1301,7 +1310,25 @@ mod tests {
     /// median-time-past rule holds) and makes two children of the same parent
     /// distinct.
     fn mine_child(parent: &BitcoinHeader, bits: u32, tag: u32) -> BitcoinHeader {
-        mine_at(parent.block_hash(), parent.time + 1 + tag, bits)
+        // Keep the timestamp one second above the parent. The tag seeds the
+        // nonce, so competing children still get different hashes without
+        // pushing their timestamps into the future.
+        let target = CompactTarget::from_consensus(bits);
+        let mut nonce = tag;
+        loop {
+            let h = BitcoinHeader {
+                version: Version::ONE,
+                prev_blockhash: parent.block_hash(),
+                merkle_root: bitcoin::hashes::Hash::all_zeros(),
+                time: parent.time + 1,
+                bits: target,
+                nonce,
+            };
+            if h.validate_pow(h.target()).is_ok() {
+                return h;
+            }
+            nonce = nonce.wrapping_add(1);
+        }
     }
 
     /// Mine `n` contiguous headers above `parent` with the given target bits.
@@ -2184,8 +2211,12 @@ mod tests {
         let period = DIFFICULTY_PERIOD as usize;
 
         // Genesis has easy-target work. Period 0 blocks use work 22.
+        // Keep the clock close enough to the synthetic header times that the
+        // linear bar stays below the tail work, and above the header times so
+        // the future-time check does not reject them.
+        let now = canonical(&chain, 0).time as u64 + 1_000 * finality::TARGET_BLOCK_SECONDS;
         let run1 = mine_chain_from(&canonical(&chain, 0), period, WORK22_BITS, 1);
-        chain.connect_headers(&run1, NOW)?;
+        chain.connect_headers(&run1, now)?;
 
         // Tail after boundary 2016 at the lower work 20, enough to outweigh the
         // period before it and finalize.
@@ -2196,7 +2227,7 @@ mod tests {
             WORK20_BITS,
             1,
         );
-        chain.connect_headers(&tail, NOW)?;
+        chain.connect_headers(&tail, now)?;
 
         assert_eq!(
             chain.finalized_height()?.unwrap(),

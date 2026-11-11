@@ -5,7 +5,7 @@ use thiserror::Error;
 /// Errors from the side-effect-free core.
 ///
 /// Everything here is deterministic given the store contents and the inputs:
-/// there is no network, no clock, no concurrency and no hidden I/O behind any
+/// there is no network, no internal clock, no concurrency and no hidden I/O behind any
 /// of these.
 #[derive(Debug, Error)]
 pub enum Error {
@@ -48,6 +48,16 @@ pub enum Error {
 
     #[error("timestamp {got} at height {height} is not above the median-time-past {median}")]
     BadTimestamp { height: u64, median: u32, got: u32 },
+
+    #[error(
+        "timestamp {got} at height {height} is more than {max_ahead} s after the caller clock {now}"
+    )]
+    TimestampTooNew {
+        height: u64,
+        now: u64,
+        got: u32,
+        max_ahead: u64,
+    },
 
     #[error("header at height {height} does not link to {expected}")]
     LinkBreak { height: u64, expected: BlockHash },

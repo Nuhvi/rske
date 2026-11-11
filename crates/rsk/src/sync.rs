@@ -22,7 +22,8 @@ use crate::config::Config;
 use crate::peers::{Peer, Pool};
 
 /// The caller's clock, in unix seconds, for the finality rule. The core keeps
-/// no clock of its own; this is where it gets one.
+/// no internal clock of its own; this is where the header check and the
+/// finality rule get one.
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

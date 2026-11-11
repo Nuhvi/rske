@@ -32,8 +32,8 @@ use crate::{ConnectOutcome, RskConnectOutcome, RskEntry, Tag};
 /// The side-effect-free core: a thin, deterministic layer over a redb-backed
 /// store.
 ///
-/// No concurrency, no network, no clock, no hidden I/O — the caller supplies
-/// data and reads back outcomes.
+/// No concurrency, no network, no internal clock, no hidden I/O — the caller
+/// supplies data, time and reads back outcomes.
 pub struct Core {
     pub(crate) store: Store,
     pub(crate) network: Network,

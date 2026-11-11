@@ -4,7 +4,8 @@
 //! canonical chain, finalize it at difficulty-period boundaries, and carry
 //! Rootstock header trees rooted at trusted anchors in the same store.
 //!
-//! No concurrency, no network, no clock, no hidden I/O. The only state is a
+//! No concurrency, no network, no internal clock, no hidden I/O. Time is an
+//! input, never a hidden dependency. The only state is a
 //! redb-backed store, reached only through a transaction: [`Core`] opens a read
 //! snapshot or the writer at the start of each method.
 //!

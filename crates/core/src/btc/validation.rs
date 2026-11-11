@@ -12,15 +12,18 @@
 //!   schedule calls for at this height. Within a difficulty period every block
 //!   carries its period's target; at a period boundary the target is recomputed
 //!   from the previous period (Core's `GetNextWorkRequired`, Electrum's
-//!   `get_target`). This also pins the target to the network's proof-of-work
-//!   limit, since the retarget clamps to it.
+//!   `get_target`). At a period boundary the retarget clamps to the network's
+//!   proof-of-work limit.
 //! - **Median-time-past** — the timestamp is strictly greater than the median
 //!   of the previous [`MEDIAN_TIME_PAST`] blocks (Core's
 //!   `ContextualCheckBlockHeader`).
+//! - **Future time** — the timestamp is at most [`MAX_FUTURE_BLOCK_TIME`]
+//!   seconds after the caller's clock.
 //!
 //! Deliberately **not** checked:
 //!
-//! - **Future time** — that needs a wall clock, and the core is clock-free.
+//! - **Target range and proof-of-work limit** — `validate_pow` compares only the
+//!   hash with the target. See C6 in `specs/bitcoin-headers.md`.
 //! - **Transaction / merkle validity** — not visible in a header; out of scope.
 //! - **Version rules** (BIP34/65/66/9) — height-activated and of no SPV value.
 //! - **Retargeting on testnet/regtest** — those networks permit
@@ -35,6 +38,12 @@ use crate::store::DIFFICULTY_PERIOD;
 
 /// Number of prior blocks whose timestamps form the median-time-past.
 pub const MEDIAN_TIME_PAST: usize = 11;
+
+/// The maximum time a header may lead the caller's clock, in seconds.
+///
+/// Bitcoin Core uses two hours. The header time is not checked against a
+/// network-adjusted clock; the caller supplies `now` on every connect.
+pub const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
 
 /// Whether the retarget rule (expected `bits`) is enforced on this network.
 ///
