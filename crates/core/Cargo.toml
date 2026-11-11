@@ -4,10 +4,6 @@ version = "0.1.0"
 edition = "2024"
 description = "Side-effect-free Rootstock/Bitcoin core: deterministic chain state in redb, no concurrency or I/O in the logic"
 
-[features]
-# Exposes a full-state view and injectable finality parameters for tests.
-test-support = []
-
 [dependencies]
 alloy-primitives = { version = "1.5.4", features = ["rlp"] }
 alloy-rlp = "0.3.13"
@@ -23,3 +19,5 @@ unwrap_used = "deny"
 [dev-dependencies]
 eyre = "0.6"
 proptest = "1"
+# 0.9 is source-identical but requires proptest 1.12; 0.8 keeps the current 1.11.
+proptest-state-machine = "0.8"

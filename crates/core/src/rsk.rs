@@ -21,7 +21,7 @@ use rsk_consensus::validation::uncles::{
 
 use crate::Core;
 use crate::error::Error;
-use crate::store::WriteTxn;
+use crate::store::{ReadTxn, WriteTxn};
 
 /// The Rootstock consensus config matching a Bitcoin [`Network`]. Used when
 /// [`Core`] is opened.
@@ -48,6 +48,70 @@ pub struct RskEntry {
 pub struct RskUncle {
     pub header: Header,
     pub raw: Vec<u8>,
+}
+
+/// Streams stored RSK headers backwards from a tip, newest-first.
+///
+/// Created by [`Core::rsk_headers_back`]. Holds one read snapshot while it
+/// yields rows.
+pub struct RskHeadersBack {
+    txn: ReadTxn,
+    cursor: Option<[u8; 32]>,
+    min_bn: u64,
+    remaining: usize,
+}
+
+impl Iterator for RskHeadersBack {
+    type Item = Result<RskEntry, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let cursor = self.cursor?;
+        if self.remaining == 0 {
+            self.cursor = None;
+            return None;
+        }
+        self.remaining -= 1;
+
+        let raw = match self.txn.rsk_raw_header(&cursor) {
+            Ok(Some(raw)) => raw,
+            Ok(None) => {
+                self.cursor = None;
+                return None;
+            }
+            Err(error) => {
+                self.cursor = None;
+                return Some(Err(error));
+            }
+        };
+        let Some(header) = decode_header(&raw) else {
+            self.cursor = None;
+            return None;
+        };
+        let number = header.number;
+        let parent = header.parent_hash.0;
+        let uncles = match self.txn.rsk_uncle_raw(&cursor) {
+            Ok(raws) => raws
+                .into_iter()
+                .filter_map(|uncle_raw| {
+                    decode_header(&uncle_raw).map(|header| RskUncle {
+                        header,
+                        raw: uncle_raw,
+                    })
+                })
+                .collect(),
+            Err(error) => {
+                self.cursor = None;
+                return Some(Err(error));
+            }
+        };
+        let entry = RskEntry {
+            header,
+            raw,
+            uncles,
+        };
+        self.cursor = (number > self.min_bn).then_some(parent);
+        Some(Ok(entry))
+    }
 }
 
 /// Outcome of a [`Core::connect_rsk_headers`] call.
@@ -181,49 +245,20 @@ impl Core {
         })
     }
 
-    /// Read RSK headers backwards from a stored tip, oldest-first, stopping at
-    /// `min_bn`.
+    /// Stream RSK headers backwards from a stored tip, newest-first, stopping
+    /// at `min_bn`.
     ///
-    /// Returns an empty vector when `tip` is not stored (for example because
-    /// the peer has advanced past the last committed header). A missing parent
-    /// stops the walk; the returned range is then the contiguous suffix that is
-    /// stored.
-    pub fn rsk_headers_back(&self, tip: B256, min_bn: u64) -> Result<Vec<RskEntry>, Error> {
-        const MAX_HEADERS: usize = 20_000;
-        let txn = self.store.read()?;
-        let mut cursor = tip.0;
-        let mut out = Vec::new();
-        while out.len() < MAX_HEADERS {
-            let Some(raw) = txn.rsk_raw_header(&cursor)? else {
-                break;
-            };
-            let Some(header) = decode_header(&raw) else {
-                break;
-            };
-            let number = header.number;
-            let parent = header.parent_hash.0;
-            let uncles = txn
-                .rsk_uncle_raw(&cursor)?
-                .into_iter()
-                .filter_map(|uncle_raw| {
-                    decode_header(&uncle_raw).map(|header| RskUncle {
-                        header,
-                        raw: uncle_raw,
-                    })
-                })
-                .collect();
-            out.push(RskEntry {
-                header,
-                raw,
-                uncles,
-            });
-            if number <= min_bn {
-                break;
-            }
-            cursor = parent;
-        }
-        out.reverse();
-        Ok(out)
+    /// Yields nothing when `tip` is not stored (for example because the peer
+    /// has advanced past the last committed header). A missing parent stops the
+    /// walk; the range is then the contiguous suffix that is stored. Callers
+    /// that need oldest-first order can reverse a collected vector.
+    pub fn rsk_headers_back(&self, tip: B256, min_bn: u64) -> Result<RskHeadersBack, Error> {
+        Ok(RskHeadersBack {
+            txn: self.store.read()?,
+            cursor: Some(tip.0),
+            min_bn,
+            remaining: 20_000,
+        })
     }
 
     /// The newest RSK header the last IBD pass committed, if recorded.
@@ -739,19 +774,30 @@ mod tests {
         }
         let tip = hashes[4];
 
-        let all = core.rsk_headers_back(tip, 0).unwrap();
+        let mut all: Vec<RskEntry> = core
+            .rsk_headers_back(tip, 0)
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        all.reverse();
         let numbers: Vec<u64> = all.iter().map(|entry| entry.header.number).collect();
         assert_eq!(numbers, vec![0, 1, 2, 3, 4]);
 
-        let tail = core.rsk_headers_back(tip, 3).unwrap();
+        let mut tail: Vec<RskEntry> = core
+            .rsk_headers_back(tip, 3)
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        tail.reverse();
         let numbers: Vec<u64> = tail.iter().map(|entry| entry.header.number).collect();
         assert_eq!(numbers, vec![3, 4]);
 
-        assert!(
-            core.rsk_headers_back(B256::repeat_byte(9), 0)
-                .unwrap()
-                .is_empty()
-        );
+        let missing: Vec<RskEntry> = core
+            .rsk_headers_back(B256::repeat_byte(9), 0)
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(missing.is_empty());
 
         core.set_rsk_sync_tip(tip).unwrap();
         assert_eq!(core.rsk_sync_tip().unwrap(), Some((tip, 4)));

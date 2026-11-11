@@ -27,7 +27,7 @@ use redb::{Database, ReadTransaction, TypeName, Value, WriteTransaction};
 mod btc;
 mod rsk;
 
-pub(crate) use btc::{BtcReads, CoinbaseRow};
+pub(crate) use btc::{BtcReads, CoinbaseRow, ForkMeta};
 
 use crate::error::Error;
 
@@ -121,7 +121,6 @@ impl Store {
 
     /// Create a store over the redb in-memory backend. No disk I/O: this is
     /// what tests use, and what "I control everything going on" means.
-    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn in_memory() -> Result<Self, Error> {
         let db = Database::builder().create_with_backend(redb::backends::InMemoryBackend::new())?;
         Self::new(db)

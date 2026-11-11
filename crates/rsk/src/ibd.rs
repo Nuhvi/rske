@@ -35,6 +35,15 @@ use crate::rootstock::{Chain, Session};
 /// RSK blocks; 20,000 is a safety valve, not a working limit.
 const MAX_HEADERS: usize = 20_000;
 
+/// Stored RSK headers in oldest-first order, as the IBD window expects.
+fn headers_back_oldest(core: &Core, tip: B256, min_bn: u64) -> Result<Vec<RskEntry>> {
+    let mut entries: Vec<RskEntry> = core
+        .rsk_headers_back(tip, min_bn)?
+        .collect::<Result<_, _>>()?;
+    entries.reverse();
+    Ok(entries)
+}
+
 /// What one IBD pass found.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct IbdReport {
@@ -189,7 +198,7 @@ impl RskSource {
     /// stored tip is used as the seam: fetch only the new headers above it and
     /// splice them onto the stored range below.
     async fn load_from_store(&mut self, core: &Core, target_bn: u64) -> Result<()> {
-        let direct = core.rsk_headers_back(self.peer_tip, target_bn)?;
+        let direct = headers_back_oldest(core, self.peer_tip, target_bn)?;
         if !direct.is_empty() {
             self.adopt(direct);
             info!(
@@ -203,7 +212,7 @@ impl RskSource {
         let Some((stored_hash, stored_number)) = self.stored_tip else {
             return Ok(());
         };
-        let stored = core.rsk_headers_back(stored_hash, target_bn)?;
+        let stored = headers_back_oldest(core, stored_hash, target_bn)?;
         if stored.is_empty() {
             return Ok(());
         }
@@ -259,7 +268,7 @@ impl RskSource {
     /// `cursor` is the parent of the current oldest header, so this reads only
     /// the gap the next tag needs rather than replaying the whole stored range.
     fn load_stored_gap(&mut self, core: &Core, target_bn: u64) -> Result<bool> {
-        let gap = core.rsk_headers_back(self.cursor, target_bn)?;
+        let gap = headers_back_oldest(core, self.cursor, target_bn)?;
         if gap.is_empty() {
             return Ok(false);
         }

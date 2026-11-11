@@ -299,7 +299,6 @@ impl ReadTxn {
     }
 }
 
-#[cfg(feature = "test-support")]
 impl super::Store {
     /// Drop every Rootstock table, so a replayed action sequence starts from an
     /// empty forest while the Bitcoin side stays seeded.

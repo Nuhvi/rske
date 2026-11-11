@@ -23,17 +23,25 @@ pub mod error;
 pub mod rsk;
 mod store;
 
+#[cfg(test)]
+#[path = "../specs/mod.rs"]
+mod specs;
+
 pub use btc::finality::{FinalityStatus, REVERSAL_BLOCKS, is_checkpoint};
 pub use btc::validation::MEDIAN_TIME_PAST;
 pub use btc::{
-    Coinbase, CoinbaseTag, ConnectOutcome, FINALITY_MARGIN_BLOCKS, bip34_height, header_work,
+    Coinbase, CoinbaseTag, CoinbaseTags, ConnectOutcome, FINALITY_MARGIN_BLOCKS,
+    FinalizedCheckpoints, bip34_height, header_work,
 };
-pub use core::{Action, Core, CoreState, ForkState, Outcome, RskState};
+pub use core::{
+    Action, CanonicalHeaders, Core, CoreState, ForkState, Outcome, RskState, StoredHeader,
+    StoredHeaders,
+};
 pub use error::Error;
 pub use rsk::{
     EphemeralChainCheckpoint, FIVE_SIGMA_ALPHA, HeaderRef, RootScore, RskConnectOutcome, RskEntry,
-    Scoreboard, Share, WORK_EQUIVALENT_BLOCKS, min_tags_for_fraud_proof, oldest_checkpoint,
-    required_endorsements, score,
+    RskHeadersBack, Scoreboard, Share, WORK_EQUIVALENT_BLOCKS, min_tags_for_fraud_proof,
+    oldest_checkpoint, required_endorsements, score,
 };
 pub use rsk_consensus::validation::merged_mining::Tag;
 pub use store::DIFFICULTY_PERIOD;

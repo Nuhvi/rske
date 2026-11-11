@@ -26,7 +26,7 @@ use rsk_consensus::config::ChainConfig;
 use crate::btc::finality;
 use crate::error::Error;
 use crate::rsk;
-use crate::store::Store;
+use crate::store::{ForkMeta, ReadTxn, Store};
 use crate::{ConnectOutcome, RskConnectOutcome, RskEntry, Tag};
 
 /// The side-effect-free core: a thin, deterministic layer over a redb-backed
@@ -62,21 +62,18 @@ impl Core {
         })
     }
 
-    /// Open an in-memory store (tests, no disk I/O) for the given network.
-    #[cfg(any(test, feature = "test-support"))]
+    /// Open an in-memory store (no disk I/O) for the given network.
     pub fn in_memory(network: Network) -> Result<Self, Error> {
         Self::in_memory_with_bar(network, bar_for(network))
     }
 
-    /// Open an in-memory store with an explicit finality policy (tests).
-    #[cfg(any(test, feature = "test-support"))]
+    /// Open an in-memory store with an explicit finality policy.
     pub fn in_memory_with_bar(network: Network, bar: finality::Bar) -> Result<Self, Error> {
         Self::in_memory_with(network, bar, crate::btc::FINALITY_MARGIN_BLOCKS)
     }
 
-    /// Open an in-memory store with an explicit finality policy and mark depth
-    /// (tests only: a short margin lets a small chain exercise finality).
-    #[cfg(any(test, feature = "test-support"))]
+    /// Open an in-memory store with an explicit finality policy and mark depth.
+    /// A short margin lets a small chain exercise finality.
     pub fn in_memory_with(
         network: Network,
         bar: finality::Bar,
@@ -91,14 +88,12 @@ impl Core {
         })
     }
 
-    /// Empty the Bitcoin tables (tests: replay from a clean seed).
-    #[cfg(feature = "test-support")]
+    /// Drop every Bitcoin table (destructive: replay from a clean seed).
     pub fn reset(&self) -> Result<(), Error> {
         self.store.reset_btc()
     }
 
-    /// Empty the Rootstock tables, keeping the Bitcoin side intact.
-    #[cfg(feature = "test-support")]
+    /// Drop every Rootstock table, keeping the Bitcoin side intact.
     pub fn reset_rsk(&self) -> Result<(), Error> {
         self.store.reset_rsk()
     }
@@ -154,6 +149,12 @@ impl Core {
     /// This is what a reader wants and what a test uses to deduplicate explored
     /// states: the canonical chain alone is not enough, because a store holding
     /// a blocked fork looks identical to one without it.
+    ///
+    /// This is a point-in-time snapshot, not a streaming read. For the row
+    /// collections that can grow without bound, use the iterators
+    /// ([`Core::stored_headers`], [`Core::canonical_headers`],
+    /// [`Core::finalized_checkpoints`], [`Core::coinbase_tags`],
+    /// [`Core::rsk_headers_back`]).
     pub fn state(&self) -> Result<CoreState, Error> {
         let txn = self.store.read()?;
         let mut forks: Vec<ForkState> = txn
@@ -186,6 +187,51 @@ impl Core {
                 sync_tip_header: txn.rsk_sync_tip()?,
             },
         })
+    }
+
+    /// Every stored Bitcoin header and the fork/height it occupies.
+    ///
+    /// [`CoreState`] reports fork metadata, not the rows themselves: a header
+    /// on a blocked fork is invisible through the canonical readers. This is
+    /// the observability view a model-based test needs to compare its predicted
+    /// stored set with the real one.
+    ///
+    /// The rows are streamed from the read snapshot: a caller that only needs
+    /// the first few does not pay for the whole tree.
+    pub fn stored_headers(&self) -> Result<StoredHeaders, Error> {
+        let txn = self.store.read()?;
+        let forks = txn.all_forks()?;
+        Ok(StoredHeaders {
+            txn,
+            forks: forks.into_iter(),
+            current: None,
+        })
+    }
+
+    /// The canonical chain, oldest first, streamed from one read snapshot.
+    ///
+    /// Yields an [`Error::Internal`] once if a canonical height has no stored
+    /// row. A spine-only seed (for example checkpoints at 0 and 2016 with no
+    /// blocks between them) has such gaps; a full chain does not.
+    pub fn canonical_headers(&self) -> Result<CanonicalHeaders, Error> {
+        let txn = self.store.read()?;
+        let Some(best) = txn.best_fork()? else {
+            return Ok(CanonicalHeaders::empty());
+        };
+        let Some((tip, _)) = txn.fork_tip(best)? else {
+            return Ok(CanonicalHeaders::empty());
+        };
+        Ok(CanonicalHeaders {
+            txn: Some(txn),
+            best,
+            next: 0,
+            tip,
+        })
+    }
+
+    /// Where a stored block lives, canonical or not.
+    pub fn locate(&self, hash: &BlockHash) -> Result<Option<(u64, u64)>, Error> {
+        self.store.read()?.locate(hash)
     }
 }
 
@@ -247,6 +293,108 @@ pub struct CoreState {
     pub rootstock: RskState,
 }
 
+/// One stored Bitcoin header, with the fork and height it occupies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StoredHeader {
+    pub fork: u64,
+    pub height: u64,
+    pub hash: BlockHash,
+}
+
+/// Streams every stored Bitcoin header, one row at a time.
+///
+/// Created by [`Core::stored_headers`]. Rows are grouped by fork and ascending
+/// height. The underlying read snapshot is held for the life of the iterator.
+pub struct StoredHeaders {
+    txn: ReadTxn,
+    forks: std::vec::IntoIter<(u64, ForkMeta)>,
+    current: Option<(u64, u64, u64)>, // (fork, next height, tip height)
+}
+
+impl Iterator for StoredHeaders {
+    type Item = Result<StoredHeader, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some((fork, height, tip)) = self.current {
+                if height <= tip {
+                    self.current = Some((fork, height + 1, tip));
+                    match self.txn.header_at(fork, height) {
+                        Ok(Some(header)) => {
+                            return Some(Ok(StoredHeader {
+                                fork,
+                                height,
+                                hash: header.block_hash(),
+                            }));
+                        }
+                        Ok(None) => continue,
+                        Err(error) => {
+                            self.current = None;
+                            self.forks = Vec::new().into_iter();
+                            return Some(Err(error));
+                        }
+                    }
+                }
+                self.current = None;
+            }
+
+            let (fork, meta) = self.forks.next()?;
+            if meta.tip_height >= meta.forkpoint {
+                self.current = Some((fork, meta.forkpoint, meta.tip_height));
+            }
+        }
+    }
+}
+
+/// Streams the canonical Bitcoin chain, oldest first.
+///
+/// Created by [`Core::canonical_headers`]. Holds one read snapshot while it
+/// yields rows.
+pub struct CanonicalHeaders {
+    txn: Option<ReadTxn>,
+    best: u64,
+    next: u64,
+    tip: u64,
+}
+
+impl CanonicalHeaders {
+    fn empty() -> Self {
+        Self {
+            txn: None,
+            best: 0,
+            next: 0,
+            tip: 0,
+        }
+    }
+}
+
+impl Iterator for CanonicalHeaders {
+    type Item = Result<BitcoinHeader, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let txn = self.txn.as_ref()?;
+        if self.next > self.tip {
+            self.txn = None;
+            return None;
+        }
+        let height = self.next;
+        self.next += 1;
+        match txn.header_at(self.best, height) {
+            Ok(Some(header)) => Some(Ok(header)),
+            Ok(None) => {
+                self.txn = None;
+                Some(Err(Error::Internal(format!(
+                    "missing canonical header at height {height}"
+                ))))
+            }
+            Err(error) => {
+                self.txn = None;
+                Some(Err(error))
+            }
+        }
+    }
+}
+
 /// One Bitcoin fork: its identity, parent and tip.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ForkState {
@@ -259,7 +407,7 @@ pub struct ForkState {
 }
 
 /// The Rootstock forest: stored headers, proposed roots and the sync tip.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct RskState {
     /// Every stored header hash, sorted.
     pub forest: Vec<[u8; 32]>,

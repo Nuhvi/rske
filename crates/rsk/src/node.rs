@@ -129,7 +129,10 @@ impl Node {
             .core
             .finalized_height()?
             .context("store is not seeded")?;
-        let checkpoints = self.core.finalized_checkpoints()?;
+        let checkpoints: Vec<_> = self
+            .core
+            .finalized_checkpoints()?
+            .collect::<Result<Vec<_>, _>>()?;
         if checkpoints.is_empty() {
             bail!("no checkpoints at or below the finality mark {finalized}");
         }

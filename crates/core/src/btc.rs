@@ -111,7 +111,93 @@ pub fn bip34_height(height: u64) -> Vec<u8> {
     bytes
 }
 
-/// Outcome of a [`Core::connect_headers`] call.
+/// Streams the finalized period boundaries at or below the finality mark.
+///
+/// Created by [`Core::finalized_checkpoints`]. Holds one read snapshot while it
+/// yields rows.
+pub struct FinalizedCheckpoints {
+    txn: Option<ReadTxn>,
+    best: u64,
+    next: u64,
+    finalized: u64,
+}
+
+impl FinalizedCheckpoints {
+    fn empty() -> Self {
+        Self {
+            txn: None,
+            best: 0,
+            next: 0,
+            finalized: 0,
+        }
+    }
+}
+
+impl Iterator for FinalizedCheckpoints {
+    type Item = Result<(u64, BitcoinHeader), Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let txn = self.txn.as_ref()?;
+        while self.next <= self.finalized {
+            let height = self.next;
+            self.next = self.next.saturating_add(DIFFICULTY_PERIOD);
+            match txn.header_at(self.best, height) {
+                Ok(Some(header)) => return Some(Ok((height, header))),
+                Ok(None) => continue,
+                Err(error) => {
+                    self.txn = None;
+                    return Some(Err(error));
+                }
+            }
+        }
+        self.txn = None;
+        None
+    }
+}
+
+/// Streams cached coinbase tag states for a height range.
+///
+/// Created by [`Core::coinbase_tags`]. Holds one read snapshot and fetches rows
+/// in bounded chunks, so a caller can stop early without materialising the
+/// whole range.
+pub struct CoinbaseTags {
+    txn: ReadTxn,
+    next: Option<u64>,
+    end: u64,
+    buffer: std::vec::IntoIter<(u64, CoinbaseTag)>,
+}
+
+impl Iterator for CoinbaseTags {
+    type Item = Result<(u64, CoinbaseTag), Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        const CHUNK: u64 = 256;
+        loop {
+            if let Some(item) = self.buffer.next() {
+                return Some(Ok(item));
+            }
+            let from = self.next?;
+            if from > self.end {
+                self.next = None;
+                return None;
+            }
+            let chunk_end = from.saturating_add(CHUNK - 1).min(self.end);
+            match self.txn.coinbase_tags(from, chunk_end) {
+                Ok(rows) => {
+                    self.next = (chunk_end < self.end).then_some(chunk_end + 1);
+                    self.buffer = rows.into_iter();
+                }
+                Err(error) => {
+                    self.next = None;
+                    self.buffer = Vec::new().into_iter();
+                    return Some(Err(error));
+                }
+            }
+        }
+    }
+}
+
+/// Outcome of a [`Core::connect_headers`] call./// Outcome of a [`Core::connect_headers`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectOutcome {
     /// Headers newly accepted and stored (across whatever fork they landed on).
@@ -190,9 +276,9 @@ impl Core {
         self.store.read()?.finalized_height()
     }
 
-    /// The newest **checkpoint**: the last difficulty-period start at or below
-    /// the mark. This is what a Rootstock tail starts from, because a checkpoint
-    /// is a boundary while the mark itself is only a reorg depth.
+    /// The newest **Bitcoin period boundary** at or below the mark. This is
+    /// what a Rootstock tail starts from: a boundary is a stable period start,
+    /// while the mark itself is only a reorg depth.
     pub fn finalized_checkpoint(&self) -> Result<Option<u64>, Error> {
         Ok(self
             .finalized_height()?
@@ -289,31 +375,28 @@ impl Core {
         Ok(Some(end - begin))
     }
 
-    /// The **checkpoints** — the period-boundary headers at or below the
-    /// finality mark, in height order (height `0` first).
+    /// The **Bitcoin period boundaries** at or below the finality mark, in
+    /// height order (height `0` first).
     ///
-    /// A boundary is a checkpoint exactly when it starts a difficulty period
+    /// A height is one exactly when it starts a difficulty period
     /// ([`finality::is_checkpoint`]) *and* the mark has reached it. These are
     /// the headers safe to treat as irreversible, e.g. to embed as a trust
     /// anchor. The tip's nearest boundary is deliberately **excluded**: the
     /// mark never reaches into the last [`FINALITY_MARGIN_BLOCKS`].
-    pub fn finalized_checkpoints(&self) -> Result<Vec<(u64, BitcoinHeader)>, Error> {
+    pub fn finalized_checkpoints(&self) -> Result<FinalizedCheckpoints, Error> {
         let txn = self.store.read()?;
         let Some(finalized) = txn.finalized_height()? else {
-            return Ok(Vec::new());
+            return Ok(FinalizedCheckpoints::empty());
         };
         let Some(best) = txn.best_fork()? else {
-            return Ok(Vec::new());
+            return Ok(FinalizedCheckpoints::empty());
         };
-        let mut out = Vec::new();
-        let mut height = 0u64;
-        while height <= finalized {
-            if let Some(header) = txn.header_at(best, height)? {
-                out.push((height, header));
-            }
-            height += DIFFICULTY_PERIOD;
-        }
-        Ok(out)
+        Ok(FinalizedCheckpoints {
+            txn: Some(txn),
+            best,
+            next: 0,
+            finalized,
+        })
     }
 
     /// Height of a known block hash on the canonical chain, if it is canonical.
@@ -405,8 +488,13 @@ impl Core {
     /// This is the bulk form of [`Core::coinbase_tag_at`] for the backwards tag
     /// scan: opening one transaction for the whole range avoids paying redb's
     /// snapshot cost hundreds of times per run.
-    pub fn coinbase_tags(&self, from: u64, to: u64) -> Result<Vec<(u64, CoinbaseTag)>, Error> {
-        self.store.read()?.coinbase_tags(from, to)
+    pub fn coinbase_tags(&self, from: u64, to: u64) -> Result<CoinbaseTags, Error> {
+        Ok(CoinbaseTags {
+            txn: self.store.read()?,
+            next: Some(from),
+            end: to,
+            buffer: Vec::new().into_iter(),
+        })
     }
 
     /// Backfill the cached tag on an existing coinbase row.
@@ -729,15 +817,23 @@ impl Core {
             .unwrap_or(Work::from_be_bytes([0; 32]));
         if target_fork != best && target_work > best_work {
             // A fork created above the mark can outlive it. Once the mark has
-            // passed this fork's forkpoint, letting it win would reorg finalized
+            // passed its divergence point, letting it win would reorg finalized
             // history: the fork stays stored but never becomes the best chain.
             let mark = txn.finalized_height()?.unwrap_or(0);
             // Fork 0 is the spine's own chain (the mark lives on it), so it is
-            // always allowed to win back; only other forks can cross the mark.
-            let crosses_mark = target_fork != 0
-                && txn
-                    .fork_meta(target_fork)?
-                    .is_some_and(|meta| meta.forkpoint <= mark);
+            // always allowed to win back. Any other fork may only win if it
+            // carries the mark's block. The fork's own `forkpoint` is not
+            // enough: a fork branched off another fork can start above the mark
+            // while its chain diverged below it, so the block at the mark is
+            // resolved through the fork's ancestors (`header_at`) instead.
+            let crosses_mark = if target_fork == 0 {
+                false
+            } else {
+                let at_mark = txn.header_at(target_fork, mark)?;
+                let canonical = txn.header_at(0, mark)?;
+                at_mark.map(|header| header.block_hash())
+                    != canonical.map(|header| header.block_hash())
+            };
             if !crosses_mark {
                 txn.set_best_fork(target_fork)?;
                 best = target_fork;
@@ -1600,7 +1696,7 @@ mod tests {
 
         let finalized = chain.finalized_height()?.expect("a finality mark");
         assert_eq!(finalized, 2 * DIFFICULTY_PERIOD);
-        let cps = chain.finalized_checkpoints()?;
+        let cps: Vec<_> = chain.finalized_checkpoints()?.collect::<Result<_, _>>()?;
 
         // Every exported checkpoint is at or below the mark, and the newest one
         // *is* the mark here — never a boundary above it.

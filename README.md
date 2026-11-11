@@ -7,17 +7,18 @@ Rske (Rootstock Edge client) is a persistent Rootstock (RSK) light client for fa
 ```
 crates/
   rsk-core/      — side-effect-free Bitcoin + Rootstock chain state (redb): checkpoint spine, fork tree, RSK header forest, checkpoint rules
-  rsk/           — the Rske node as a library: Bitcoin header sync, peer pool, checkpoint export
+  rsk/           — the Rske node as a library: Bitcoin header sync, coinbase tag scan, IBD scoring, checkpoint export
   cli/           — rsk-cli: a thin command-line wrapper over the `rsk` library
   btc-p2p/       — Bitcoin P2P protocol client: framed transport, version/verack handshake, headers
-  rsk-consensus/ — vendored rustock consensus: Header, HeaderVerifier, ChainConfig, checkpoint (88 tests)
+  rsk-consensus/ — vendored rustock consensus: Header, HeaderVerifier, ChainConfig, checkpoint, tag parser (96 tests)
   rsk-p2p/       — vendored rustock RLPx networking + rsk subprotocol + discovery (80 tests)
 ```
 
 ## Usage
 
 ```bash
-# sync Bitcoin headers into ./data/rske/chain.redb (validates every header)
+# sync Bitcoin headers, scan tags, and run IBD into ./data/rske/chain.redb
+# (RSK peers default to the shipped bootnodes; override with --rsk-peer)
 cargo run -p rsk-cli -- sync
 
 # write the store's finalized period boundaries as a checkpoints.txt

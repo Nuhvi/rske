@@ -299,7 +299,7 @@ impl Value for ForkMeta {
             forkpoint_hash: BlockHash::from_byte_array(fp_hash),
             tip_height: u64::from_be_bytes(data[48..56].try_into().expect("8 bytes")),
             tip_hash: BlockHash::from_byte_array(data[56..88].try_into().expect("32 bytes")),
-            tip_work: Work::from_be_bytes(data[80..112].try_into().expect("32 bytes")),
+            tip_work: Work::from_be_bytes(data[88..120].try_into().expect("32 bytes")),
         }
     }
 
@@ -453,7 +453,6 @@ macro_rules! btc_read_methods {
     };
 }
 
-#[cfg(feature = "test-support")]
 impl super::Store {
     /// Drop every Bitcoin table, so a replayed action sequence starts from an
     /// empty store without paying for a new database.

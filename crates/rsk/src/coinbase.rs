@@ -164,8 +164,9 @@ impl<'a> Scanner<'a> {
         let start = floor.max(tip.saturating_sub(span - 1));
         info!("coinbase: scanning #{tip} down to #{start} (at most {max_blocks} block(s))");
         let cache_floor = start.max(tip.saturating_sub(TAG_PREFETCH - 1));
-        let cached_tags: HashMap<u64, CoinbaseTag> =
-            core.coinbase_tags(cache_floor, tip)?.into_iter().collect();
+        let cached_tags: HashMap<u64, CoinbaseTag> = core
+            .coinbase_tags(cache_floor, tip)?
+            .collect::<Result<_, _>>()?;
 
         Ok(Some(Self {
             config,
@@ -201,7 +202,10 @@ impl<'a> Scanner<'a> {
 
         if height < self.cache_floor {
             let from = self.stop_at.max(height.saturating_sub(TAG_PREFETCH - 1));
-            self.cached_tags.extend(core.coinbase_tags(from, height)?);
+            let tags: Vec<_> = core
+                .coinbase_tags(from, height)?
+                .collect::<Result<_, _>>()?;
+            self.cached_tags.extend(tags);
             self.cache_floor = from;
         }
 
