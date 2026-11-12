@@ -69,10 +69,12 @@
 //! ## The clock
 //!
 //! `T = now − t0` comes from the node's clock, which is therefore a trust input:
-//! a backward clock skew lowers the requirement. The store remembers the greatest
-//! `now` it has seen, so winding it back cannot shrink the requirement. The work of a
-//! chain is `Σ D · 2³²` over its blocks, so the mark tracks exactly the work the
-//! network had to hash.
+//! a backward clock skew lowers the requirement. The rule takes the greatest of
+//! the supplied clock, the stored high-water mark and the chain time at the best
+//! tip, so a wound-back clock cannot shrink the requirement. The chain time is
+//! Bitcoin's median-time-past over the last 11 headers: a consensus aggregate
+//! that one miner's timestamp cannot move. The work of a chain is `Σ D · 2³²`
+//! over its blocks, so the mark tracks exactly the work the network had to hash.
 
 use alloy_primitives::U256;
 use bitcoin::Network;

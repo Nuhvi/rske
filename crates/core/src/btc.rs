@@ -287,8 +287,8 @@ impl Core {
     /// tip-work requirement instead.
     pub fn finality_status(&self, now: u64) -> Result<Option<FinalityStatus>, Error> {
         let txn = self.store.read()?;
-        // Report the same requirement the decision would use: the caller's value floored
-        // by the high-water mark and the best tip's time.
+        // Report the same requirement the decision would use: the caller's value
+        // floored by the high-water mark and the chain time at the best tip.
         let now = effective_clock(&txn, Some(now), txn.now_hwm()?)?;
         Ok(measure_finality(&txn, now, self.config.partition_safety)?.map(|m| m.status))
     }
@@ -615,8 +615,10 @@ impl Core {
     /// core keeps no internal clock. The future-time check (C7) runs only on
     /// this value; without it, C7 is skipped. The finality rule runs on the
     /// clock floor instead: the greatest of the supplied value, the stored
-    /// high-water mark and the best tip's header time. The store remembers the
-    /// greatest floor used on a batch that stores headers.
+    /// high-water mark and the chain time at the best tip — the median of its
+    /// last 11 header times, or the tip's own time when that window is not
+    /// stored. The store remembers the greatest floor used on a batch that
+    /// stores headers.
     ///
     /// Returns [`Error::NetworkMismatch`] if the store was seeded for a
     /// different network than this [`Core`] validates against.
@@ -956,12 +958,13 @@ fn finalize_in_txn(
     partition_safety: bool,
 ) -> Result<Finality, Error> {
     // The requirement's clock: the greatest of the caller's value (if it
-    // supplied one), the stored high-water mark and the best tip's header time.
-    // A caller with no clock therefore measures the requirement from the
-    // chain's own time, and a stale value can never put the rule behind the
-    // chain it already holds. C7 does not use this value: a chain-derived clock
-    // would reject the very headers it is meant to admit, so C7 runs only on an
-    // explicit clock.
+    // supplied one), the stored high-water mark and the chain time at the best
+    // tip. The chain time is the median of the last 11 header times, so one
+    // miner's timestamp cannot move it. A caller with no clock therefore
+    // measures the requirement from the chain's consensus time, and a stale
+    // value can never put the rule behind the chain it already holds. C7 does
+    // not use this value: a chain-derived clock would reject the very headers
+    // it is meant to admit, so C7 runs only on an explicit clock.
     let hwm = txn.now_hwm()?;
     let now = effective_clock(txn, now, hwm)?;
     if hwm.is_none_or(|seen| now > seen) {
@@ -1000,27 +1003,51 @@ fn finalize_in_txn(
     })
 }
 
+/// The chain's own clock at a fork tip: Bitcoin Core's `GetMedianTimePast`,
+/// the median of the 11 header times that end at the tip.
+///
+/// A header time is one miner's claim; the median cannot move without a
+/// majority of the window. The tip's own time is the fallback when the window
+/// is not fully stored — a sparse seed, or a chain shorter than the window.
+/// Returns 0 when the tip header itself is missing.
+fn chain_time_at<R: BtcReads>(reads: &R, fork: u64, tip: u64) -> Result<u64, Error> {
+    let Some(tip_header) = reads.header_at(fork, tip)? else {
+        return Ok(0);
+    };
+    let mut times = [0u32; validation::MEDIAN_TIME_PAST];
+    for (offset, slot) in times.iter_mut().enumerate() {
+        let Some(height) = tip.checked_sub(offset as u64) else {
+            return Ok(u64::from(tip_header.time));
+        };
+        match reads.header_at(fork, height)? {
+            Some(header) => *slot = header.time,
+            None => return Ok(u64::from(tip_header.time)),
+        }
+    }
+    Ok(u64::from(validation::median_time_past(times)))
+}
+
 /// The clock a connect or a status read runs on: the greatest supplied value,
-/// the stored high-water mark, and the best tip's header time.
+/// the stored high-water mark, and the chain time at the best tip.
 ///
 /// The first two keep a wound-back or absent caller clock from shrinking the
-/// requirement. The third makes the chain's own time the floor, so a caller with
-/// no clock still gets a meaningful future-time bound and requirement.
+/// requirement. The third gives a caller with no clock a chain-derived clock.
+/// It is a consensus aggregate — the median of the last 11 header times — not
+/// one miner's timestamp, and falls back to the tip's own time when the window
+/// is not stored.
 fn effective_clock<R: BtcReads>(
     reads: &R,
     supplied: Option<u64>,
     hwm: Option<u64>,
 ) -> Result<u64, Error> {
-    let tip_time = match reads.best_fork()? {
+    let chain_time = match reads.best_fork()? {
         Some(fork) => match reads.fork_tip(fork)? {
-            Some((height, _)) => reads
-                .header_at(fork, height)?
-                .map_or(0, |header| u64::from(header.time)),
+            Some((tip, _)) => chain_time_at(reads, fork, tip)?,
             None => 0,
         },
         None => 0,
     };
-    Ok(supplied.unwrap_or(0).max(hwm.unwrap_or(0)).max(tip_time))
+    Ok(supplied.unwrap_or(0).max(hwm.unwrap_or(0)).max(chain_time))
 }
 
 /// A partition-safety evaluation and the tip it was taken at.
@@ -1249,8 +1276,8 @@ impl Core {
     }
 
     /// Connect a run of Bitcoin headers with no caller clock. The clock is the
-    /// stored high-water mark or the best tip's header time, whichever is
-    /// greater.
+    /// greatest of the stored high-water mark and the chain time at the best
+    /// tip: the median of its last 11 header times.
     pub fn connect_headers_clockless(
         &self,
         headers: &[BitcoinHeader],
@@ -2041,7 +2068,8 @@ mod tests {
         let run = easy_chain(&genesis, 3, 1);
         let out = chain.connect_headers_clockless(&run)?;
         assert_eq!(out.connected, 3);
-        // The clock is the new tip's time, recorded as the mark.
+        // Three headers are fewer than the median window, so the chain time
+        // falls back to the new tip's own time, recorded as the mark.
         assert_eq!(chain.state()?.now_hwm, Some(anchor_time + 3));
 
         // C7 is skipped without an explicit clock, so a future header is not
@@ -2050,6 +2078,32 @@ mod tests {
         let ahead = mine_at(tip.block_hash(), (anchor_time + 10_000) as u32, EASY_BITS);
         let out = chain.connect_headers_clockless(&[ahead])?;
         assert_eq!(out.connected, 1, "no future-time bound without a clock");
+        Ok(())
+    }
+
+    /// The chain clock is the median of the last 11 header times, not the tip's
+    /// own time: one miner's timestamp cannot move it.
+    #[test]
+    fn the_chain_clock_is_the_median_time_past() -> eyre::Result<()> {
+        let chain = seeded();
+        let genesis = canonical(&chain, 0);
+        let anchor_time = genesis.time as u64;
+
+        // Twelve headers fill the 11-header window that ends at the tip.
+        let run = easy_chain(&genesis, 12, 1);
+        chain.connect_headers_clockless(&run)?;
+        assert_eq!(chain.tip_height()?, Some(12));
+
+        // Times are one second apart, so the median of heights 2..=12 is the
+        // time at height 7; the tip is five seconds later.
+        assert_eq!(chain.state()?.now_hwm, Some(anchor_time + 7));
+
+        // A tip two hours ahead moves the median by one block: the window
+        // slides, and the outlier is one value of eleven.
+        let tip = canonical(&chain, 12);
+        let ahead = mine_at(tip.block_hash(), tip.time + 2 * 60 * 60, EASY_BITS);
+        chain.connect_headers_clockless(&[ahead])?;
+        assert_eq!(chain.state()?.now_hwm, Some(anchor_time + 8));
         Ok(())
     }
 

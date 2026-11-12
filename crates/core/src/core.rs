@@ -307,7 +307,7 @@ pub enum Action<'a> {
         headers: &'a [BitcoinHeader],
         /// The caller's clock, when it has one. `None` skips the future-time
         /// check and runs the requirement on the stored high-water mark and
-        /// the best tip's header time.
+        /// the chain time at the best tip.
         now: Option<u64>,
     },
     /// Store a canonical coinbase and its inclusion proof.

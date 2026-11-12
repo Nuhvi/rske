@@ -67,7 +67,9 @@ period-boundary retarget through `Core`, which the machine does not reach.
 
 Not yet checked by any machine:
 
-- the clock floor and clockless connects (R10), which only unit tests cover;
+- the clock floor and clockless connects (R10), including the
+  median-time-past chain clock and its sparse-window fallback, which only unit
+  tests cover;
 - a heavier fork that crosses the mark (the mark-crossing half of R6, and the
   election path it exercises);
 - median-time-past with fewer than 11 stored headers, and at a height where an

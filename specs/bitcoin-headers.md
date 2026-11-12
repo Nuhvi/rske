@@ -37,10 +37,11 @@ One action supplies:
 - **`now`.** The caller's clock, or none. C7 uses it when supplied and is
   skipped when it is not. Network-partition safety uses the clock floor (R10):
   the greatest of the supplied value, the stored high-water mark (S5) and the
-  best tip's header time, so a missing clock measures finality from the chain's
-  own time and a stale one cannot reduce the requirement. Within a batch, the
-  finality mark moves only if that batch stores a new header; a later `now`
-  alone never advances it.
+  chain time at the best tip — the median of its last 11 header times, or the
+  tip's own time when those are not all stored — so a missing clock measures
+  finality from the chain's own time and a stale one cannot reduce the
+  requirement. Within a batch, the finality mark moves only if that batch
+  stores a new header; a later `now` alone never advances it.
 
 The machine is configured, once, with:
 
@@ -195,8 +196,12 @@ finality mark. At or below the mark the action fails with
 `ForkBelowFinalized` and changes nothing. Above the mark, R3 and R6 apply.
 
 **R10 — clock floor.** The requirement's clock is the greatest of three values:
-the supplied `now`, if any; the stored high-water mark; and the header time at
-the best tip. C7 is not affected: it runs on the supplied value alone. Every
-batch that stores a new header raises the high-water mark to the requirement's
-clock when that is greater, whether or not the finality mark moves. A batch
-that stores no new header leaves it unchanged, so a poll cannot raise the floor.
+the supplied `now`, if any; the stored high-water mark; and the chain time at
+the best tip. The chain time is the median of the last 11 header times,
+including the tip (Bitcoin Core's `GetMedianTimePast`), so one miner's
+timestamp cannot move it. It falls back to the tip's own header time when the
+11-header window is not stored: a sparse seed, or a chain shorter than the
+window. C7 is not affected: it runs on the supplied value alone. Every batch
+that stores a new header raises the high-water mark to the requirement's clock
+when that is greater, whether or not the finality mark moves. A batch that
+stores no new header leaves it unchanged, so a poll cannot raise the floor.
