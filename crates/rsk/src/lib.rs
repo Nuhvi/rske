@@ -23,7 +23,7 @@ mod peers;
 mod sync;
 
 pub use coinbase::{CoinbaseReport, TagScan};
-pub use config::{Anchor, Config, DEFAULT_DATA_DIR, USER_AGENT};
+pub use config::{Config, DEFAULT_DATA_DIR, USER_AGENT};
 pub use ibd::IbdReport;
 pub use node::Node;
 pub use rootstock::Chain;

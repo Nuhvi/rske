@@ -485,6 +485,12 @@ impl super::Store {
 impl ReadTxn {
     btc_read_methods!();
 
+    /// The trusted checkpoint header stored at `height`, if any.
+    pub(crate) fn checkpoint_at(&self, height: u64) -> Result<Option<BitcoinHeader>, Error> {
+        let table = self.txn.open_table(BTC_CHECKPOINTS)?;
+        Ok(table.get(height)?.map(|v| v.value().0))
+    }
+
     /// Every fork's metadata, by id, for the whole-state view.
     pub(crate) fn all_forks(&self) -> Result<Vec<(u64, ForkMeta)>, Error> {
         let forks = self.txn.open_table(BTC_FORKS)?;
@@ -526,14 +532,12 @@ impl WriteTxn {
             .and_then(|v| v.value().as_text().and_then(|t| t.parse().ok())))
     }
 
-    /// Plant the trust anchor: one header per difficulty period (the
-    /// checkpoint spine from this crate's embedded `checkpoints.txt`), taken on faith
+    /// Plant the trust anchor: one header per difficulty period, taken on faith
     /// without validating ancestors, and create the root chain on top of it.
     ///
-    /// This is a one-time operation: it is refused ([`Error::AlreadySeeded`])
-    /// if the store already carries a chain, so it can never clobber a taller
-    /// tip or a more advanced finality floor. Resume by connecting the headers
-    /// above the existing tip.
+    /// Called by [`Core::ensure_anchor`](crate::Core) on a store with no chain.
+    /// It is refused if the store already carries one, so it can never clobber
+    /// a taller tip or a more advanced finality floor.
     ///
     /// Because difficulty is constant within a period, each checkpoint header
     /// pins the work of its whole 2016-block period, so cumulative work is
@@ -541,7 +545,7 @@ impl WriteTxn {
     /// one period apart (contiguous, ascending), starting at a period boundary.
     pub(crate) fn seed_checkpoints(&self, entries: &[(u64, BitcoinHeader)]) -> Result<(), Error> {
         if self.fork_meta(0)?.is_some() {
-            return Err(Error::AlreadySeeded);
+            return Err(Error::Internal("store is already seeded".into()));
         }
         if entries.is_empty() {
             return Err(Error::Internal("no checkpoints to seed".into()));

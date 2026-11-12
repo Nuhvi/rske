@@ -600,10 +600,12 @@ mod tests {
     /// A regtest chain with a usable Bitcoin tail: the spine at 0 and 2016, then
     /// easy headers up to 4032, so `btc_tail_work(2016) = work[2016..4032)`.
     fn btc_with_tail() -> Core {
-        let core = Core::in_memory(Network::Regtest).unwrap();
         let g0 = mine(BlockHash::all_zeros(), 1_600_000_000);
         let g2016 = mine(g0.block_hash(), 1_600_000_001);
-        core.seed_checkpoints(&[(0, g0), (2016, g2016)]).unwrap();
+        let core = Core::new(
+            crate::Config::in_memory(Network::Regtest).with_anchor(&[(0, g0), (2016, g2016)]),
+        )
+        .unwrap();
 
         let mut cur = g2016;
         let mut run = Vec::new();

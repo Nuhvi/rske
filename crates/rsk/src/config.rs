@@ -1,5 +1,6 @@
-//! How the node is configured: where its store lives, which network it speaks,
-//! how to find peers, and how to anchor an empty store.
+//! How the node is configured: where its store lives, which network it speaks
+//! and how to find peers. The trust anchor is not a node option: `rsk-core`
+//! selects it from the network.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -13,18 +14,6 @@ pub const DEFAULT_DATA_DIR: &str = "data/rske";
 
 /// The BIP 14 user agent the node advertises on the wire.
 pub const USER_AGENT: &str = "/rske:0.1.0/";
-
-/// How an empty store is anchored before the first sync, and the ceiling for
-/// adopting a newer shipped checkpoint when resuming an existing store.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Anchor {
-    /// Trust the embedded checkpoint spine (one header per difficulty period),
-    /// minus the last `cut` periods, and sync the tail above the newest trusted
-    /// checkpoint. `cut = 0` trusts the whole spine.
-    Spine { cut: u64 },
-    /// Trust only genesis and validate the whole chain from block 1.
-    Genesis,
-}
 
 /// Everything the node needs to run.
 #[derive(Debug, Clone)]
@@ -43,8 +32,6 @@ pub struct Config {
     pub addrs: Vec<SocketAddr>,
     /// DNS seed hosts (defaults to the mainnet seeds when empty).
     pub seeds: Vec<String>,
-    /// How to anchor an empty store.
-    pub anchor: Anchor,
     /// The merge-mining share the fraud proof assumes will tag honestly.
     pub honest_share: f64,
     /// Rootstock peers to ask for headers in IBD (`host:port`). Empty uses the
@@ -64,7 +51,6 @@ impl Default for Config {
             limit: 8,
             addrs: Vec::new(),
             seeds: Vec::new(),
-            anchor: Anchor::Spine { cut: 0 },
             honest_share: 0.10,
             rsk_peers: Vec::new(),
             ibd_max_blocks: 4_000,

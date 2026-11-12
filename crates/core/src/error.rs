@@ -24,11 +24,17 @@ pub enum Error {
     #[error("commit error: {0}")]
     Commit(#[from] redb::CommitError),
 
-    #[error("no chain seeded: call Core::seed_checkpoints first")]
+    #[error("no chain seeded: the store has no anchor and the configuration supplied none")]
     Unseeded,
 
-    #[error("chain already seeded: checkpoints are planted once; resume by connecting headers")]
-    AlreadySeeded,
+    #[error(
+        "stored checkpoint at height {height} is {stored}; the configuration supplies {configured}"
+    )]
+    AnchorMismatch {
+        height: u64,
+        stored: BlockHash,
+        configured: BlockHash,
+    },
 
     #[error("malformed checkpoint line {line}: {detail}")]
     CheckpointFormat { line: usize, detail: String },

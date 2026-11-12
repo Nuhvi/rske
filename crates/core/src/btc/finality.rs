@@ -130,7 +130,7 @@ pub fn is_checkpoint(height: u64) -> bool {
 /// anchor — the bottom of the price law — floored by the coinbase-maturity
 /// window. A genesis anchor fails closed (`U256::MAX`): the price law is
 /// undefined at the network's birth, so a genesis-only seed cannot price modern
-/// work. Ship a checkpoint; `--from-genesis` is a development path without the
+/// work. A store seeded only from genesis is a development path without the
 /// guarantee.
 ///
 /// Every other network permits minimum-difficulty blocks, so elapsed time is not

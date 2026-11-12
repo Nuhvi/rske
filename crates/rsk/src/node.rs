@@ -4,12 +4,12 @@
 use std::collections::VecDeque;
 
 use anyhow::{Context, Result, bail};
-use bitcoin::blockdata::constants::genesis_block;
+use bitcoin::Network;
 use bitcoin::consensus::Encodable;
 use rsk_core::Core;
 use tracing::{info, warn};
 
-use crate::config::{Anchor, Config};
+use crate::config::Config;
 use crate::peers;
 use crate::peers::PeerCache;
 use crate::sync::{self, SyncReport};
@@ -27,6 +27,10 @@ pub struct Node {
 
 impl Node {
     /// Open (creating the data directory and store if needed) the node.
+    ///
+    /// The core anchors the store before the handle exists: the embedded
+    /// checkpoint spine on mainnet, genesis on every other network. An
+    /// existing store whose checkpoints or network disagree is refused there.
     pub fn open(config: Config) -> Result<Self> {
         std::fs::create_dir_all(&config.data_dir)
             .with_context(|| format!("creating data dir {}", config.data_dir.display()))?;
@@ -35,10 +39,23 @@ impl Node {
         let data_dir = std::fs::canonicalize(&config.data_dir)
             .with_context(|| format!("resolving data dir {}", config.data_dir.display()))?;
         let store_path = data_dir.join("chain.redb");
+        let fresh = !store_path.exists();
         info!("data directory: {}", data_dir.display());
         info!("chain store:    {}", store_path.display());
 
         let core = Core::open(&store_path, config.network)?;
+        if fresh {
+            let tip = core.tip_height()?.context("the store was just anchored")?;
+            if config.network == Network::Bitcoin {
+                info!(
+                    "anchor: embedded checkpoint spine trusted up to height {tip}; syncing the tail above it"
+                );
+            } else {
+                info!("anchor: genesis; validating the whole chain from block 1");
+            }
+        } else if let Some(tip) = core.tip_height()? {
+            info!("resume: store already anchored at tip {tip}; continuing above it");
+        }
         let peer_cache = PeerCache::load(&data_dir);
         Ok(Self {
             core,
@@ -57,13 +74,13 @@ impl Node {
         &self.config
     }
 
-    /// Plant the trust anchor if the store is empty, sync the Bitcoin tail,
-    /// then run the pipelined IBD pass: connect an RSK peer, scan coinbases
-    /// backwards, fetch and score the headers each tag names as it arrives, and
-    /// stop at the first final root. Header sync overlaps validation across the
-    /// configured peers.
+    /// Adopt the newest embedded checkpoint the store holds, sync the Bitcoin
+    /// tail, then run the pipelined IBD pass: connect an RSK peer, scan
+    /// coinbases backwards, fetch and score the headers each tag names as it
+    /// arrives, and stop at the first final root. Header sync overlaps
+    /// validation across the configured peers.
     pub fn sync(&self) -> Result<SyncReport> {
-        let from = plant_anchor(&self.core, &self.config)?;
+        let from = resume_from(&self.core)?;
         info!("syncing from height {from} …");
 
         let mut addrs = self.peer_cache.btc();
@@ -150,122 +167,68 @@ impl Node {
     }
 }
 
-/// The checkpoints this invocation trusts: genesis alone, or the embedded
-/// spine minus the last `cut` periods. Shared by seeding and by re-anchoring a
-/// store that was seeded by an older, shorter spine.
-fn trusted_prefix(config: &Config) -> Result<Vec<(u64, bitcoin::block::Header)>> {
-    match config.anchor {
-        Anchor::Genesis => Ok(vec![(0, genesis_block(config.network).header)]),
-        Anchor::Spine { cut } => {
-            let spine = rsk_core::btc::checkpoints::parse()?;
-            let cut = cut as usize;
-            anyhow::ensure!(
-                cut < spine.len(),
-                "--cut {cut} is past the end of the {}-period spine",
-                spine.len()
-            );
-            Ok(spine[..spine.len() - cut].to_vec())
-        }
+/// Adopt the newest embedded checkpoint the store can prove it holds, and
+/// return the first height to download. A store anchored by an older, shorter
+/// spine benefits from a newer one instead of staying stuck on its old mark.
+fn resume_from(core: &Core) -> Result<u64> {
+    let tip = core.tip_height()?.context("the store is not anchored")?;
+    if let Some((from, to)) = core.reanchor_shipped()? {
+        info!(
+            "finality: adopted shipped checkpoint #{to} (was #{from}); \
+             the next bar is measured from it"
+        );
     }
-}
-
-/// Plant the trust anchor once and return the first height to download. On a
-/// store that is already anchored this is just the height above the tip — after
-/// adopting the newest shipped checkpoint the store can prove it holds, so a
-/// store seeded by an older binary benefits from a newer spine instead of
-/// staying stuck on its old mark.
-fn plant_anchor(core: &Core, config: &Config) -> Result<u64> {
-    let trusted = trusted_prefix(config)?;
-
-    if let Some(tip) = core.tip_height()? {
-        if let Some((from, to)) = core.reanchor_shipped(&trusted)? {
-            info!(
-                "finality: adopted shipped checkpoint #{to} (was #{from}); \
-                 the next bar is measured from it"
-            );
-        }
-        info!("resume: store already anchored at tip {tip}; continuing above it");
-        return Ok(tip + 1);
-    }
-
-    core.seed_checkpoints(&trusted)?;
-    let seed_height = trusted.last().context("non-empty spine")?.0;
-    match config.anchor {
-        Anchor::Genesis => {
-            info!("anchor: genesis only — validating the whole chain from block 1");
-        }
-        Anchor::Spine { cut: 0 } => {
-            info!(
-                "anchor: {} embedded checkpoints trusted (heights 0..={seed_height}); syncing the tail above them",
-                trusted.len()
-            );
-        }
-        Anchor::Spine { cut } => {
-            info!(
-                "anchor: {} checkpoints trusted up to {seed_height}; validating {cut} period(s) of real headers above",
-                trusted.len()
-            );
-        }
-    }
-    Ok(seed_height + 1)
+    Ok(tip + 1)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::Network;
 
-    /// A fresh temp store for one test. The temp dir must outlive the store.
-    fn store() -> (tempfile::TempDir, Core) {
+    #[test]
+    fn opening_a_fresh_mainnet_store_trusts_the_whole_spine() {
         let dir = tempfile::tempdir().unwrap();
-        let core = Core::open(&dir.path().join("chain.redb"), Network::Bitcoin).unwrap();
-        (dir, core)
-    }
-
-    #[test]
-    fn anchor_trusts_the_whole_spine_by_default() {
-        let (_dir, core) = store();
-        let spine = rsk_core::btc::checkpoints::parse().unwrap();
-        let from = plant_anchor(&core, &Config::default()).unwrap();
-        assert_eq!(from, spine.last().unwrap().0 + 1);
-    }
-
-    #[test]
-    fn anchor_cut_trusts_fewer_checkpoints() {
-        let (_dir, core) = store();
-        let spine = rsk_core::btc::checkpoints::parse().unwrap();
-        let config = Config {
-            anchor: Anchor::Spine { cut: 2 },
+        let node = Node::open(Config {
+            data_dir: dir.path().to_path_buf(),
             ..Config::default()
-        };
-        // Trust everything but the last two periods.
+        })
+        .unwrap();
+        let spine = rsk_core::btc::checkpoints::parse().unwrap();
         assert_eq!(
-            plant_anchor(&core, &config).unwrap(),
-            spine[spine.len() - 3].0 + 1
+            node.core().tip_height().unwrap(),
+            Some(spine.last().unwrap().0)
+        );
+        assert_eq!(
+            resume_from(node.core()).unwrap(),
+            spine.last().unwrap().0 + 1
         );
     }
 
     #[test]
-    fn anchor_resumes_above_an_anchored_tip() {
-        let (_dir, core) = store();
-        let spine = rsk_core::btc::checkpoints::parse().unwrap();
-        core.seed_checkpoints(&spine[..3]).unwrap();
-        // Already anchored: resume above the tip, ignoring the anchor setting.
-        let config = Config {
-            anchor: Anchor::Genesis,
+    fn opening_a_fresh_non_mainnet_store_starts_from_genesis() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            data_dir: dir.path().to_path_buf(),
+            network: Network::Regtest,
             ..Config::default()
-        };
-        assert_eq!(plant_anchor(&core, &config).unwrap(), spine[2].0 + 1);
+        })
+        .unwrap();
+        assert_eq!(node.core().tip_height().unwrap(), Some(0));
+        assert_eq!(resume_from(node.core()).unwrap(), 1);
     }
 
     #[test]
-    fn anchor_from_genesis_starts_at_one() {
-        let (_dir, core) = store();
+    fn reopening_an_anchored_store_resumes_above_its_tip() {
+        let dir = tempfile::tempdir().unwrap();
         let config = Config {
-            anchor: Anchor::Genesis,
+            data_dir: dir.path().to_path_buf(),
             ..Config::default()
         };
-        assert_eq!(plant_anchor(&core, &config).unwrap(), 1);
-        assert_eq!(core.tip_height().unwrap(), Some(0));
+        let tip = {
+            let node = Node::open(config.clone()).unwrap();
+            node.core().tip_height().unwrap().unwrap()
+        };
+        let node = Node::open(config).unwrap();
+        assert_eq!(resume_from(node.core()).unwrap(), tip + 1);
     }
 }

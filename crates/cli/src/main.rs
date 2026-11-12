@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use rsk::{Anchor, Config, DEFAULT_DATA_DIR, Node};
+use rsk::{Config, DEFAULT_DATA_DIR, Node};
 use tracing::info;
 
 #[derive(Parser)]
@@ -56,16 +56,6 @@ struct SyncArgs {
     #[arg(long, value_name = "DIR", default_value = DEFAULT_DATA_DIR)]
     data_dir: PathBuf,
 
-    /// Trust only the first (spine length − N) checkpoints, validating N
-    /// periods of real headers above the spine
-    #[arg(long, value_name = "N", default_value_t = 0)]
-    cut: u64,
-
-    /// Ignore the embedded checkpoint spine and validate the whole chain from
-    /// block 1
-    #[arg(long)]
-    from_genesis: bool,
-
     /// Number of peers to keep connected
     #[arg(long, value_name = "N", default_value_t = 3)]
     peers: usize,
@@ -90,14 +80,8 @@ struct SyncArgs {
 
 impl SyncArgs {
     fn run(self) -> Result<()> {
-        let anchor = if self.from_genesis {
-            Anchor::Genesis
-        } else {
-            Anchor::Spine { cut: self.cut }
-        };
         let config = Config {
             data_dir: self.data_dir,
-            anchor,
             rsk_peers: self.rsk_peer,
             peers: self.peers,
             limit: self.limit,
@@ -123,6 +107,10 @@ struct ExportArgs {
 
 impl ExportArgs {
     fn run(self) -> Result<()> {
+        // Never create a store for a read: an export from an empty directory
+        // would otherwise seed one and export nothing.
+        let store = self.data_dir.join("chain.redb");
+        anyhow::ensure!(store.exists(), "no store at {}", store.display());
         let config = Config {
             data_dir: self.data_dir,
             ..Config::default()

@@ -28,20 +28,7 @@ Out of scope:
 - coinbase storage, tagging and pruning,
 - Rootstock checkpoint policy.
 
-## 1. Inputs
-
-One action supplies:
-
-- **Headers.** A contiguous run. The run may repeat a leading prefix of stored
-  headers.
-- **`now`.** The caller's clock, or none. C7 uses it when supplied and is
-  skipped when it is not. Network-partition safety uses the clock floor (R10):
-  the greatest of the supplied value, the stored high-water mark (S5) and the
-  chain time at the best tip — the median of its last 11 header times, or the
-  tip's own time when those are not all stored — so a missing clock measures
-  finality from the chain's own time and a stale one cannot reduce the
-  requirement. Within a batch, the finality mark moves only if that batch
-  stores a new header; a later `now` alone never advances it.
+## 1. Configuration
 
 The machine is configured, once, with:
 
@@ -61,9 +48,15 @@ safety disabled, every network uses the tip-work rule.
 The machine also starts from a trust anchor:
 
 - **Seed.** One or more trusted headers at difficulty-period boundaries. The seed
-  may be sparse, and its first height may be above 0. Seeding creates fork `0`
-  and sets the first finality mark (S2, S4). The canonical chain starts at the
-  first seed header.
+  may be sparse, and its first height may be above 0. The crate fixes the seed:
+  the embedded spine on mainnet, genesis on every other network. A test may
+  replace it; production code cannot. Seeding creates fork `0` and sets the
+  first finality mark (S2, S4). The canonical chain starts at the first seed
+  header.
+- **Seed agreement.** A store that already holds a checkpoint at a configured
+  height must hold the same header. Opening a store against a seed that
+  disagrees fails with `AnchorMismatch`. Opening never extends an existing
+  store, so a configured checkpoint the store does not hold is not planted.
 
 ## 2. State
 
@@ -86,11 +79,20 @@ The state machine tracks:
 
 ## 3. Action
 
-**A1 — connect a batch.** One action delivers a run of headers that the caller
-claims are contiguous, with the caller's clock when it has one. The batch may extend a fork,
-start a new fork or repeat a leading run of stored headers.
+**A1 — connect a batch.** One action delivers:
 
-A leading stored prefix is skipped. The next header must name the last prefix
+- **Headers.** A run that the caller claims is contiguous.
+- **`now`.** The caller's clock, or none. C7 uses it when supplied and is
+  skipped when it is not. Network-partition safety uses the clock floor (R10):
+  the greatest of the supplied value, the stored high-water mark (S5) and the
+  chain time at the best tip — the median of its last 11 header times, or the
+  tip's own time when those are not all stored — so a missing clock measures
+  finality from the chain's own time and a stale one cannot reduce the
+  requirement. Within a batch, the finality mark moves only if that batch
+  stores a new header; a later `now` alone never advances it.
+
+The batch may extend a fork, start a new fork or repeat a leading run of stored
+headers. A repeated prefix is skipped; the next header must name the last prefix
 header as its parent. A repeat after a new header is not a no-op; it is a link
 error.
 

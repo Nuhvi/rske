@@ -618,15 +618,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let core = Core::open(&dir.path().join("chain.redb"), Network::Regtest).unwrap();
 
-        let genesis = BitcoinHeader {
-            version: BlockVersion::ONE,
-            prev_blockhash: bitcoin::block::BlockHash::all_zeros(),
-            merkle_root: bitcoin::TxMerkleNode::all_zeros(),
-            time: 1_600_000_000,
-            bits: CompactTarget::from_consensus(0x207f_ffff),
-            nonce: 0,
-        };
-        core.seed_checkpoints(&[(0, genesis)]).unwrap();
+        // A non-mainnet store starts from the network genesis.
+        let genesis = core.header_at(0).unwrap().expect("regtest genesis");
 
         let coinbase = coinbase_with_tag(7);
         let mut header = BitcoinHeader {

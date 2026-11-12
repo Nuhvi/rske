@@ -19,7 +19,7 @@ use proptest::prelude::*;
 use proptest_state_machine::{ReferenceStateMachine, StateMachineTest, prop_state_machine};
 use rsk_consensus::types::header::Header as RskHeader;
 
-use crate::{Action, Core, EphemeralChainCheckpoint, Outcome, RskEntry};
+use crate::{Action, Config, Core, EphemeralChainCheckpoint, Outcome, RskEntry};
 
 const EASY_BITS: u32 = 0x207f_ffff;
 const BASE_TIME: u32 = 1_600_000_000;
@@ -50,11 +50,11 @@ const TAIL_START: u64 = 2016;
 /// A regtest chain with a finalized tail `[2016, 3932]`: spine at 0 and 2016,
 /// then easy headers up to 4032.
 fn btc_with_tail() -> Core {
-    let core = Core::in_memory(Network::Regtest).expect("in-memory store");
     let g0 = mine(BlockHash::all_zeros(), BASE_TIME, 0);
     let g2016 = mine(g0.block_hash(), BASE_TIME + 1, 1);
-    core.seed_checkpoints(&[(0, g0), (2016, g2016)])
-        .expect("seed");
+    let core =
+        Core::new(Config::in_memory(Network::Regtest).with_anchor(&[(0, g0), (2016, g2016)]))
+            .expect("in-memory store");
 
     let mut cur = g2016;
     let mut run = Vec::new();

@@ -170,10 +170,12 @@ mod tests {
 
     #[test]
     fn anchor_resolves_to_the_bitcoin_parent_height() {
-        let chain = Core::in_memory(Network::Regtest).unwrap();
         let h0 = mine(BlockHash::all_zeros(), 0);
         let h2016 = mine(h0.block_hash(), 1);
-        chain.seed_checkpoints(&[(0, h0), (2016, h2016)]).unwrap();
+        let chain = Core::new(
+            crate::Config::in_memory(Network::Regtest).with_anchor(&[(0, h0), (2016, h2016)]),
+        )
+        .unwrap();
 
         // Anchored on the 2016 checkpoint.
         let header = rsk(h2016.block_hash(), 5_000_000, 10);

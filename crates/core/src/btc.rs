@@ -214,17 +214,47 @@ pub struct ConnectOutcome {
 }
 
 impl Core {
-    /// Plant the trust anchor: the Bitcoin spine, one header per
-    /// difficulty-period boundary, accepted without validating its ancestors.
-    /// This makes the whole chain's work computable and creates the root chain.
-    /// The network is recorded in the same transaction so a later connect with
-    /// different parameters is refused.
-    pub(crate) fn seed_checkpoints_impl(
-        &self,
-        entries: &[(u64, BitcoinHeader)],
-    ) -> Result<(), Error> {
+    /// Apply the configured trust anchor to the store: seed a fresh store, or
+    /// refuse a stored checkpoint that the configuration disagrees with.
+    ///
+    /// The anchor is a crate decision, so a store always reopens against the
+    /// same chain identity. Seeding never extends an existing store: a
+    /// configured checkpoint the store does not hold is left unplanted.
+    pub(crate) fn ensure_anchor(&self) -> Result<(), Error> {
+        {
+            let txn = self.store.read()?;
+            // The network is recorded at seed time. Refuse a different one
+            // before any header is validated against the wrong parameters.
+            if let Some(seeded) = txn.network()?
+                && seeded != self.config.params.network
+            {
+                return Err(Error::NetworkMismatch {
+                    seeded,
+                    opened: self.config.params.network,
+                });
+            }
+            if txn.fork_meta(0)?.is_some() {
+                for (height, header) in &self.config.resolve_anchor()? {
+                    if let Some(stored) = txn.checkpoint_at(*height)?
+                        && stored.block_hash() != header.block_hash()
+                    {
+                        return Err(Error::AnchorMismatch {
+                            height: *height,
+                            stored: stored.block_hash(),
+                            configured: header.block_hash(),
+                        });
+                    }
+                }
+                return Ok(());
+            }
+        }
+
+        let anchor = self.config.resolve_anchor()?;
+        if anchor.is_empty() {
+            return Ok(());
+        }
         let txn = self.store.write()?;
-        txn.seed_checkpoints(entries)?;
+        txn.seed_checkpoints(&anchor)?;
         txn.set_network(self.config.params.network)?;
         txn.commit()
     }
@@ -297,25 +327,23 @@ impl Core {
     /// store already holds, if that is newer than the current mark. Returns
     /// `(from, to)` when the mark moved.
     ///
-    /// The compiled-in spine is the binary's subjective trust anchor. A store
+    /// The configured anchor is the binary's subjective trust anchor. A store
     /// seeded from an older or shorter spine would otherwise never benefit from
     /// a newer one: the mark is the anchor, and seeding happens only once. This
     /// is the "upgrade — trust a newer checkpoint shipped in the new binary"
     /// path, applied to a store that already exists.
     ///
     /// Forward-only, and only to a header the store can prove it holds: the
-    /// exact hash at that height on the spine's own chain. That is the same
+    /// exact hash at that height on the anchor's own chain. That is the same
     /// trust the seed takes, no more.
-    pub(crate) fn reanchor_shipped_impl(
-        &self,
-        trusted: &[(u64, BitcoinHeader)],
-    ) -> Result<Option<(u64, u64)>, Error> {
+    pub(crate) fn reanchor_shipped_impl(&self) -> Result<Option<(u64, u64)>, Error> {
         let txn = self.store.write()?;
         let Some(current) = txn.finalized_height()? else {
             // Unseeded: seeding decides the first mark.
             return Ok(None);
         };
 
+        let trusted = self.config.resolve_anchor()?;
         let mut adopted = None;
         for (height, header) in trusted.iter().rev() {
             if *height <= current {
@@ -1245,22 +1273,10 @@ pub fn header_work(header: &BitcoinHeader) -> Work {
 /// The public mutators: thin wrappers over [`Core::apply`], so the node and the
 /// tests go through the same state machine.
 impl Core {
-    /// Plant the trust anchor: the Bitcoin spine, one header per
-    /// difficulty-period boundary, accepted without validating its ancestors.
-    pub fn seed_checkpoints(&self, entries: &[(u64, BitcoinHeader)]) -> Result<(), Error> {
-        expect(
-            self.apply(crate::Action::SeedCheckpoints { entries })?,
-            |outcome| matches!(outcome, crate::Outcome::Seeded),
-        )
-    }
-
-    /// Move the finality mark forward to the newest shipped checkpoint the
+    /// Move the finality mark forward to the newest configured checkpoint the
     /// store already holds, if that is newer than the current mark.
-    pub fn reanchor_shipped(
-        &self,
-        trusted: &[(u64, BitcoinHeader)],
-    ) -> Result<Option<(u64, u64)>, Error> {
-        match self.apply(crate::Action::ReanchorShipped { trusted })? {
+    pub fn reanchor_shipped(&self) -> Result<Option<(u64, u64)>, Error> {
+        match self.apply(crate::Action::ReanchorShipped)? {
             crate::Outcome::Reanchored(adopted) => Ok(adopted),
             other => Err(unexpected("reanchor_shipped", other)),
         }
@@ -1490,6 +1506,11 @@ mod tests {
         mine_chain_from(parent, n, EASY_BITS, tag_offset)
     }
 
+    /// A fresh in-memory chain anchored on `entries`, with the network defaults.
+    fn anchored(network: Network, entries: &[(u64, BitcoinHeader)]) -> Core {
+        Core::new(crate::Config::in_memory(network).with_anchor(entries)).expect("in-memory store")
+    }
+
     /// A fresh in-memory regtest chain seeded with a synthetic checkpoint at 0.
     ///
     /// Regtest permits minimum-difficulty blocks, so (like Electrum) the
@@ -1497,10 +1518,7 @@ mod tests {
     /// machinery and the median-time-past rule. The difficulty rule itself is
     /// tested in [`crate::btc::validation`] and against real mainnet data.
     fn seeded() -> Core {
-        let chain = Core::in_memory(Network::Regtest).expect("in-memory store");
-        let genesis = mine_genesis(0);
-        chain.seed_checkpoints(&[(0, genesis)]).expect("seed");
-        chain
+        anchored(Network::Regtest, &[(0, mine_genesis(0))])
     }
 
     /// The header at `height` on the canonical chain.
@@ -1543,18 +1561,25 @@ mod tests {
     }
 
     #[test]
-    fn seeding_twice_is_refused_and_leaves_the_chain_intact() -> eyre::Result<()> {
+    fn a_conflicting_anchor_is_refused_and_leaves_the_chain_intact() -> eyre::Result<()> {
         let chain = seeded();
         let run = easy_chain(&canonical(&chain, 0), 5, 1);
         chain.connect_headers(&run, NOW)?;
         let tip = chain.tip_height()?;
         let work = chain.chainwork()?;
 
-        // Re-seeding an anchored store is refused rather than clobbering the
-        // taller tip and the finality floor.
-        let other = mine_genesis(42);
-        let err = chain.seed_checkpoints(&[(0, other)]).unwrap_err();
-        assert!(matches!(err, Error::AlreadySeeded), "got {err:?}");
+        // The same store opened against a different genesis: `Core::new` runs
+        // this exact check, and the store wins.
+        let Core { store, config } = chain;
+        let chain = Core {
+            store,
+            config: config.with_anchor(&[(0, mine_genesis(42))]),
+        };
+        let err = chain.ensure_anchor().unwrap_err();
+        assert!(
+            matches!(err, Error::AnchorMismatch { height: 0, .. }),
+            "got {err:?}"
+        );
 
         assert_eq!(chain.tip_height()?, tip);
         assert_eq!(chain.chainwork()?, work);
@@ -1864,13 +1889,10 @@ mod tests {
         // 2016 blocks in the intervening period were stored:
         //   work_at(0)     = w                    (just the boundary block)
         //   work_at(2016)  = w + 2015*w + w = 2017*w
-        let chain = Core::in_memory(Network::Regtest).unwrap();
         let g0 = mine_genesis(0);
         let g2016 = mine_genesis(1);
         let w = header_work(&g0);
-        chain
-            .seed_checkpoints(&[(0, g0), (DIFFICULTY_PERIOD, g2016)])
-            .unwrap();
+        let chain = anchored(Network::Regtest, &[(0, g0), (DIFFICULTY_PERIOD, g2016)]);
 
         assert_eq!(chain.store.read()?.work_at(0, 0).unwrap(), Some(w));
         let expected = {
@@ -1894,8 +1916,7 @@ mod tests {
         genesis
             .validate_pow(genesis.target())
             .expect("real genesis PoW");
-        let chain = Core::in_memory(Network::Regtest).unwrap();
-        chain.seed_checkpoints(&[(0, genesis)]).unwrap();
+        let chain = anchored(Network::Regtest, &[(0, genesis)]);
         assert_eq!(
             chain.header_at(0)?.unwrap().block_hash(),
             genesis.block_hash()
@@ -1946,14 +1967,13 @@ mod tests {
         let mut params = bitcoin::consensus::Params::new(Network::Bitcoin);
         params.max_attainable_target =
             bitcoin::pow::Target::from_compact(CompactTarget::from_consensus(EASY_BITS));
+        let genesis = mine_genesis(0);
         let chain = Core::new(
             crate::Config::in_memory(Network::Bitcoin)
                 .with_params(params)
-                .without_partition_safety(),
+                .without_partition_safety()
+                .with_anchor(&[(0, genesis)]),
         )?;
-
-        let genesis = mine_genesis(0);
-        chain.seed_checkpoints(&[(0, genesis)])?;
         let run = easy_chain(&genesis, 110, 1);
         let out = chain.connect_headers(&run, NOW)?;
         assert_eq!(out.tip_height, 110);
@@ -2135,8 +2155,7 @@ mod tests {
     fn the_mainnet_requirement_is_used_by_the_store() -> eyre::Result<()> {
         let spine = crate::btc::checkpoints::parse()?;
         let (height, header) = *spine.last().expect("non-empty spine");
-        let chain = Core::in_memory(Network::Bitcoin)?;
-        chain.seed_checkpoints(&[(height, header)])?;
+        let chain = anchored(Network::Bitcoin, &[(height, header)]);
 
         let now = header.time as u64 + 31 * 86_400;
         let status = chain
@@ -2174,20 +2193,37 @@ mod tests {
                 canonical(&chain, 2 * DIFFICULTY_PERIOD),
             ),
         ];
+        let Core { store, config } = chain;
+        let chain = Core {
+            store,
+            config: config.with_anchor(&trusted),
+        };
+        chain.ensure_anchor()?;
         assert_eq!(
-            chain.reanchor_shipped(&trusted)?,
+            chain.reanchor_shipped()?,
             Some((mark, 2 * DIFFICULTY_PERIOD))
         );
         assert_eq!(chain.finalized_height()?, Some(2 * DIFFICULTY_PERIOD));
 
         // A newer spine than that, but a header the store does not hold: the
         // mark must not move on an unverifiable claim.
-        let beyond = vec![(4 * DIFFICULTY_PERIOD, mine_genesis(7))];
-        assert_eq!(chain.reanchor_shipped(&beyond)?, None);
+        let Core { store, config } = chain;
+        let chain = Core {
+            store,
+            config: config.with_anchor(&[(4 * DIFFICULTY_PERIOD, mine_genesis(7))]),
+        };
+        chain.ensure_anchor()?;
+        assert_eq!(chain.reanchor_shipped()?, None);
         assert_eq!(chain.finalized_height()?, Some(2 * DIFFICULTY_PERIOD));
 
         // Never backwards.
-        assert_eq!(chain.reanchor_shipped(&trusted)?, None);
+        let Core { store, config } = chain;
+        let chain = Core {
+            store,
+            config: config.with_anchor(&trusted),
+        };
+        chain.ensure_anchor()?;
+        assert_eq!(chain.reanchor_shipped()?, None);
         Ok(())
     }
 
@@ -2236,9 +2272,12 @@ mod tests {
         let mut params = bitcoin::consensus::Params::new(Network::Bitcoin);
         params.max_attainable_target =
             bitcoin::pow::Target::from_compact(CompactTarget::from_consensus(EASY_BITS));
-        let chain = Core::in_memory_with_params(params)?;
         let genesis = mine_genesis(0);
-        chain.seed_checkpoints(&[(0, genesis)])?;
+        let chain = Core::new(
+            crate::Config::in_memory(Network::Bitcoin)
+                .with_params(params)
+                .with_anchor(&[(0, genesis)]),
+        )?;
         let high = genesis.time as u64 + 4_000 * finality::TARGET_BLOCK_SECONDS;
 
         // A connect at the high clock stores the HWM (no finalization yet).
@@ -2260,10 +2299,9 @@ mod tests {
     /// measured from a stale fixed checkpoint.
     #[test]
     fn the_anchor_follows_the_mark() -> eyre::Result<()> {
-        let chain = Core::in_memory(Network::Regtest)?;
         let g0 = mine_genesis(0);
         let g2016 = mine_child(&g0, EASY_BITS, 1);
-        chain.seed_checkpoints(&[(0, g0), (DIFFICULTY_PERIOD, g2016)])?;
+        let chain = anchored(Network::Regtest, &[(0, g0), (DIFFICULTY_PERIOD, g2016)]);
 
         // A clock 4,000 blocks past the seeded tip's time, and a run of 4,100
         // blocks: the mark advances to the tip minus the depth, 2016 + 4,100 -
@@ -2320,10 +2358,12 @@ mod tests {
         let mut params = bitcoin::consensus::Params::new(Network::Regtest);
         params.allow_min_difficulty_blocks = false;
         params.no_pow_retargeting = false;
-        let chain = Core::in_memory_with_params(params.clone())?;
-
         let genesis = mine_genesis(0);
-        chain.seed_checkpoints(&[(0, genesis)])?;
+        let chain = Core::new(
+            crate::Config::in_memory(Network::Regtest)
+                .with_params(params.clone())
+                .with_anchor(&[(0, genesis)]),
+        )?;
 
         // 2,015 blocks at 150 s each: a quarter of the two-week timespan.
         let mut parent = genesis;
@@ -2381,21 +2421,20 @@ mod tests {
 
     #[test]
     fn connecting_with_the_wrong_network_is_refused() -> eyre::Result<()> {
-        let chain = Core::in_memory(Network::Regtest)?;
-        chain.seed_checkpoints(&[(0, mine_genesis(0))])?;
+        let chain = anchored(Network::Regtest, &[(0, mine_genesis(0))]);
         assert_eq!(chain.store.read()?.network()?, Some(Network::Regtest));
 
         // Re-open the same store believing it is mainnet: the recorded network
-        // wins over the caller's claim.
+        // wins over the caller's claim, at open and again at the first connect.
         let Core { store, config } = chain;
         let chain = Core {
             store,
-            config: crate::Config {
-                params: bitcoin::consensus::Params::new(Network::Bitcoin),
-                rsk_chain: crate::rsk::chain_config(Network::Bitcoin),
-                ..config
-            },
+            config: config.with_params(bitcoin::consensus::Params::new(Network::Bitcoin)),
         };
+        assert!(matches!(
+            chain.ensure_anchor(),
+            Err(Error::NetworkMismatch { .. })
+        ));
         let header = mine_child(&canonical(&chain, 0), EASY_BITS, 1);
         let err = chain.connect_headers(&[header], NOW).unwrap_err();
         assert!(
@@ -2417,7 +2456,7 @@ mod tests {
     /// there is nothing to compute.
     #[test]
     fn btc_tail_work_none_without_seed() -> eyre::Result<()> {
-        let chain = Core::in_memory(Network::Regtest)?;
+        let chain = Core::new(crate::Config::in_memory(Network::Regtest).with_anchor(&[]))?;
         assert_eq!(chain.finalized_height()?, None);
         assert_eq!(chain.btc_tail_work(0)?, None);
         Ok(())
@@ -2508,9 +2547,8 @@ mod tests {
 
     #[test]
     fn stores_and_reads_a_canonical_coinbase() -> eyre::Result<()> {
-        let chain = Core::in_memory(Network::Regtest)?;
         let (header, coinbase, proof) = coinbase_fixture(BlockHash::all_zeros(), BASE_TIME);
-        chain.seed_checkpoints(&[(0, header)])?;
+        let chain = anchored(Network::Regtest, &[(0, header)]);
         chain.store_coinbase(0, header.block_hash(), &coinbase, &proof)?;
 
         let got = chain.coinbase_at(0)?.expect("stored coinbase");
@@ -2524,10 +2562,9 @@ mod tests {
 
     #[test]
     fn rejects_a_proof_for_another_block() -> eyre::Result<()> {
-        let chain = Core::in_memory(Network::Regtest)?;
         let (header, coinbase, _) = coinbase_fixture(BlockHash::all_zeros(), BASE_TIME);
         let (other, _, other_proof) = coinbase_fixture(BlockHash::all_zeros(), BASE_TIME + 1);
-        chain.seed_checkpoints(&[(0, header)])?;
+        let chain = anchored(Network::Regtest, &[(0, header)]);
         let err = chain
             .store_coinbase(0, header.block_hash(), &coinbase, &other_proof)
             .unwrap_err();
@@ -2540,9 +2577,8 @@ mod tests {
 
     #[test]
     fn advancing_the_mark_prunes_superseded_coinbases() -> eyre::Result<()> {
-        let chain = Core::in_memory(Network::Regtest)?;
         let (genesis, coinbase, proof) = coinbase_fixture(BlockHash::all_zeros(), BASE_TIME);
-        chain.seed_checkpoints(&[(0, genesis)])?;
+        let chain = anchored(Network::Regtest, &[(0, genesis)]);
         chain.store_coinbase(0, genesis.block_hash(), &coinbase, &proof)?;
         assert!(chain.coinbase_at(0)?.is_some());
 
@@ -2563,12 +2599,11 @@ mod tests {
 
     #[test]
     fn prune_drops_coinbases_below_the_finalized_checkpoint() -> eyre::Result<()> {
-        let chain = Core::in_memory(Network::Regtest)?;
         let (header, coinbase, proof) = coinbase_fixture(BlockHash::all_zeros(), BASE_TIME);
         let next = mine_child(&header, EASY_BITS, 1);
         // Two period boundaries: the mark is the second, so height 0 is a
         // superseded full difficulty period.
-        chain.seed_checkpoints(&[(0, header), (DIFFICULTY_PERIOD, next)])?;
+        let chain = anchored(Network::Regtest, &[(0, header), (DIFFICULTY_PERIOD, next)]);
         chain.store_coinbase(0, header.block_hash(), &coinbase, &proof)?;
         assert!(chain.coinbase_at(0)?.is_some());
         assert_eq!(chain.prune_coinbases()?, 1);

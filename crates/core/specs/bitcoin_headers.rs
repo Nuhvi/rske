@@ -81,23 +81,25 @@ fn delivery_params() -> Params {
 /// An in-memory mainnet core for the specs.
 ///
 /// It keeps the mainnet consensus rules and disables only the estimated-work
-/// finality requirement, which a synthetic chain cannot clear. The trust
-/// anchor is the seed that each machine plants at [`SEED_HEIGHT`].
-fn synthetic_mainnet_core(params: Params) -> Core {
+/// finality requirement, which a synthetic chain cannot clear. `anchor` is the
+/// seed the machine starts from; production code cannot replace the embedded
+/// spine.
+fn synthetic_mainnet_core(params: Params, anchor: &[(u64, BitcoinHeader)]) -> Core {
     Core::new(
         Config::in_memory(Network::Bitcoin)
             .with_params(params)
-            .without_partition_safety(),
+            .without_partition_safety()
+            .with_anchor(anchor),
     )
     .expect("in-memory store")
 }
 
-fn mainnet_core() -> Core {
-    synthetic_mainnet_core(mainnet_params())
+fn mainnet_core(anchor: &[(u64, BitcoinHeader)]) -> Core {
+    synthetic_mainnet_core(mainnet_params(), anchor)
 }
 
-fn delivery_core() -> Core {
-    synthetic_mainnet_core(delivery_params())
+fn delivery_core(anchor: &[(u64, BitcoinHeader)]) -> Core {
+    synthetic_mainnet_core(delivery_params(), anchor)
 }
 
 fn mine(prev: BlockHash, time: u32, tag: u32) -> BitcoinHeader {
@@ -419,9 +421,7 @@ impl StateMachineTest for HeaderMachine {
     type Reference = HeaderMachine;
 
     fn init_test(model: &HeaderModel) -> HeaderSut {
-        let core = delivery_core();
-        core.seed_checkpoints(&[(SEED_HEIGHT, model.universe.genesis)])
-            .expect("seed");
+        let core = delivery_core(&[(SEED_HEIGHT, model.universe.genesis)]);
         let last_work = work(&core);
         HeaderSut {
             core,
@@ -809,9 +809,7 @@ impl StateMachineTest for FinalityMachine {
     type Reference = FinalityMachine;
 
     fn init_test(model: &FinalityModel) -> FinalitySut {
-        let core = mainnet_core();
-        core.seed_checkpoints(&[(SEED_HEIGHT, model.universe.genesis)])
-            .expect("seed");
+        let core = mainnet_core(&[(SEED_HEIGHT, model.universe.genesis)]);
         let last_work = work(&core);
         FinalitySut {
             core,
@@ -1075,9 +1073,7 @@ impl StateMachineTest for DifficultyMachine {
     fn init_test(model: &DifficultyModel) -> DifficultySut {
         // Mainnet enforces the expected-bits rule. Only the proof-of-work limit
         // is relaxed, so the test can mine without mainnet work.
-        let core = mainnet_core();
-        core.seed_checkpoints(&[(SEED_HEIGHT, model.universe.genesis)])
-            .expect("seed");
+        let core = mainnet_core(&[(SEED_HEIGHT, model.universe.genesis)]);
         DifficultySut { core }
     }
 
@@ -1244,9 +1240,7 @@ impl StateMachineTest for FutureMachine {
     type Reference = FutureMachine;
 
     fn init_test(model: &FutureModel) -> FutureSut {
-        let core = mainnet_core();
-        core.seed_checkpoints(&[(SEED_HEIGHT, model.universe.genesis)])
-            .expect("seed");
+        let core = mainnet_core(&[(SEED_HEIGHT, model.universe.genesis)]);
         FutureSut { core }
     }
 
@@ -1356,4 +1350,22 @@ prop_state_machine! {
     /// C7: a header more than two hours ahead of `now` is rejected.
     #[test]
     fn future_time_matches_the_spec(sequential 1..8 => FutureMachine);
+}
+
+/// §1: the seed is configuration, and a store never switches chains. An anchor
+/// that disagrees with a stored checkpoint is refused.
+#[test]
+fn seed_agreement_matches_the_spec() {
+    let genesis = mine(BlockHash::all_zeros(), SEED_TIME, 0);
+    let other = mine(BlockHash::all_zeros(), SEED_TIME + 1, 0);
+    let core = delivery_core(&[(SEED_HEIGHT, genesis)]);
+    let Core { store, config } = core;
+    let core = Core {
+        store,
+        config: config.with_anchor(&[(SEED_HEIGHT, other)]),
+    };
+    assert!(matches!(
+        core.ensure_anchor(),
+        Err(Error::AnchorMismatch { height, .. }) if height == SEED_HEIGHT
+    ));
 }

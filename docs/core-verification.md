@@ -118,12 +118,15 @@ The tests drive only public API:
   `Core::finalized_checkpoints()`, `Core::coinbase_tags()`,
   `Core::rsk_headers_back()` — iterators over the row collections that can grow
   without bound;
-- `Core::new(Config)` — opens a store from one configuration value;
-  `Config::in_memory`/`Config::open` select the backend, and
+- `Core::new(Config)` — opens a store from one configuration value. It seeds a
+  fresh store from the compiled-in anchor and refuses an existing store whose
+  network or checkpoints disagree, so no caller can switch chains. `Config::in_memory`/`Config::open` select the backend, and
   `Config::with_params`/`Config::without_partition_safety` override the network
-  defaults (`Core::in_memory`/`Core::open` are the default-option shortcuts);
-- `Core::reset`, `Core::reset_rsk` — replay from a clean in-memory fixture.
-  These are ordinary public methods; no feature flag is needed.
+  defaults (`Core::in_memory`/`Core::open` are the default-option shortcuts).
+  `Config::with_anchor` is test-only and crate-private;
+- `Core::reset`, `Core::reset_rsk` — replay from a clean fixture. `Core::reset`
+  re-anchors from the configuration; `Core::reset_rsk` drops only the Rootstock
+  tables. These are ordinary public methods; no feature flag is needed.
 
 If a requirement is not in `specs/` and has no executable counterpart, it is
 covered — if at all — by an ordinary unit test in the module that owns the

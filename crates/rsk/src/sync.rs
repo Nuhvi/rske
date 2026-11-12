@@ -523,33 +523,24 @@ mod tests {
     use super::*;
     use bitcoin::Network;
 
-    /// A temp store anchored on the first `periods` spine checkpoints
-    /// (heights 0, 2016, 4032, …). The temp dir must outlive the store.
-    fn anchored(periods: usize) -> (tempfile::TempDir, Core) {
+    /// A temp store anchored on the embedded spine. The temp dir must outlive
+    /// the store.
+    fn anchored() -> (tempfile::TempDir, Core) {
         let dir = tempfile::tempdir().unwrap();
         let core = Core::open(&dir.path().join("chain.redb"), Network::Bitcoin).unwrap();
-        let spine = rsk_core::btc::checkpoints::parse().unwrap();
-        core.seed_checkpoints(&spine[..periods]).unwrap();
         (dir, core)
     }
 
     #[test]
     fn locator_is_the_tip_then_genesis() {
-        let (_dir, core) = anchored(3); // heights 0, 2016, 4032
+        let (_dir, core) = anchored();
         let spine = rsk_core::btc::checkpoints::parse().unwrap();
 
-        // Only the tip boundary (4032) is within the last ten heights; genesis
-        // is always appended as the fallback.
+        // Only the tip boundary is within the last ten heights; genesis is
+        // always appended as the fallback.
         let loc = locator(&core).unwrap();
-        assert_eq!(loc.first(), Some(&spine[2].1.block_hash()));
+        assert_eq!(loc.first(), Some(&spine.last().unwrap().1.block_hash()));
         assert_eq!(loc.last(), Some(&spine[0].1.block_hash()));
         assert_eq!(loc.len(), 2);
-    }
-
-    #[test]
-    fn locator_is_empty_without_a_tip() {
-        let dir = tempfile::tempdir().unwrap();
-        let core = Core::open(&dir.path().join("chain.redb"), Network::Bitcoin).unwrap();
-        assert!(locator(&core).unwrap().is_empty());
     }
 }

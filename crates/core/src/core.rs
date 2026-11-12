@@ -18,6 +18,7 @@ use std::sync::Arc;
 use alloy_primitives::B256;
 use bitcoin::Network;
 use bitcoin::block::{BlockHash, Header as BitcoinHeader};
+use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::consensus::Params;
 use bitcoin::hashes::Hash as _;
 use bitcoin::merkle_tree::MerkleBlock;
@@ -62,6 +63,24 @@ pub struct Config {
     /// difficulty rules on a chain that is cheap to mine. A production node
     /// must keep this enabled.
     pub partition_safety: bool,
+    /// The trusted checkpoints this store starts from.
+    ///
+    /// The crate chooses it, so nothing outside `rsk-core` can change the
+    /// anchor: the embedded spine on mainnet, genesis on every other network,
+    /// and an explicit list in tests. A store that already holds a checkpoint
+    /// at a configured height must agree with it.
+    anchor: AnchorSource,
+}
+
+/// Where the trusted checkpoints come from.
+#[derive(Debug, Clone)]
+pub(crate) enum AnchorSource {
+    /// The anchor compiled into the crate: the embedded spine on mainnet,
+    /// genesis on every other network.
+    Embedded,
+    /// An explicit list. Tests set it; production code cannot.
+    #[cfg(test)]
+    Explicit(Vec<(u64, BitcoinHeader)>),
 }
 
 impl Config {
@@ -72,6 +91,7 @@ impl Config {
             params: Params::new(network),
             rsk_chain: rsk::chain_config(network),
             partition_safety: true,
+            anchor: AnchorSource::Embedded,
         }
     }
 
@@ -82,7 +102,29 @@ impl Config {
             params: Params::new(network),
             rsk_chain: rsk::chain_config(network),
             partition_safety: true,
+            anchor: AnchorSource::Embedded,
         }
+    }
+
+    /// The anchor for this configuration, resolved for its network.
+    pub(crate) fn resolve_anchor(&self) -> Result<Vec<(u64, BitcoinHeader)>, Error> {
+        match &self.anchor {
+            #[cfg(test)]
+            AnchorSource::Explicit(entries) => Ok(entries.clone()),
+            AnchorSource::Embedded => match self.params.network {
+                Network::Bitcoin => crate::btc::checkpoints::parse(),
+                network => Ok(vec![(0, genesis_block(network).header)]),
+            },
+        }
+    }
+
+    /// Replace the embedded anchor with an explicit list.
+    ///
+    /// Test-only: the anchor is a crate decision, not a runtime option.
+    #[cfg(test)]
+    pub(crate) fn with_anchor(mut self, entries: &[(u64, BitcoinHeader)]) -> Self {
+        self.anchor = AnchorSource::Explicit(entries.to_vec());
+        self
     }
 
     /// Replace the Bitcoin consensus parameters.
@@ -116,12 +158,17 @@ pub struct Core {
 
 impl Core {
     /// Open a core with the given configuration.
+    ///
+    /// The store is anchored before the handle is returned: a fresh store gets
+    /// the configured checkpoints, and an existing store must agree with them.
     pub fn new(config: Config) -> Result<Self, Error> {
         let store = match &config.store {
             StoreConfig::File(path) => Store::open(path)?,
             StoreConfig::Memory => Store::in_memory()?,
         };
-        Ok(Self { store, config })
+        let core = Self { store, config };
+        core.ensure_anchor()?;
+        Ok(core)
     }
 
     /// Open a file-backed store for the given network.
@@ -144,9 +191,11 @@ impl Core {
         Self::new(Config::in_memory(params.network).with_params(params))
     }
 
-    /// Drop every Bitcoin table (destructive: replay from a clean seed).
+    /// Drop every Bitcoin table and re-anchor from the configuration
+    /// (destructive: replay from a clean seed).
     pub fn reset(&self) -> Result<(), Error> {
-        self.store.reset_btc()
+        self.store.reset_btc()?;
+        self.ensure_anchor()
     }
 
     /// Drop every Rootstock table, keeping the Bitcoin side intact.
@@ -161,13 +210,7 @@ impl Core {
     /// Every action runs in its own transaction, so it is all-or-nothing.
     pub fn apply(&self, action: Action<'_>) -> Result<Outcome, Error> {
         Ok(match action {
-            Action::SeedCheckpoints { entries } => {
-                self.seed_checkpoints_impl(entries)?;
-                Outcome::Seeded
-            }
-            Action::ReanchorShipped { trusted } => {
-                Outcome::Reanchored(self.reanchor_shipped_impl(trusted)?)
-            }
+            Action::ReanchorShipped => Outcome::Reanchored(self.reanchor_shipped_impl()?),
             Action::ConnectHeaders { headers, now } => {
                 Outcome::Connected(self.connect_headers_impl(headers, now)?)
             }
@@ -298,10 +341,8 @@ impl Core {
 /// Every state-changing operation the node can ask the core to perform.
 #[derive(Debug)]
 pub enum Action<'a> {
-    /// Plant the trusted Bitcoin spine (once): one header per period boundary.
-    SeedCheckpoints { entries: &'a [(u64, BitcoinHeader)] },
-    /// Adopt the newest shipped Bitcoin period boundary the store already holds.
-    ReanchorShipped { trusted: &'a [(u64, BitcoinHeader)] },
+    /// Adopt the newest configured Bitcoin period boundary the store holds.
+    ReanchorShipped,
     /// Connect a run of Bitcoin headers at the caller's clock.
     ConnectHeaders {
         headers: &'a [BitcoinHeader],
@@ -334,7 +375,6 @@ pub enum Action<'a> {
 /// What [`Core::apply`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    Seeded,
     Reanchored(Option<(u64, u64)>),
     Connected(ConnectOutcome),
     CoinbaseStored,
