@@ -3,9 +3,9 @@
 Status: draft
 Executable form: [`crates/core/specs/bitcoin_headers.rs`](../crates/core/specs/bitcoin_headers.rs)
 
-This document describes the Bitcoin header state machine exposed by
-`Core::apply(Action::ConnectHeaders { headers, now })`. The Rust comments use
-the same clause IDs.
+This document describes the Bitcoin header state machine seeded at open and
+exposed by `Core::apply(Action::ConnectHeaders { headers, now })`. The Rust
+comments use the same clause IDs.
 
 Design rules use `R*`. Bitcoin header checks use `C*`. Some `C*` clauses contain
 local policy; those parts are marked **Local**.
@@ -30,52 +30,26 @@ Out of scope:
 
 ## 1. Configuration
 
-The machine is configured, once, with:
+The machine is configured once, at open, with:
 
-- **Network.** Selects the Bitcoin consensus parameters. The expected-difficulty
-  rule applies on mainnet and signet. Testnet, testnet4 and regtest permit
-  minimum-difficulty blocks.
+- **Network.** The Bitcoin consensus parameters.
 - **Partition safety.** Whether the mainnet network-partition safety rule runs.
-  The default is on. A test disables it to run the mainnet consensus rules over
-  a low-work synthetic chain (R8).
-
-The network selects the default requirement: mainnet prices elapsed time from
-the anchor and floors the result at a coinbase-maturity window of work. Every
-other network uses the tip block's own work, which the tip always carries above
-the mark, so finality there is decided by the depth alone. With partition
-safety disabled, every network uses the tip-work rule.
-
-The machine also starts from a trust anchor:
-
-- **Seed.** One or more trusted headers at difficulty-period boundaries. The seed
-  may be sparse, and its first height may be above 0. The crate fixes the seed:
-  the embedded spine on mainnet, genesis on every other network. A test may
-  replace it; production code cannot. Seeding creates fork `0` and sets the
-  first finality mark (S2, S4). The canonical chain starts at the first seed
-  header.
-- **Seed agreement.** A store that already holds a checkpoint at a configured
-  height must hold the same header. Opening a store against a seed that
-  disagrees fails with `AnchorMismatch`. Opening never extends an existing
-  store, so a configured checkpoint the store does not hold is not planted.
+  The default is on; a test disables it (R9).
+- **Seed.** Trusted headers at difficulty-period boundaries. The crate fixes it:
+  the embedded spine on mainnet, genesis elsewhere, replaced in tests (R1).
 
 ## 2. State
 
 The state machine tracks:
 
-- **S1 — stored headers.** Every seed entry and every accepted header, keyed by
-  fork and height. A header on a losing fork is stored.
+- **S1 — stored headers.** Every stored Bitcoin header, keyed by fork and
+  height.
 - **S2 — forks.** Fork `0` is the seed chain. Every other fork has a
   `forkpoint`, the height of its first header, and a contiguous run of headers
   from that height. A fork's cumulative work is the work stored on its chain.
-- **S3 — best fork.** The fork with the most cumulative work among the forks
-  that R6 permits to win. A tie keeps the incumbent.
-- **S4 — finality mark.** The newest height treated as un-reorgable. Seeding
-  sets it to the newest seed height. The mark is kept at least one coinbase
-  maturity window (100 blocks) below the tip: the candidate is `tip - 100`. The
-  requirement can hold it lower. It never exceeds the candidate and never
-  regresses.
-- **S5 — clock high-water mark.** The greatest clock value used by a batch that
-  stores new headers.
+- **S3 — best fork.** The fork that R6 and R7 select.
+- **S4 — finality mark.** The newest height treated as un-reorgable.
+- **S5 — clock high-water mark.** The greatest finality clock seen.
 
 ## 3. Action
 
@@ -83,7 +57,7 @@ The state machine tracks:
 
 - **Headers.** A run that the caller claims is contiguous.
 - **`now`.** The caller's clock, or none. C7 uses it when supplied and is
-  skipped when it is not. Network-partition safety uses the clock floor (R10):
+  skipped when it is not. Network-partition safety uses the clock floor (R11):
   the greatest of the supplied value, the stored high-water mark (S5) and the
   chain time at the best tip — the median of its last 11 header times, or the
   tip's own time when those are not all stored — so a missing clock measures
@@ -97,6 +71,14 @@ header as its parent. A repeat after a new header is not a no-op; it is a link
 error.
 
 ## 4. Requirements
+
+### Opening (designed here)
+
+**R1 — store identity.** An open with no stored chain plants the configured
+seed and records the network. An open with a stored chain must find the same
+network (`NetworkMismatch`) and the same header at every height where the store
+and the seed both have a checkpoint (`AnchorMismatch`). Opening adds no
+checkpoint to an existing store.
 
 ### Bitcoin header rules (external)
 
@@ -154,23 +136,25 @@ Known Bitcoin header checks that are not performed:
 
 ### Interface and storage (designed here)
 
-**R1 — atomicity.** If the action returns an error, the state is unchanged.
+**R2 — atomicity.** If the action returns an error, the state is unchanged.
 
-**R2 — idempotence.** If every header in the batch is already stored, the action
+**R3 — idempotence.** If every header in the batch is already stored, the action
 succeeds, reports no connected header, and changes nothing.
 
-**R3 — storage exactness.** The stored set is exactly the seed entries plus every
-header from every accepted batch. A losing header remains stored and readable.
+**R4 — storage exactness.** The stored set is exactly the seed entries applied
+when the store was created plus every header from every accepted batch. A still
+longer configured seed on a later open adds nothing (R1). A losing header
+remains stored and readable.
 
-**R4 — canonical chain.** For a chain with no gaps in stored headers, the
+**R5 — canonical chain.** For a chain with no gaps in stored headers, the
 canonical chain starts at the seed header, links continuously and ends at the
 best fork tip. A read of a canonical height with no stored header reports an
 error; a sparse production seed has such gaps.
 
-**R5 — fork choice by work.** The best fork carries the maximum cumulative work
-among the forks that R6 permits to win. Height alone does not decide.
+**R6 — fork choice by work.** The best fork carries the maximum cumulative work
+among the forks that R7 permits to win. Height alone does not decide.
 
-**R6 — switching.** A fork becomes best only if two conditions hold:
+**R7 — switching.** A fork becomes best only if two conditions hold:
 
 1. it is strictly heavier than the old best, and
 2. it carries the same block as fork `0` at the mark.
@@ -180,11 +164,11 @@ the mark. Equal work keeps the incumbent.
 
 ### Finality (designed here)
 
-**R7 — mark safety.** After seeding, the mark never regresses, never exceeds
+**R8 — mark safety.** After seeding, the mark never regresses, never exceeds
 `tip - 100`, and every height at or below it keeps the block it had when it was
 finalized. Seeding itself sets the mark to the newest seed height.
 
-**R8 — mark advancement.** With the seed chain best, if the work above the mark
+**R9 — mark advancement.** With the seed chain best, if the work above the mark
 clears the requirement (`have >= need`), the mark advances to `tip - 100` when
 that is greater than the current mark. Mainnet takes `need` from the estimated
 work since the mark, floored at a coinbase-maturity window; every other network
@@ -193,11 +177,11 @@ those networks the depth is the only gate. With partition safety disabled,
 every network uses the tip-work rule. This switch is test-only; a production
 mainnet node keeps it on.
 
-**R9 — fork gate.** A fork is created only when its forkpoint is above the
+**R10 — fork gate.** A fork is created only when its forkpoint is above the
 finality mark. At or below the mark the action fails with
-`ForkBelowFinalized` and changes nothing. Above the mark, R3 and R6 apply.
+`ForkBelowFinalized` and changes nothing. Above the mark, R4 and R7 apply.
 
-**R10 — clock floor.** The requirement's clock is the greatest of three values:
+**R11 — clock floor.** The requirement's clock is the greatest of three values:
 the supplied `now`, if any; the stored high-water mark; and the chain time at
 the best tip. The chain time is the median of the last 11 header times,
 including the tip (Bitcoin Core's `GetMedianTimePast`), so one miner's

@@ -35,13 +35,13 @@ universe containing a 12-block trunk, a competing fork, a fork of a fork, a
 bad-PoW header, a stale-timestamp header, an out-of-range target header,
 duplicate batches and an empty batch:
 
-- R1–R2: atomicity and idempotence. A rejected action leaves the store unchanged.
+- R2–R3: atomicity and idempotence. A rejected action leaves the store unchanged.
 - C1–C4: parent, linkage, proof of work and median-time-past. The errors are
   `UnknownAncestor`, `LinkBreak`, `BadPow` and `BadTimestamp`.
 - C7: a header more than two hours after `now` gives `TimestampTooNew`.
-- R3–R4: the exact stored header set and canonical-chain linkage, starting at
+- R4–R5: the exact stored header set and canonical-chain linkage, starting at
   the recent seed.
-- R5–R6: maximum-work fork choice and strict-heavier switching.
+- R6–R7: maximum-work fork choice and strict-heavier switching.
 
 This machine allows minimum-difficulty blocks to skip C5, because the
 expected-bits rule would reject an out-of-range target before C6 can see it.
@@ -50,10 +50,10 @@ C5 has its own machine.
 `finality_and_fork_gate_matches_the_spec` checks the finality mark and the fork
 gate on a 240-block trunk with the production depth, delivered in short runs:
 
-- R7: the mark never regresses, never passes the tip, and never moves a
+- R8: the mark never regresses, never passes the tip, and never moves a
   finalized block;
-- R8: the mark is exactly `tip - depth`, and `finalized` reports each move;
-- R9: forks at or below the mark are refused, while lighter forks above it are
+- R9: the mark is exactly `tip - depth`, and `finalized` reports each move;
+- R10: forks at or below the mark are refused, while lighter forks above it are
   stored and never become best.
 
 `difficulty_matches_the_spec` checks C5 through `Core` with mainnet parameters
@@ -65,12 +65,16 @@ period-boundary retarget through `Core`, which the machine does not reach.
 
 `future_time_matches_the_spec` checks C7 against the caller clock.
 
+`store_identity_matches_the_spec` covers R1 (store identity) without a
+machine: an open with a stored chain refuses another network or another
+seed.
+
 Not yet checked by any machine:
 
-- the clock floor and clockless connects (R10), including the
+- the clock floor and clockless connects (R11), including the
   median-time-past chain clock and its sparse-window fallback, which only unit
   tests cover;
-- a heavier fork that crosses the mark (the mark-crossing half of R6, and the
+- a heavier fork that crosses the mark (the mark-crossing half of R7, and the
   election path it exercises);
 - median-time-past with fewer than 11 stored headers, and at a height where an
   ancestor header is missing;

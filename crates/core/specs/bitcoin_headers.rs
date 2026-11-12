@@ -7,16 +7,18 @@
 //!
 //! Four machines, all on mainnet parameters:
 //!
-//! - `bitcoin_headers_match_the_spec` checks R1–R2, C1–C6 and R3–R6 over a
+//! - `bitcoin_headers_match_the_spec` checks R2–R3, C1–C6 and R4–R7 over a
 //!   delivery universe with a trunk, a competing fork, a fork of a fork, a
 //!   bad-PoW header, a stale-timestamp header, an out-of-range target header,
 //!   duplicates and empty batches.
-//! - `finality_and_fork_gate_matches_the_spec` checks R7–R9 on a long trunk
+//! - `finality_and_fork_gate_matches_the_spec` checks R8–R10 on a long trunk
 //!   delivered in runs, at the production depth, including light forks
 //!   below/above the mark.
 //! - `difficulty_matches_the_spec` checks C5 with the mainnet expected-bits
 //!   rule.
 //! - `future_time_matches_the_spec` checks C7 against the caller clock.
+//!
+//! A plain test, `store_identity_matches_the_spec`, checks R1 at open.
 //!
 //! The synthetic chain seeds a recent mainnet height and relaxes the
 //! proof-of-work limit, so it mines in no time. The mainnet estimated-work
@@ -443,8 +445,8 @@ impl StateMachineTest for HeaderMachine {
         });
         let after = sut.core.state().expect("state");
 
-        // R6: a best-fork change must be a strict improvement; equal work never
-        // promotes the challenger. The mark-crossing half of R6 is out of
+        // R7: a best-fork change must be a strict improvement; equal work never
+        // promotes the challenger. The mark-crossing half of R7 is out of
         // reach here because the mark stays at the seed height.
         if let (Some(old), Some(new)) = (before.best_fork, after.best_fork)
             && old != new
@@ -465,9 +467,9 @@ impl StateMachineTest for HeaderMachine {
             );
         }
 
-        // R1: an error leaves the store untouched, checked below.
+        // R2: an error leaves the store untouched, checked below.
         match (&model.last, &outcome) {
-            // R2: an all-stored batch is a no-op.
+            // R3: an all-stored batch is a no-op.
             (HeaderPrediction::Noop, Ok(Outcome::Connected(result))) => {
                 assert_eq!(result.connected, 0, "model expected a no-op");
                 assert_eq!(before, after, "a no-op changed the store");
@@ -515,7 +517,7 @@ impl StateMachineTest for HeaderMachine {
     fn check_invariants(sut: &HeaderSut, model: &HeaderModel) {
         let state = sut.core.state().expect("state");
 
-        // R3: every stored row, blocked forks included.
+        // R4: every stored row, blocked forks included.
         let stored: HashSet<BlockHash> = sut
             .core
             .stored_headers()
@@ -524,7 +526,7 @@ impl StateMachineTest for HeaderMachine {
             .collect();
         assert_eq!(stored, model.stored, "the stored header set diverged");
 
-        // R4: the canonical chain is linked and agrees with the best fork.
+        // R5: the canonical chain is linked and agrees with the best fork.
         let best = state.best_fork.expect("seeded store has a best fork");
         let best_fork = state
             .forks
@@ -567,7 +569,7 @@ impl StateMachineTest for HeaderMachine {
             Some(best_fork.tip_height)
         );
 
-        // R5: no fork can be blocked by the mark here (depth 100, tip at most
+        // R6: no fork can be blocked by the mark here (depth 100, tip at most
         // 12), so the best fork must carry the maximum work. Ties are
         // allowed to stay with the incumbent; `apply` checks that a *switch*
         // only ever goes to a strictly heavier fork.
@@ -577,7 +579,7 @@ impl StateMachineTest for HeaderMachine {
             assert!(fork_work <= best_work, "the best fork is not the heaviest");
         }
 
-        // R7: every height at or below the mark still has the block it had.
+        // R8: every height at or below the mark still has the block it had.
         let mark = state.finalized.expect("seeded store has a mark");
         assert!(mark <= best_fork.tip_height);
         assert_eq!(sut.finalized_prefix.len() as u64, mark - SEED_HEIGHT + 1);
@@ -767,7 +769,7 @@ impl ReferenceStateMachine for FinalityMachine {
                 if state.stored.contains(&fork.block_hash()) {
                     state.last = FinalityPrediction::Noop;
                 } else {
-                    // R9: a fork at or below the mark is refused. A fork above
+                    // R10: a fork at or below the mark is refused. A fork above
                     // the mark is stored, but it can only tie the trunk here.
                     let forkpoint = SEED_HEIGHT + *index as u64 + 2;
                     if forkpoint <= state.mark {
@@ -786,7 +788,7 @@ impl ReferenceStateMachine for FinalityMachine {
     }
 }
 
-/// R7/R8: the mark follows the tip at the production depth.
+/// R8/R9: the mark follows the tip at the production depth.
 ///
 /// The specs disable the mainnet partition-safety requirement. The remaining
 /// requirement is the tip block's own work, which the tip always carries above
@@ -838,7 +840,7 @@ impl StateMachineTest for FinalityMachine {
             .apply(Action::ConnectHeaders { headers, now: None });
         let after = sut.core.state().expect("state");
 
-        // R8: `ConnectOutcome::finalized` reports exactly the mark movement the
+        // R9: `ConnectOutcome::finalized` reports exactly the mark movement the
         // model predicted.
         match (&model.last, &outcome) {
             (FinalityPrediction::Noop, Ok(Outcome::Connected(result))) => {
@@ -913,7 +915,7 @@ impl StateMachineTest for FinalityMachine {
 
     fn check_invariants(sut: &FinalitySut, model: &FinalityModel) {
         let state = sut.core.state().expect("state");
-        // R7/R8: the mark is the model's mark and sits exactly at the depth.
+        // R8/R9: the mark is the model's mark and sits exactly at the depth.
         assert_eq!(state.finalized, Some(model.mark));
         assert_eq!(state.best_fork, Some(0));
         assert_eq!(sut.core.tip_height().expect("read"), Some(model.tip));
@@ -926,7 +928,7 @@ impl StateMachineTest for FinalityMachine {
             "the mark is not tip - depth"
         );
 
-        // R3 (shared): the stored set includes the branches.
+        // R4 (shared): the stored set includes the branches.
         let stored: HashSet<BlockHash> = sut
             .core
             .stored_headers()
@@ -943,7 +945,7 @@ impl StateMachineTest for FinalityMachine {
             "a stored branch must have its own fork"
         );
 
-        // R4 (shared): the best chain still links through the trunk.
+        // R5 (shared): the best chain still links through the trunk.
         let chain = canonical_chain(&sut.core);
         assert_eq!(chain.len() as u64, trunk);
         assert_eq!(chain[0].block_hash(), model.universe.genesis.block_hash());
@@ -1308,13 +1310,46 @@ impl StateMachineTest for FutureMachine {
 
 // ── the runnable specs ───────────────────────────────────────────────────────
 
+/// R1: an open with a stored chain refuses another network or another seed,
+/// and adds no checkpoint.
+#[test]
+fn store_identity_matches_the_spec() {
+    let genesis = mine(BlockHash::all_zeros(), SEED_TIME, 0);
+    let other = mine(BlockHash::all_zeros(), SEED_TIME + 1, 0);
+    let core = delivery_core(&[(SEED_HEIGHT, genesis)]);
+
+    // A different network.
+    let Core { store, config } = core;
+    let core = Core {
+        store,
+        config: config.with_params(Params::new(Network::Regtest)),
+    };
+    assert!(matches!(
+        core.ensure_anchor(),
+        Err(Error::NetworkMismatch { .. })
+    ));
+
+    // A different header at the same checkpoint height.
+    let Core { store, config } = core;
+    let core = Core {
+        store,
+        config: config
+            .with_params(Params::new(Network::Bitcoin))
+            .with_anchor(&[(SEED_HEIGHT, other)]),
+    };
+    assert!(matches!(
+        core.ensure_anchor(),
+        Err(Error::AnchorMismatch { height, .. }) if height == SEED_HEIGHT
+    ));
+}
+
 prop_state_machine! {
     #![proptest_config(ProptestConfig {
         cases: 64,
         .. ProptestConfig::default()
     })]
 
-    /// R1–R2, C1–C6, R3–R6: acceptance, storage and fork choice on the delivery universe.
+    /// R2–R3, C1–C6, R4–R7: acceptance, storage and fork choice on the delivery universe.
     #[test]
     fn bitcoin_headers_match_the_spec(sequential 1..32 => HeaderMachine);
 }
@@ -1325,7 +1360,7 @@ prop_state_machine! {
         .. ProptestConfig::default()
     })]
 
-    /// R7–R9: mark safety/advancement and the fork gate on a trunk.
+    /// R8–R10: mark safety/advancement and the fork gate on a trunk.
     #[test]
     fn finality_and_fork_gate_matches_the_spec(sequential 1..64 => FinalityMachine);
 }
@@ -1350,22 +1385,4 @@ prop_state_machine! {
     /// C7: a header more than two hours ahead of `now` is rejected.
     #[test]
     fn future_time_matches_the_spec(sequential 1..8 => FutureMachine);
-}
-
-/// §1: the seed is configuration, and a store never switches chains. An anchor
-/// that disagrees with a stored checkpoint is refused.
-#[test]
-fn seed_agreement_matches_the_spec() {
-    let genesis = mine(BlockHash::all_zeros(), SEED_TIME, 0);
-    let other = mine(BlockHash::all_zeros(), SEED_TIME + 1, 0);
-    let core = delivery_core(&[(SEED_HEIGHT, genesis)]);
-    let Core { store, config } = core;
-    let core = Core {
-        store,
-        config: config.with_anchor(&[(SEED_HEIGHT, other)]),
-    };
-    assert!(matches!(
-        core.ensure_anchor(),
-        Err(Error::AnchorMismatch { height, .. }) if height == SEED_HEIGHT
-    ));
 }
