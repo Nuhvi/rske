@@ -63,6 +63,10 @@ pub struct Config {
     /// difficulty rules on a chain that is cheap to mine. A production node
     /// must keep this enabled.
     pub partition_safety: bool,
+    /// Check the expected `bits` of every new header (V5). The default is
+    /// `true`. A test turns it off to exercise other checks on a fixture that
+    /// does not follow the schedule.
+    pub(crate) difficulty_check: bool,
     /// The trusted checkpoints this store starts from.
     ///
     /// The crate chooses it, so nothing outside `rsk-core` can change the
@@ -91,6 +95,7 @@ impl Config {
             params: Params::new(network),
             rsk_chain: rsk::chain_config(network),
             partition_safety: true,
+            difficulty_check: true,
             anchor: AnchorSource::Embedded,
         }
     }
@@ -102,6 +107,7 @@ impl Config {
             params: Params::new(network),
             rsk_chain: rsk::chain_config(network),
             partition_safety: true,
+            difficulty_check: true,
             anchor: AnchorSource::Embedded,
         }
     }
@@ -116,6 +122,16 @@ impl Config {
                 network => Ok(vec![(0, genesis_block(network).header)]),
             },
         }
+    }
+
+    /// Turn off the expected-bits check.
+    ///
+    /// Test-only: V5 has its own machine, and the delivery universe needs to
+    /// reach the other checks with a target that the schedule would reject.
+    #[cfg(test)]
+    pub(crate) fn without_difficulty_check(mut self) -> Self {
+        self.difficulty_check = false;
+        self
     }
 
     /// Replace the embedded anchor with an explicit list.

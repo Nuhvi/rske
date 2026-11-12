@@ -11,11 +11,11 @@
 //! - **Target range** — `bits` decodes without a negative, zero or overflowing
 //!   target, and the target is at or below the network proof-of-work limit.
 //! - **Expected difficulty** — `bits` is exactly the target the retarget
-//!   schedule calls for at this height. Within a difficulty period every block
-//!   carries its period's target; at a period boundary the target is recomputed
-//!   from the previous period (Core's `GetNextWorkRequired`, Electrum's
-//!   `get_target`). At a period boundary the retarget clamps to the network's
-//!   proof-of-work limit.
+//!   schedule calls for at this height (Core's `GetNextWorkRequired`, Electrum's
+//!   `get_target`). Inside a period that is the parent's bits; at a period
+//!   boundary the target is recomputed. Testnet's minimum-difficulty rule and
+//!   testnet4's BIP94 retarget are included; regtest never retargets. The
+//!   retarget clamps to the network's proof-of-work limit.
 //! - **Median-time-past** — the timestamp is strictly greater than the median
 //!   of the previous [`MEDIAN_TIME_PAST`] blocks (Core's
 //!   `ContextualCheckBlockHeader`).
@@ -26,13 +26,8 @@
 //!
 //! - **Transaction / merkle validity** — not visible in a header; out of scope.
 //! - **Version rules** (BIP34/65/66/9) — height-activated and of no SPV value.
-//! - **Retargeting on testnet/regtest** — those networks permit
-//!   minimum-difficulty blocks, so "`bits` equals the schedule" does not hold.
-//!   Electrum skips them entirely; so do we (see [`enforces_difficulty`]).
-//!   Electrum goes further: on testnet its `verify_header` returns before the
-//!   `bits` and proof-of-work checks. This crate still requires every header to
-//!   meet its own target.
 
+use bitcoin::Network;
 use bitcoin::block::Header as BitcoinHeader;
 use bitcoin::consensus::Params;
 use bitcoin::pow::{CompactTarget, Target};
@@ -65,37 +60,52 @@ pub fn target_in_range(bits: CompactTarget, params: &Params) -> bool {
 /// network-adjusted clock; the caller supplies `now` on every connect.
 pub const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
 
-/// Whether the retarget rule (expected `bits`) is enforced on this network.
+/// The `bits` the header at `height` must carry.
 ///
-/// Testnet and regtest allow minimum-difficulty blocks, so their `bits` do not
-/// follow the schedule; like Electrum we skip the difficulty rule there. Only
-/// that rule is skipped: the proof-of-work check still runs, where Electrum
-/// omits it on testnet. The production network (mainnet) and signet are
-/// enforced.
-pub fn enforces_difficulty(params: &Params) -> bool {
-    !params.no_pow_retargeting && !params.allow_min_difficulty_blocks
-}
-
-/// The `bits` the header at `height` must carry, given its parent.
+/// Inside a period the parent's bits are expected, except on a network that
+/// permits minimum-difficulty blocks: there a header more than twice the target
+/// spacing after its parent must carry the proof-of-work limit, and any other
+/// header expects the bits of the last non-minimum-difficulty block in the
+/// period (see [`last_normal_bits`](crate::btc)). At a period boundary the
+/// retarget runs; testnet4 starts from the period-start bits (BIP94), every
+/// other network from the parent's, and regtest keeps the parent's.
 ///
-/// Off a difficulty-period boundary, every block in the period carries the
-/// same target as its parent. On a boundary (`height % DIFFICULTY_PERIOD == 0`)
-/// the target is recalculated from the previous period: its first block
-/// (`height - DIFFICULTY_PERIOD`, `period_start`) and its last block (the
-/// parent). Returns `None` when `period_start` is not available — e.g. it lies
-/// below a trusted checkpoint — in which case the caller skips the check.
+/// Returns `None` at a boundary without a period-start header. The connect path
+/// treats that as an internal error: a seed at a period boundary makes it
+/// unreachable.
 pub fn expected_bits(
     height: u64,
+    header_time: u32,
     parent: &BitcoinHeader,
     period_start: Option<&BitcoinHeader>,
+    last_normal_bits: CompactTarget,
     params: &Params,
 ) -> Option<CompactTarget> {
     if !height.is_multiple_of(DIFFICULTY_PERIOD) {
+        if params.allow_min_difficulty_blocks {
+            let gap =
+                u64::from(header_time) > u64::from(parent.time) + params.pow_target_spacing * 2;
+            return Some(if gap {
+                params.max_attainable_target.to_compact_lossy()
+            } else {
+                last_normal_bits
+            });
+        }
+        return Some(parent.bits);
+    }
+
+    if params.no_pow_retargeting {
         return Some(parent.bits);
     }
     let first = period_start?;
-    Some(CompactTarget::from_header_difficulty_adjustment(
-        *first, *parent, params,
+    let last_bits = if params.network == Network::Testnet4 {
+        first.bits
+    } else {
+        parent.bits
+    };
+    let timespan = u64::from(parent.time).saturating_sub(u64::from(first.time));
+    Some(CompactTarget::from_next_work_required(
+        last_bits, timespan, params,
     ))
 }
 
@@ -125,20 +135,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn difficulty_is_enforced_only_where_the_schedule_holds() {
-        assert!(!enforces_difficulty(&Params::new(Network::Regtest)));
-        assert!(!enforces_difficulty(&Params::new(Network::Testnet)));
-        assert!(enforces_difficulty(&Params::new(Network::Bitcoin)));
-        assert!(enforces_difficulty(&Params::new(Network::Signet)));
-    }
-
+    /// Mainnet and signet: inside a period the parent's bits are expected.
     #[test]
     fn off_boundary_bits_follow_the_parent() {
         let params = Params::new(Network::Bitcoin);
         let parent = header_with(1_600_000_000, 0x1d00_f3b3);
         assert_eq!(
-            expected_bits(5, &parent, None, &params),
+            expected_bits(5, parent.time + 1, &parent, None, parent.bits, &params),
             Some(CompactTarget::from_consensus(0x1d00_f3b3)),
         );
     }
@@ -152,12 +155,108 @@ mod tests {
         let parent = header_with(1_600_000_000 + 1_209_600, 0x1d00_ffff);
         let expected = CompactTarget::from_header_difficulty_adjustment(first, parent, &params);
         assert_eq!(
-            expected_bits(DIFFICULTY_PERIOD, &parent, Some(&first), &params),
+            expected_bits(
+                DIFFICULTY_PERIOD,
+                parent.time + 1,
+                &parent,
+                Some(&first),
+                parent.bits,
+                &params,
+            ),
             Some(expected),
         );
         assert_eq!(
-            expected_bits(DIFFICULTY_PERIOD, &parent, None, &params),
+            expected_bits(
+                DIFFICULTY_PERIOD,
+                parent.time + 1,
+                &parent,
+                None,
+                parent.bits,
+                &params
+            ),
             None,
+        );
+    }
+
+    /// Testnet: a header more than twice the target spacing after its parent
+    /// must carry the proof-of-work limit, whatever the last normal block had.
+    #[test]
+    fn a_minimum_difficulty_gap_requires_the_pow_limit() {
+        let params = Params::new(Network::Testnet);
+        let parent = header_with(1_600_000_000, 0x1d00_ffff);
+        let expected = params.max_attainable_target.to_compact_lossy();
+        assert_eq!(
+            expected_bits(
+                5,
+                parent.time + 2 * 600 + 1,
+                &parent,
+                None,
+                CompactTarget::from_consensus(0x1d00_ffff),
+                &params,
+            ),
+            Some(expected),
+        );
+    }
+
+    /// Testnet: without a gap, a normal block after a minimum-difficulty block
+    /// carries the last normal bits, not the parent's minimum-difficulty bits.
+    #[test]
+    fn a_minimum_difficulty_parent_uses_the_last_normal_bits() {
+        let params = Params::new(Network::Testnet);
+        let parent = header_with(1_600_000_000, 0x1d00_ffff);
+        let last_normal = CompactTarget::from_consensus(0x1c00_ffff);
+        assert_eq!(
+            expected_bits(5, parent.time + 1, &parent, None, last_normal, &params),
+            Some(last_normal),
+        );
+    }
+
+    /// Testnet4 (BIP94) starts the retarget from the period-start bits; testnet3
+    /// starts from the parent's.
+    #[test]
+    fn testnet4_takes_the_retarget_from_the_period_start() {
+        let first = header_with(1_600_000_000, 0x1d00_ffff);
+        let parent = header_with(1_600_000_000 + 1_209_600, 0x1c00_ffff);
+        let testnet3 = Params::new(Network::Testnet);
+        let testnet4 = Params::new(Network::Testnet4);
+        let e3 = expected_bits(
+            DIFFICULTY_PERIOD,
+            parent.time + 1,
+            &parent,
+            Some(&first),
+            parent.bits,
+            &testnet3,
+        );
+        let e4 = expected_bits(
+            DIFFICULTY_PERIOD,
+            parent.time + 1,
+            &parent,
+            Some(&first),
+            parent.bits,
+            &testnet4,
+        );
+        // A full timespan makes the retarget a no-op: the starting bits survive.
+        assert_eq!(e3, Some(parent.bits));
+        assert_eq!(e4, Some(first.bits));
+        assert_ne!(e3, e4);
+    }
+
+    /// Regtest never retargets, so a boundary keeps the parent's bits.
+    #[test]
+    fn regtest_keeps_the_parent_bits() {
+        let params = Params::new(Network::Regtest);
+        let first = header_with(1_600_000_000, 0x207f_ffff);
+        let parent = header_with(1_600_000_100, 0x207f_ffff);
+        assert_eq!(
+            expected_bits(
+                DIFFICULTY_PERIOD,
+                parent.time + 1,
+                &parent,
+                Some(&first),
+                parent.bits,
+                &params,
+            ),
+            Some(parent.bits),
         );
     }
 

@@ -1,24 +1,24 @@
 //! Executable specification for `specs/bitcoin-headers.md`.
 //!
-//! Requirement IDs in comments (`R1`, `R2`, ...) point at clauses in that
+//! Clause IDs in comments (`O1`, `V1`, `E1`, ...) point at clauses in that
 //! document. The Markdown is the human source; this file is the executable
 //! form that is expected to fail when a clause is broken. When a clause changes,
 //! update its comment here in the same change.
 //!
 //! Four machines, all on mainnet parameters:
 //!
-//! - `bitcoin_headers_match_the_spec` checks R2–R3, C1–C6 and R4–R7 over a
+//! - `bitcoin_headers_match_the_spec` checks E1–E2, V1–V6 and E3–E5 over a
 //!   delivery universe with a trunk, a competing fork, a fork of a fork, a
 //!   bad-PoW header, a stale-timestamp header, an out-of-range target header,
 //!   duplicates and empty batches.
-//! - `finality_and_fork_gate_matches_the_spec` checks R8–R10 on a long trunk
+//! - `finality_and_fork_gate_matches_the_spec` checks E3 and E6 on a long trunk
 //!   delivered in runs, at the production depth, including light forks
 //!   below/above the mark.
-//! - `difficulty_matches_the_spec` checks C5 with the mainnet expected-bits
+//! - `difficulty_matches_the_spec` checks V5 with the mainnet expected-bits
 //!   rule.
-//! - `future_time_matches_the_spec` checks C7 against the caller clock.
+//! - `future_time_matches_the_spec` checks V7 against the caller clock.
 //!
-//! A plain test, `store_identity_matches_the_spec`, checks R1 at open.
+//! A plain test, `store_identity_matches_the_spec`, checks O1 at open.
 //!
 //! The synthetic chain seeds a recent mainnet height and relaxes the
 //! proof-of-work limit, so it mines in no time. The mainnet estimated-work
@@ -69,39 +69,35 @@ fn mainnet_params() -> Params {
     params
 }
 
-/// Mainnet parameters for the delivery machine.
-///
-/// Minimum-difficulty blocks are allowed to skip C5. With the expected-bits
-/// rule on, C5 rejects an out-of-range target before C6 can see it, so the
-/// `BadTarget` transition would be unreachable. C5 has its own machine.
-fn delivery_params() -> Params {
-    let mut params = mainnet_params();
-    params.allow_min_difficulty_blocks = true;
-    params
-}
-
 /// An in-memory mainnet core for the specs.
 ///
 /// It keeps the mainnet consensus rules and disables only the estimated-work
 /// finality requirement, which a synthetic chain cannot clear. `anchor` is the
 /// seed the machine starts from; production code cannot replace the embedded
-/// spine.
-fn synthetic_mainnet_core(params: Params, anchor: &[(u64, BitcoinHeader)]) -> Core {
-    Core::new(
-        Config::in_memory(Network::Bitcoin)
-            .with_params(params)
-            .without_partition_safety()
-            .with_anchor(anchor),
-    )
-    .expect("in-memory store")
+/// spine. `check_difficulty` is false for the delivery machine: with V5 on, an
+/// out-of-range target fails before V6 can see it, so the `BadTarget`
+/// transition would be unreachable. V5 has its own machine.
+fn synthetic_mainnet_core(
+    params: Params,
+    anchor: &[(u64, BitcoinHeader)],
+    check_difficulty: bool,
+) -> Core {
+    let mut config = Config::in_memory(Network::Bitcoin)
+        .with_params(params)
+        .without_partition_safety()
+        .with_anchor(anchor);
+    if !check_difficulty {
+        config = config.without_difficulty_check();
+    }
+    Core::new(config).expect("in-memory store")
 }
 
 fn mainnet_core(anchor: &[(u64, BitcoinHeader)]) -> Core {
-    synthetic_mainnet_core(mainnet_params(), anchor)
+    synthetic_mainnet_core(mainnet_params(), anchor, true)
 }
 
 fn delivery_core(anchor: &[(u64, BitcoinHeader)]) -> Core {
-    synthetic_mainnet_core(delivery_params(), anchor)
+    synthetic_mainnet_core(mainnet_params(), anchor, false)
 }
 
 fn mine(prev: BlockHash, time: u32, tag: u32) -> BitcoinHeader {
@@ -246,15 +242,15 @@ fn header_universe() -> HeaderUniverse {
 
     // Q12: linked to A11 (index 10) but its timestamp equals the median of the
     // previous eleven headers (index 20). The full window makes MTP apply, and
-    // equality is the C4 boundary.
+    // equality is the V4 boundary.
     let q12 = mine(headers[10].block_hash(), SEED_TIME + 6, 77);
     headers.push(q12);
     kinds.push(HeaderKind::BadTime);
 
-    // T2: a valid hash at a target above the relaxed mainnet proof-of-work
+    // X2: a valid hash at a target above the relaxed mainnet proof-of-work
     // limit (index 21).
-    let t2 = mine_with_bits(a1.block_hash(), SEED_TIME + 2, 88, 0x2100_ffff);
-    headers.push(t2);
+    let x2 = mine_with_bits(a1.block_hash(), SEED_TIME + 2, 88, 0x2100_ffff);
+    headers.push(x2);
     kinds.push(HeaderKind::BadTarget);
 
     let mut batches = Vec::new();
@@ -275,7 +271,7 @@ fn header_universe() -> HeaderUniverse {
     }
     batches.push(vec![0, 2]); // A1 then A3: link break
     batches.push(vec![0, 19]); // A1 then P4: bad PoW
-    batches.push(vec![0, 21]); // A1 then T2: target above the pow limit
+    batches.push(vec![0, 21]); // A1 then X2: target above the pow limit
     batches.push(vec![0, 0]); // duplicate inside one batch
     batches.push(Vec::new()); // empty batch
 
@@ -332,7 +328,7 @@ fn predict(
         return (HeaderPrediction::Noop, Vec::new());
     };
 
-    // C1: the parent of the first new header must be stored.
+    // V1: the parent of the first new header must be stored.
     let parent_known = if start == 0 {
         stored.contains(&headers[0].prev_blockhash)
     } else {
@@ -348,15 +344,15 @@ fn predict(
         headers[start - 1].block_hash()
     };
     for (offset, header) in headers[start..].iter().enumerate() {
-        // C2: the run must link, and the first new header must link to the
+        // V2: the run must link, and the first new header must link to the
         // batch's parent (the previous element when a prefix was skipped).
         if header.prev_blockhash != prev {
             return (HeaderPrediction::LinkBreak, Vec::new());
         }
-        // C4: with eleven ancestors available, the timestamp must beat their
+        // V4: with eleven ancestors available, the timestamp must beat their
         // median. Q12 is positioned so that its parent implies the full window.
-        // C6: the target must be in range and at or below the pow limit.
-        // C3: the header must satisfy its own target.
+        // V6: the target must be in range and at or below the pow limit.
+        // V3: the header must satisfy its own target.
         match universe.kinds[batch[start + offset]] {
             HeaderKind::Valid => {}
             HeaderKind::BadPow => return (HeaderPrediction::BadPow, Vec::new()),
@@ -445,8 +441,8 @@ impl StateMachineTest for HeaderMachine {
         });
         let after = sut.core.state().expect("state");
 
-        // R7: a best-fork change must be a strict improvement; equal work never
-        // promotes the challenger. The mark-crossing half of R7 is out of
+        // E5: a best-fork change must be a strict improvement; equal work never
+        // promotes the challenger. The mark-crossing half of E5 is out of
         // reach here because the mark stays at the seed height.
         if let (Some(old), Some(new)) = (before.best_fork, after.best_fork)
             && old != new
@@ -467,9 +463,9 @@ impl StateMachineTest for HeaderMachine {
             );
         }
 
-        // R2: an error leaves the store untouched, checked below.
+        // E1: an error leaves the store untouched, checked below.
         match (&model.last, &outcome) {
-            // R3: an all-stored batch is a no-op.
+            // E2: an all-stored batch is a no-op.
             (HeaderPrediction::Noop, Ok(Outcome::Connected(result))) => {
                 assert_eq!(result.connected, 0, "model expected a no-op");
                 assert_eq!(before, after, "a no-op changed the store");
@@ -517,7 +513,7 @@ impl StateMachineTest for HeaderMachine {
     fn check_invariants(sut: &HeaderSut, model: &HeaderModel) {
         let state = sut.core.state().expect("state");
 
-        // R4: every stored row, blocked forks included.
+        // E4: every stored row, blocked forks included.
         let stored: HashSet<BlockHash> = sut
             .core
             .stored_headers()
@@ -526,7 +522,7 @@ impl StateMachineTest for HeaderMachine {
             .collect();
         assert_eq!(stored, model.stored, "the stored header set diverged");
 
-        // R5: the canonical chain is linked and agrees with the best fork.
+        // S3: the canonical chain is the best fork's chain.
         let best = state.best_fork.expect("seeded store has a best fork");
         let best_fork = state
             .forks
@@ -569,7 +565,7 @@ impl StateMachineTest for HeaderMachine {
             Some(best_fork.tip_height)
         );
 
-        // R6: no fork can be blocked by the mark here (depth 100, tip at most
+        // E3: no fork can be blocked by the mark here (depth 100, tip at most
         // 12), so the best fork must carry the maximum work. Ties are
         // allowed to stay with the incumbent; `apply` checks that a *switch*
         // only ever goes to a strictly heavier fork.
@@ -579,7 +575,7 @@ impl StateMachineTest for HeaderMachine {
             assert!(fork_work <= best_work, "the best fork is not the heaviest");
         }
 
-        // R8: every height at or below the mark still has the block it had.
+        // E6: every height at or below the mark still has the block it had.
         let mark = state.finalized.expect("seeded store has a mark");
         assert!(mark <= best_fork.tip_height);
         assert_eq!(sut.finalized_prefix.len() as u64, mark - SEED_HEIGHT + 1);
@@ -769,7 +765,7 @@ impl ReferenceStateMachine for FinalityMachine {
                 if state.stored.contains(&fork.block_hash()) {
                     state.last = FinalityPrediction::Noop;
                 } else {
-                    // R10: a fork at or below the mark is refused. A fork above
+                    // E3: a fork at or below the mark is refused. A fork above
                     // the mark is stored, but it can only tie the trunk here.
                     let forkpoint = SEED_HEIGHT + *index as u64 + 2;
                     if forkpoint <= state.mark {
@@ -788,7 +784,7 @@ impl ReferenceStateMachine for FinalityMachine {
     }
 }
 
-/// R8/R9: the mark follows the tip at the production depth.
+/// E6: the mark follows the tip at the production depth.
 ///
 /// The specs disable the mainnet partition-safety requirement. The remaining
 /// requirement is the tip block's own work, which the tip always carries above
@@ -840,7 +836,7 @@ impl StateMachineTest for FinalityMachine {
             .apply(Action::ConnectHeaders { headers, now: None });
         let after = sut.core.state().expect("state");
 
-        // R9: `ConnectOutcome::finalized` reports exactly the mark movement the
+        // E6: `ConnectOutcome::finalized` reports exactly the mark movement the
         // model predicted.
         match (&model.last, &outcome) {
             (FinalityPrediction::Noop, Ok(Outcome::Connected(result))) => {
@@ -915,7 +911,7 @@ impl StateMachineTest for FinalityMachine {
 
     fn check_invariants(sut: &FinalitySut, model: &FinalityModel) {
         let state = sut.core.state().expect("state");
-        // R8/R9: the mark is the model's mark and sits exactly at the depth.
+        // E6: the mark is the model's mark and sits exactly at the depth.
         assert_eq!(state.finalized, Some(model.mark));
         assert_eq!(state.best_fork, Some(0));
         assert_eq!(sut.core.tip_height().expect("read"), Some(model.tip));
@@ -928,7 +924,7 @@ impl StateMachineTest for FinalityMachine {
             "the mark is not tip - depth"
         );
 
-        // R4 (shared): the stored set includes the branches.
+        // E4 (shared): the stored set includes the branches.
         let stored: HashSet<BlockHash> = sut
             .core
             .stored_headers()
@@ -945,7 +941,7 @@ impl StateMachineTest for FinalityMachine {
             "a stored branch must have its own fork"
         );
 
-        // R5 (shared): the best chain still links through the trunk.
+        // S3 (shared): the best chain still links through the trunk.
         let chain = canonical_chain(&sut.core);
         assert_eq!(chain.len() as u64, trunk);
         assert_eq!(chain[0].block_hash(), model.universe.genesis.block_hash());
@@ -984,8 +980,8 @@ struct DifficultyUniverse {
 fn difficulty_universe() -> DifficultyUniverse {
     let genesis = mine(BlockHash::all_zeros(), SEED_TIME, 0);
     let good = mine(genesis.block_hash(), SEED_TIME + 1, 0);
-    // A valid header at a slightly different target. C5 rejects it for the bits,
-    // before C6 or PoW.
+    // A valid header at a slightly different target. V5 rejects it for the bits,
+    // before V6 or PoW.
     let wrong = mine_with_bits(genesis.block_hash(), SEED_TIME + 1, 1, EASY_BITS - 1);
     DifficultyUniverse {
         genesis,
@@ -1054,7 +1050,7 @@ impl ReferenceStateMachine for DifficultyMachine {
                 state.last = if state.stored.contains(&state.universe.wrong.block_hash()) {
                     DifficultyPrediction::Noop
                 } else {
-                    // C5: mainnet enforces the retarget schedule. Off a period
+                    // V5: mainnet enforces the retarget schedule. Off a period
                     // boundary, the child must carry the parent's bits.
                     DifficultyPrediction::BadDifficulty
                 };
@@ -1224,7 +1220,7 @@ impl ReferenceStateMachine for FutureMachine {
                 state.last = if state.stored.contains(&state.universe.future.block_hash()) {
                     FuturePrediction::Noop
                 } else {
-                    // C7: the timestamp is more than two hours after `now`.
+                    // V7: the timestamp is more than two hours after `now`.
                     FuturePrediction::TimestampTooNew
                 };
             }
@@ -1310,7 +1306,7 @@ impl StateMachineTest for FutureMachine {
 
 // ── the runnable specs ───────────────────────────────────────────────────────
 
-/// R1: an open with a stored chain refuses another network or another seed,
+/// O1: an open with a stored chain refuses another network or another seed,
 /// and adds no checkpoint.
 #[test]
 fn store_identity_matches_the_spec() {
@@ -1349,7 +1345,7 @@ prop_state_machine! {
         .. ProptestConfig::default()
     })]
 
-    /// R2–R3, C1–C6, R4–R7: acceptance, storage and fork choice on the delivery universe.
+    /// E1–E2, V1–V6, E3–E5: acceptance, storage and fork choice on the delivery universe.
     #[test]
     fn bitcoin_headers_match_the_spec(sequential 1..32 => HeaderMachine);
 }
@@ -1360,7 +1356,7 @@ prop_state_machine! {
         .. ProptestConfig::default()
     })]
 
-    /// R8–R10: mark safety/advancement and the fork gate on a trunk.
+    /// E3 and E6: the fork gate and the mark on a trunk.
     #[test]
     fn finality_and_fork_gate_matches_the_spec(sequential 1..64 => FinalityMachine);
 }
@@ -1371,7 +1367,7 @@ prop_state_machine! {
         .. ProptestConfig::default()
     })]
 
-    /// C5: on mainnet a child must carry the parent's expected bits.
+    /// V5: on mainnet a child must carry the parent's expected bits.
     #[test]
     fn difficulty_matches_the_spec(sequential 1..8 => DifficultyMachine);
 }
@@ -1382,7 +1378,7 @@ prop_state_machine! {
         .. ProptestConfig::default()
     })]
 
-    /// C7: a header more than two hours ahead of `now` is rejected.
+    /// V7: a header more than two hours ahead of `now` is rejected.
     #[test]
     fn future_time_matches_the_spec(sequential 1..8 => FutureMachine);
 }

@@ -7,8 +7,9 @@ This document describes the Bitcoin header state machine seeded at open and
 exposed by `Core::apply(Action::ConnectHeaders { headers, now })`. The Rust
 comments use the same clause IDs.
 
-Design rules use `R*`. Bitcoin header checks use `C*`. Some `C*` clauses contain
-local policy; those parts are marked **Local**.
+Opening rules use `O*`. Validation checks use `V*`. State transition rules use
+`E*`. Some `V*` clauses contain local policy; those parts are marked
+**Local**.
 
 ## Scope
 
@@ -34,9 +35,9 @@ The machine is configured once, at open, with:
 
 - **Network.** The Bitcoin consensus parameters.
 - **Partition safety.** Whether the mainnet network-partition safety rule runs.
-  The default is on; a test disables it (R9).
+  The default is on; a test disables it (E6).
 - **Seed.** Trusted headers at difficulty-period boundaries. The crate fixes it:
-  the embedded spine on mainnet, genesis elsewhere, replaced in tests (R1).
+  the embedded spine on mainnet, genesis elsewhere, replaced in tests (O1).
 
 ## 2. State
 
@@ -47,7 +48,8 @@ The state machine tracks:
 - **S2 — forks.** Fork `0` is the seed chain. Every other fork has a
   `forkpoint`, the height of its first header, and a contiguous run of headers
   from that height. A fork's cumulative work is the work stored on its chain.
-- **S3 — best fork.** The fork that R6 and R7 select.
+- **S3 — best fork.** The fork that E5 selects. Its chain is the canonical
+  chain.
 - **S4 — finality mark.** The newest height treated as un-reorgable.
 - **S5 — clock high-water mark.** The greatest finality clock seen.
 
@@ -56,64 +58,52 @@ The state machine tracks:
 **A1 — connect a batch.** One action delivers:
 
 - **Headers.** A run that the caller claims is contiguous.
-- **`now`.** The caller's clock, or none. C7 uses it when supplied and is
-  skipped when it is not. Network-partition safety uses the clock floor (R11):
-  the greatest of the supplied value, the stored high-water mark (S5) and the
-  chain time at the best tip — the median of its last 11 header times, or the
-  tip's own time when those are not all stored — so a missing clock measures
-  finality from the chain's own time and a stale one cannot reduce the
-  requirement. Within a batch, the finality mark moves only if that batch
-  stores a new header; a later `now` alone never advances it.
-
-The batch may extend a fork, start a new fork or repeat a leading run of stored
-headers. A repeated prefix is skipped; the next header must name the last prefix
-header as its parent. A repeat after a new header is not a no-op; it is a link
-error.
+- **`now`.** The caller's clock, or none. It lets the machine judge header
+  timestamps and measure finality without an internal clock (V7, E7).
 
 ## 4. Requirements
 
-### Opening (designed here)
+### Opening
 
-**R1 — store identity.** An open with no stored chain plants the configured
-seed and records the network. An open with a stored chain must find the same
-network (`NetworkMismatch`) and the same header at every height where the store
-and the seed both have a checkpoint (`AnchorMismatch`). Opening adds no
-checkpoint to an existing store.
+**O1 — store identity.** Opening an empty store plants the configured seed,
+records the network, and sets the mark to the newest seed height. Opening an
+existing store must agree with the configuration on the network and on every
+checkpoint both hold, or the open fails. It adds no checkpoint.
 
-### Bitcoin header rules (external)
+### Validation
 
-**C1 — parent.** A new header must name a stored parent. If its parent is not
-stored, the action fails with `UnknownAncestor`. Bitcoin Core calls this
-`prev-blk-not-found`. Bitcoin Core does not keep invalid previous headers, so
-`bad-prevblk` cannot arise.
+**V1 — parent.** After the skipped prefix (E2), the first new header must name
+a stored parent. If its parent is not stored, the action fails with
+`UnknownAncestor`. Bitcoin Core calls this `prev-blk-not-found`. Bitcoin Core
+does not keep invalid previous headers, so `bad-prevblk` cannot arise.
 
-**C2 — linkage.** From the first new header, each header must name the previous
+**V2 — linkage.** From the first new header, each header must name the previous
 header as its parent. A mismatch fails with `LinkBreak`.
 
-**C3 — proof of work.** Each new header must meet its own target. Failure gives
+**V3 — proof of work.** Each new header must meet its own target. Failure gives
 `BadPow`. Bitcoin Core calls this `high-hash`.
 
-**C4 — median-time-past.** Bitcoin requires the timestamp to be greater than the
+**V4 — median-time-past.** Bitcoin requires the timestamp to be greater than the
 median of the previous **up to** 11 block times. Failure gives `BadTimestamp`
 (Bitcoin Core `time-too-old`).
 
 **Local:** the check applies only when all 11 previous headers are stored. If one
 is missing, or the header is in the first 11 heights, the check is skipped.
 
-**C5 — expected difficulty.** On a network that enforces the retarget schedule,
-the header bits must equal the expected target. Inside a period, the expected
-bits are the parent bits. At a period boundary, the retarget calculation gives
-the expected bits. Failure gives `BadDifficulty` (Bitcoin Core `bad-diffbits`).
+**V5 — expected difficulty.** The header bits must equal the expected target.
+Inside a period they are the parent's. At a period boundary the retarget
+recomputes them; testnet4 starts from the period-start bits (BIP94), every other
+network from the parent's, and regtest keeps the parent's. On a network that
+permits minimum-difficulty blocks, a header more than twice the target spacing
+after its parent must carry the proof-of-work limit; any other header there
+expects the last non-minimum-difficulty bits of the period. Failure gives
+`BadDifficulty` (Bitcoin Core `bad-diffbits`).
 
-**Local:** the check is skipped when the period-start header is not stored. It is
-also skipped on testnet, testnet4 and regtest. Those networks permit
-minimum-difficulty blocks.
-
-**C6 — target range.** Bitcoin rejects a target that is negative, overflowing,
+**V6 — target range.** Bitcoin rejects a target that is negative, overflowing,
 zero or above the network proof-of-work limit. The same range check runs before
 proof of work. A failure gives `BadPow` with `target out of range`.
 
-**C7 — future time.** Bitcoin rejects a header whose timestamp is more than two
+**V7 — future time.** Bitcoin rejects a header whose timestamp is more than two
 hours after the current time. The failure is `TimestampTooNew` (Bitcoin Core
 `time-too-new`).
 
@@ -131,63 +121,40 @@ Known Bitcoin header checks that are not performed:
 | Version rules | Height-activated and no SPV value. |
 | Bitcoin Core checkpoint mismatch | Trust comes from the seeded spine. The name refers to older Bitcoin Core. |
 | Block-body checks | Not header fields. |
-| MTP when fewer than 11 headers are stored | Local skip. See C4. |
-| Boundary difficulty when the period start is missing | Local skip. See C5. |
+| MTP when fewer than 11 headers are stored | Local skip. See V4. |
 
-### Interface and storage (designed here)
+### State transition
 
-**R2 — atomicity.** If the action returns an error, the state is unchanged.
+**E1 — rejected action.** If the action fails, the state does not change.
 
-**R3 — idempotence.** If every header in the batch is already stored, the action
+**E2 — repeated prefix.** The action skips a leading run of stored headers and
+starts at the first header not yet stored. If every header is stored, the action
 succeeds, reports no connected header, and changes nothing.
 
-**R4 — storage exactness.** The stored set is exactly the seed entries applied
-when the store was created plus every header from every accepted batch. A still
-longer configured seed on a later open adds nothing (R1). A losing header
-remains stored and readable.
+**E3 — forks.** The target fork is the fork that holds the first new header's
+parent. The action extends it when the parent is its tip, and otherwise starts a
+new fork at the next height. A new fork's first height must be above the
+finality mark, or the action fails.
 
-**R5 — canonical chain.** For a chain with no gaps in stored headers, the
-canonical chain starts at the seed header, links continuously and ends at the
-best fork tip. A read of a canonical height with no stored header reports an
-error; a sparse production seed has such gaps.
+**E4 — stored headers.** The action stores each header after the skipped prefix
+at its height on the target fork. It stores nothing else and removes no header,
+so a losing fork's headers stay stored.
 
-**R6 — fork choice by work.** The best fork carries the maximum cumulative work
-among the forks that R7 permits to win. Height alone does not decide.
+**E5 — best fork.** The best fork is the one with the most cumulative work
+among the forks that carry the mark's block. A batch changes it only to a
+strictly heavier fork; equal work keeps the incumbent.
 
-**R7 — switching.** A fork becomes best only if two conditions hold:
+**E6 — finality mark.** The mark never regresses and never exceeds `tip - 100`.
+With the seed chain best, it moves to `tip - 100` when that is greater and the
+work above the mark clears the requirement. Mainnet takes the requirement from
+the estimated work since the mark, floored at a coinbase-maturity window; every
+other network takes it from the work of the tip block, so depth alone gates
+those networks. With partition safety disabled, every network uses the tip-work
+rule. This switch is test-only.
 
-1. it is strictly heavier than the old best, and
-2. it carries the same block as fork `0` at the mark.
-
-The second condition keeps a heavier fork stored when that fork diverges below
-the mark. Equal work keeps the incumbent.
-
-### Finality (designed here)
-
-**R8 — mark safety.** After seeding, the mark never regresses, never exceeds
-`tip - 100`, and every height at or below it keeps the block it had when it was
-finalized. Seeding itself sets the mark to the newest seed height.
-
-**R9 — mark advancement.** With the seed chain best, if the work above the mark
-clears the requirement (`have >= need`), the mark advances to `tip - 100` when
-that is greater than the current mark. Mainnet takes `need` from the estimated
-work since the mark, floored at a coinbase-maturity window; every other network
-takes it from the work of the tip block, which the tip always carries, so on
-those networks the depth is the only gate. With partition safety disabled,
-every network uses the tip-work rule. This switch is test-only; a production
-mainnet node keeps it on.
-
-**R10 — fork gate.** A fork is created only when its forkpoint is above the
-finality mark. At or below the mark the action fails with
-`ForkBelowFinalized` and changes nothing. Above the mark, R4 and R7 apply.
-
-**R11 — clock floor.** The requirement's clock is the greatest of three values:
-the supplied `now`, if any; the stored high-water mark; and the chain time at
-the best tip. The chain time is the median of the last 11 header times,
-including the tip (Bitcoin Core's `GetMedianTimePast`), so one miner's
-timestamp cannot move it. It falls back to the tip's own header time when the
-11-header window is not stored: a sparse seed, or a chain shorter than the
-window. C7 is not affected: it runs on the supplied value alone. Every batch
-that stores a new header raises the high-water mark to the requirement's clock
-when that is greater, whether or not the finality mark moves. A batch that
-stores no new header leaves it unchanged, so a poll cannot raise the floor.
+**E7 — clock.** The requirement's clock is the greatest of the supplied `now`
+(if any), the stored high-water mark, and the chain time at the best tip: the
+median of the last 11 header times, or the tip's own time when that window is
+not stored. V7 uses only the supplied value. A batch that stores a new header
+raises the high-water mark to this clock when greater; a batch that stores none
+leaves it unchanged.

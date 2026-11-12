@@ -37,10 +37,10 @@
 
 use bitcoin::block::BlockHash;
 use bitcoin::block::Header as BitcoinHeader;
-use bitcoin::consensus::Encodable;
+use bitcoin::consensus::{Encodable, Params};
 use bitcoin::hashes::Hash;
 use bitcoin::merkle_tree::MerkleBlock;
-use bitcoin::pow::Work;
+use bitcoin::pow::{CompactTarget, Work};
 use bitcoin::transaction::Transaction;
 
 use crate::Core;
@@ -748,7 +748,7 @@ impl Core {
         // for the new run. Earlier headers of this batch are visible to later
         // ones, so a long run validates itself.
         let params = &self.config.params;
-        let enforce_difficulty = validation::enforces_difficulty(params);
+        let check_difficulty = self.config.difficulty_check;
         let new_headers = &headers[start..];
         // Header at `height` on the chain being extended: a header already
         // accepted in this batch, or a stored ancestor (walking to ancestor
@@ -772,17 +772,30 @@ impl Core {
                 });
             }
 
-            if enforce_difficulty {
+            if check_difficulty {
                 let parent_header = at(height - 1)?
                     .ok_or_else(|| Error::Internal(format!("missing parent at {height}")))?;
                 let period_start = match height.checked_sub(DIFFICULTY_PERIOD) {
                     Some(h) => at(h)?,
                     None => None,
                 };
-                if let Some(expected) =
-                    validation::expected_bits(height, &parent_header, period_start.as_ref(), params)
-                    && header.bits != expected
+                let last_normal_bits = if params.allow_min_difficulty_blocks
+                    && !height.is_multiple_of(DIFFICULTY_PERIOD)
                 {
+                    last_normal_bits(&at, height, &parent_header, params)?
+                } else {
+                    parent_header.bits
+                };
+                let expected = validation::expected_bits(
+                    height,
+                    header.time,
+                    &parent_header,
+                    period_start.as_ref(),
+                    last_normal_bits,
+                    params,
+                )
+                .ok_or_else(|| Error::Internal(format!("missing period start at {height}")))?;
+                if header.bits != expected {
                     return Err(Error::BadDifficulty {
                         height,
                         expected: expected.to_consensus(),
@@ -1241,6 +1254,30 @@ fn is_canonical_at(txn: &ReadTxn, fork: u64, height: u64) -> Result<bool, Error>
 
 // ── validation helpers ──────────────────────────────────────────────────────
 
+/// The bits of the last block in the current period that does not carry the
+/// proof-of-work limit.
+///
+/// Testnet lets a minimum-difficulty block follow a long gap, and the next
+/// normal block must carry the last normal bits, not the minimum-difficulty
+/// ones. This is Core's walk back from the parent to the period start.
+fn last_normal_bits(
+    at: &impl Fn(u64) -> Result<Option<BitcoinHeader>, Error>,
+    height: u64,
+    parent: &BitcoinHeader,
+    params: &Params,
+) -> Result<CompactTarget, Error> {
+    let pow_limit = params.max_attainable_target.to_compact_lossy();
+    let mut h = height - 1;
+    let mut bits = parent.bits;
+    while !h.is_multiple_of(DIFFICULTY_PERIOD) && bits == pow_limit {
+        h -= 1;
+        bits = at(h)?
+            .ok_or_else(|| Error::Internal(format!("missing ancestor at {h}")))?
+            .bits;
+    }
+    Ok(bits)
+}
+
 /// The median-time-past the header at `height` must exceed: the median of the
 /// previous [`validation::MEDIAN_TIME_PAST`] timestamps. Returns `None` when
 /// any of them is unavailable (e.g. just above a checkpoint that stores only
@@ -1260,6 +1297,57 @@ fn median_time_past_at(
         }
     }
     Ok(Some(validation::median_time_past(times)))
+}
+
+#[cfg(test)]
+mod last_normal_bits_tests {
+    use super::*;
+    use bitcoin::Network;
+    use std::collections::HashMap;
+
+    fn header(time: u32, bits: u32) -> BitcoinHeader {
+        use bitcoin::block::Version;
+        use bitcoin::hashes::Hash;
+        BitcoinHeader {
+            version: Version::ONE,
+            prev_blockhash: BlockHash::all_zeros(),
+            merkle_root: Hash::all_zeros(),
+            time,
+            bits: CompactTarget::from_consensus(bits),
+            nonce: 0,
+        }
+    }
+
+    #[test]
+    fn walks_back_to_the_last_non_minimum_difficulty_block() -> Result<(), Error> {
+        let params = Params::new(Network::Regtest);
+        let mut stored = HashMap::new();
+        stored.insert(2016, header(0, 0x207f_ffff));
+        stored.insert(2017, header(1, 0x1d00_ffff)); // last normal block
+        stored.insert(2018, header(2, 0x207f_ffff));
+        stored.insert(2019, header(3, 0x207f_ffff));
+        let at = |h: u64| Ok(stored.get(&h).copied());
+        assert_eq!(
+            last_normal_bits(&at, 2020, &stored[&2019], &params)?,
+            CompactTarget::from_consensus(0x1d00_ffff)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stops_at_the_period_start() -> Result<(), Error> {
+        let params = Params::new(Network::Regtest);
+        let mut stored = HashMap::new();
+        for h in 2016..=2019 {
+            stored.insert(h, header(h as u32, 0x207f_ffff));
+        }
+        let at = |h: u64| Ok(stored.get(&h).copied());
+        assert_eq!(
+            last_normal_bits(&at, 2020, &stored[&2019], &params)?,
+            CompactTarget::from_consensus(0x207f_ffff)
+        );
+        Ok(())
+    }
 }
 
 // ── proof-of-work helper ────────────────────────────────────────────────────
@@ -1511,6 +1599,17 @@ mod tests {
         Core::new(crate::Config::in_memory(network).with_anchor(entries)).expect("in-memory store")
     }
 
+    /// The same, with the expected-bits check off. Fixtures that vary the
+    /// target (to exercise work arithmetic or a bad-PoW header) use this.
+    fn anchored_unchecked(network: Network, entries: &[(u64, BitcoinHeader)]) -> Core {
+        Core::new(
+            crate::Config::in_memory(network)
+                .without_difficulty_check()
+                .with_anchor(entries),
+        )
+        .expect("in-memory store")
+    }
+
     /// A fresh in-memory regtest chain seeded with a synthetic checkpoint at 0.
     ///
     /// Regtest permits minimum-difficulty blocks, so (like Electrum) the
@@ -1590,7 +1689,10 @@ mod tests {
     fn rejects_bad_pow() -> eyre::Result<()> {
         let chain = seeded();
         let mut bad = easy_chain(&canonical(&chain, 0), 1, 1);
-        bad[0].bits = CompactTarget::from_consensus(0x1d00_ffff);
+        // Keep the expected bits and break only the proof of work.
+        while bad[0].validate_pow(bad[0].target()).is_ok() {
+            bad[0].nonce = bad[0].nonce.wrapping_add(1);
+        }
         let err = chain.connect_headers(&bad, NOW).unwrap_err();
         assert!(matches!(err, Error::BadPow { .. }), "got {err:?}");
         Ok(())
@@ -1679,7 +1781,10 @@ mod tests {
         // Fork from height 3 (parent = main[2], not the tip), second header
         // with bad PoW (a much harder target than it was mined for).
         let mut fork = easy_chain(&main[2], 2, 1000);
-        fork[1].bits = CompactTarget::from_consensus(0x1d00_ffff);
+        // Keep the expected bits and break only the proof of work.
+        while fork[1].validate_pow(fork[1].target()).is_ok() {
+            fork[1].nonce = fork[1].nonce.wrapping_add(1);
+        }
         let err = chain.connect_headers(&fork, NOW).unwrap_err();
         assert!(matches!(err, Error::BadPow { .. }), "got {err:?}");
 
@@ -1916,7 +2021,7 @@ mod tests {
         genesis
             .validate_pow(genesis.target())
             .expect("real genesis PoW");
-        let chain = anchored(Network::Regtest, &[(0, genesis)]);
+        let chain = anchored_unchecked(Network::Regtest, &[(0, genesis)]);
         assert_eq!(
             chain.header_at(0)?.unwrap().block_hash(),
             genesis.block_hash()
@@ -2452,6 +2557,45 @@ mod tests {
 
     // ── btc tail work tests ─────────────────────────────────────────────────
 
+    /// Regtest no longer skips the expected-bits check: a header that changes
+    /// the target inside a period is refused.
+    #[test]
+    fn regtest_rejects_a_difficulty_change() -> eyre::Result<()> {
+        let chain = seeded();
+        let mut bad = easy_chain(&canonical(&chain, 0), 1, 1);
+        bad[0].bits = CompactTarget::from_consensus(0x1d00_ffff);
+        let err = chain.connect_headers(&bad, NOW).unwrap_err();
+        assert!(
+            matches!(err, Error::BadDifficulty { height: 1, .. }),
+            "got {err:?}"
+        );
+        Ok(())
+    }
+
+    /// Testnet walks back over a minimum-difficulty block: after a gap, the next
+    /// normal header carries the last normal bits, not the minimum ones.
+    #[test]
+    fn testnet_walks_back_over_a_minimum_difficulty_block() -> eyre::Result<()> {
+        let mut params = Params::new(Network::Testnet);
+        params.max_attainable_target =
+            bitcoin::pow::Target::from_compact(CompactTarget::from_consensus(EASY_BITS));
+        let seed = mine_at(BlockHash::all_zeros(), BASE_TIME, 0x207f_fffe);
+        let chain = Core::new(
+            crate::Config::in_memory(Network::Testnet)
+                .with_params(params)
+                .with_anchor(&[(DIFFICULTY_PERIOD, seed)]),
+        )?;
+
+        // A gap lets a minimum-difficulty block through.
+        let min = mine_at(seed.block_hash(), seed.time + 2 * 600 + 1, EASY_BITS);
+        assert_eq!(chain.connect_headers(&[min], NOW)?.connected, 1);
+
+        // Without a gap, the next header carries the last normal bits.
+        let normal = mine_at(min.block_hash(), min.time + 1, 0x207f_fffe);
+        assert_eq!(chain.connect_headers(&[normal], NOW)?.connected, 1);
+        Ok(())
+    }
+
     /// The work is computed on the fly for the given tail start; not seeded,
     /// there is nothing to compute.
     #[test]
@@ -2500,7 +2644,7 @@ mod tests {
     /// after the boundary, it is 2016 * 20, below the preceding ~2015 * 22.
     #[test]
     fn btc_tail_work_uses_the_period_after_the_start() -> eyre::Result<()> {
-        let chain = seeded();
+        let chain = anchored_unchecked(Network::Regtest, &[(0, mine_genesis(0))]);
         let period = DIFFICULTY_PERIOD as usize;
 
         // Genesis has easy-target work. Period 0 blocks use work 22.

@@ -560,6 +560,12 @@ impl WriteTxn {
                 )));
             }
         }
+        if !sorted[0].0.is_multiple_of(DIFFICULTY_PERIOD) {
+            return Err(Error::Internal(format!(
+                "the seed must start at a difficulty-period boundary, got {}",
+                sorted[0].0
+            )));
+        }
 
         let mut headers = self.txn.open_table(BTC_HEADERS)?;
         let mut hash_loc = self.txn.open_table(BTC_HASH_LOC)?;
