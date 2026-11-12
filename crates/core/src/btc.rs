@@ -225,7 +225,7 @@ impl Core {
     ) -> Result<(), Error> {
         let txn = self.store.write()?;
         txn.seed_checkpoints(entries)?;
-        txn.set_network(self.params.network)?;
+        txn.set_network(self.config.params.network)?;
         txn.commit()
     }
 
@@ -283,13 +283,14 @@ impl Core {
     /// Network-partition safety as the rule sees it right now: the mark it is measured
     /// from, the estimated work it demands, and what the best chain carries
     /// above the mark. A read-only view of the decision the connect path makes,
-    /// for status output.
+    /// for status output. A core with partition safety disabled reports the
+    /// tip-work requirement instead.
     pub fn finality_status(&self, now: u64) -> Result<Option<FinalityStatus>, Error> {
         let txn = self.store.read()?;
         // Report the same requirement the decision would use: the caller's value floored
         // by the high-water mark and the best tip's time.
         let now = effective_clock(&txn, Some(now), txn.now_hwm()?)?;
-        Ok(measure_finality(&txn, now)?.map(|m| m.status))
+        Ok(measure_finality(&txn, now, self.config.partition_safety)?.map(|m| m.status))
     }
 
     /// Move the finality mark forward to the newest **shipped** checkpoint the
@@ -636,11 +637,11 @@ impl Core {
         // The store records the network it was seeded for; refuse to validate
         // real headers against the wrong consensus parameters.
         if let Some(seeded) = txn.network()?
-            && seeded != self.params.network
+            && seeded != self.config.params.network
         {
             return Err(Error::NetworkMismatch {
                 seeded,
-                opened: self.params.network,
+                opened: self.config.params.network,
             });
         }
 
@@ -716,7 +717,7 @@ impl Core {
         // Validate continuity, expected difficulty, median-time-past and PoW
         // for the new run. Earlier headers of this batch are visible to later
         // ones, so a long run validates itself.
-        let params = &self.params;
+        let params = &self.config.params;
         let enforce_difficulty = validation::enforces_difficulty(params);
         let new_headers = &headers[start..];
         // Header at `height` on the chain being extended: a header already
@@ -858,7 +859,7 @@ impl Core {
 
         // Advancing the finality mark is part of connecting headers: move it if
         // this batch carried enough work above the anchor to clear the requirement.
-        let finality = finalize_in_txn(&txn, now)?;
+        let finality = finalize_in_txn(&txn, now, self.config.partition_safety)?;
         if finality.advanced.is_some()
             && let Some(checkpoint) = txn
                 .finalized_height()?
@@ -900,12 +901,14 @@ impl Core {
     /// batch (reported in [`ConnectOutcome::finalized`]); you do not normally
     /// need to call it.
     ///
-    /// Only advances when the work above the mark clears
-    /// [`finality::partition_safety_required`] — the coinbase floor and the estimated
-    /// work the network did since the mark. The mark is also the anchor: each
-    /// advance re-anchors, so the next requirement is measured from a fresher point.
-    /// Cumulative work is known at every period boundary (the spine), so both
-    /// sides are plain differences of stored cumulative work.
+    /// Only advances when the work above the mark clears the requirement: on
+    /// mainnet the coinbase floor and the estimated work since the mark, and
+    /// on every other network the tip block's work. A core with partition
+    /// safety disabled uses the tip-work requirement on every network. The
+    /// mark is also the anchor: each advance re-anchors, so the next
+    /// requirement is measured from a fresher point. Cumulative work is known
+    /// at every period boundary (the spine), so both sides are plain
+    /// differences of stored cumulative work.
     ///
     /// Nothing advances while a fork is the best chain, since the spine
     /// (fork 0) is assumed canonical.
@@ -915,7 +918,7 @@ impl Core {
     #[cfg(test)]
     pub fn finalize_period(&self, now: u64) -> Result<Option<u64>, Error> {
         let txn = self.store.write()?;
-        match finalize_in_txn(&txn, Some(now))?.advanced {
+        match finalize_in_txn(&txn, Some(now), self.config.partition_safety)?.advanced {
             Some(height) => {
                 txn.commit()?;
                 Ok(Some(height))
@@ -947,7 +950,11 @@ impl Finality {
 
 /// The finality rule, applied through an open transaction. Factored out so
 /// `connect_headers` can run it inside the same transaction as the connect.
-fn finalize_in_txn(txn: &WriteTxn, now: Option<u64>) -> Result<Finality, Error> {
+fn finalize_in_txn(
+    txn: &WriteTxn,
+    now: Option<u64>,
+    partition_safety: bool,
+) -> Result<Finality, Error> {
     // The requirement's clock: the greatest of the caller's value (if it
     // supplied one), the stored high-water mark and the best tip's header time.
     // A caller with no clock therefore measures the requirement from the
@@ -964,7 +971,7 @@ fn finalize_in_txn(txn: &WriteTxn, now: Option<u64>) -> Result<Finality, Error> 
     // Only the spine's chain settles a boundary: a fork that is best has no
     // trusted history behind it, and moving the mark onto it is exactly the
     // capture the rule exists to prevent.
-    let Some(measurement) = measure_finality(txn, now)? else {
+    let Some(measurement) = measure_finality(txn, now, partition_safety)? else {
         return Ok(Finality::default());
     };
     let status = measurement.status;
@@ -1030,10 +1037,15 @@ struct Measurement {
 /// trusted, so a returning node measures from its own chain and a fresh store
 /// measures from the seeded spine tip. Each advance re-anchors, resetting `T`.
 ///
-/// The rule is selected by the network recorded in the store, not by the
-/// caller: mainnet prices elapsed time, every other network falls back to the
-/// tip's difficulty.
-fn measure_finality<R: BtcReads>(reads: &R, now: u64) -> Result<Option<Measurement>, Error> {
+/// The rule is selected by the network recorded in the store and the core's
+/// partition-safety switch: mainnet prices elapsed time, every other network
+/// falls back to the tip's difficulty. A core with partition safety disabled
+/// uses the tip-work rule on every network.
+fn measure_finality<R: BtcReads>(
+    reads: &R,
+    now: u64,
+    partition_safety: bool,
+) -> Result<Option<Measurement>, Error> {
     if reads.best_fork()? != Some(0) {
         return Ok(None);
     }
@@ -1054,21 +1066,25 @@ fn measure_finality<R: BtcReads>(reads: &R, now: u64) -> Result<Option<Measureme
         .ok_or_else(|| Error::Internal(format!("no header at the best tip {tip}")))?;
     let anchor_time = anchor_header.time as u64;
     let anchor_work = anchor_header.target().to_work();
-    let tip_work = tip_header.target().to_work();
-    let genesis_time = u64::from(
-        bitcoin::blockdata::constants::genesis_block(network)
-            .header
-            .time,
-    );
+    let tip_block_work = tip_header.target().to_work();
     let now = now.max(anchor_time);
-    let need = finality::partition_safety_required(
-        network,
-        anchor_work,
-        anchor_time,
-        genesis_time,
-        tip_work,
-        now,
-    );
+    let need = if partition_safety {
+        let genesis_time = u64::from(
+            bitcoin::blockdata::constants::genesis_block(network)
+                .header
+                .time,
+        );
+        finality::partition_safety_required(
+            network,
+            anchor_work,
+            anchor_time,
+            genesis_time,
+            tip_block_work,
+            now,
+        )
+    } else {
+        finality::work_to_u256(tip_block_work)
+    };
 
     let work = |height: u64| -> Result<Work, Error> {
         reads
@@ -1896,6 +1912,33 @@ mod tests {
         Ok(())
     }
 
+    /// Disabling partition safety makes mainnet finality depth-only, so a
+    /// synthetic mainnet chain can advance its mark.
+    #[test]
+    fn mainnet_finality_can_run_without_partition_safety() -> eyre::Result<()> {
+        let mut params = bitcoin::consensus::Params::new(Network::Bitcoin);
+        params.max_attainable_target =
+            bitcoin::pow::Target::from_compact(CompactTarget::from_consensus(EASY_BITS));
+        let chain = Core::new(
+            crate::Config::in_memory(Network::Bitcoin)
+                .with_params(params)
+                .without_partition_safety(),
+        )?;
+
+        let genesis = mine_genesis(0);
+        chain.seed_checkpoints(&[(0, genesis)])?;
+        let run = easy_chain(&genesis, 110, 1);
+        let out = chain.connect_headers(&run, NOW)?;
+        assert_eq!(out.tip_height, 110);
+        assert_eq!(out.finalized, Some(10));
+        let status = out.finality.expect("the requirement is measurable");
+        assert_eq!(
+            status.need,
+            finality::work_to_u256(header_work(&run[run.len() - 1]))
+        );
+        Ok(())
+    }
+
     /// The depth is what gates the mark on a non-mainnet network: below it
     /// nothing advances, above it the mark moves to `tip - COINBASE_MATURITY`.
     #[test]
@@ -2290,11 +2333,14 @@ mod tests {
 
         // Re-open the same store believing it is mainnet: the recorded network
         // wins over the caller's claim.
-        let Core { store, .. } = chain;
+        let Core { store, config } = chain;
         let chain = Core {
             store,
-            params: bitcoin::consensus::Params::new(Network::Bitcoin),
-            rsk_chain: crate::rsk::chain_config(Network::Bitcoin),
+            config: crate::Config {
+                params: bitcoin::consensus::Params::new(Network::Bitcoin),
+                rsk_chain: crate::rsk::chain_config(Network::Bitcoin),
+                ..config
+            },
         };
         let header = mine_child(&canonical(&chain, 0), EASY_BITS, 1);
         let err = chain.connect_headers(&[header], NOW).unwrap_err();

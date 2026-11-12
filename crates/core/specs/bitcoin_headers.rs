@@ -5,7 +5,7 @@
 //! form that is expected to fail when a clause is broken. When a clause changes,
 //! update its comment here in the same change.
 //!
-//! Three machines:
+//! Four machines, all on mainnet parameters:
 //!
 //! - `bitcoin_headers_match_the_spec` checks R1–R2, C1–C6 and R3–R6 over a
 //!   delivery universe with a trunk, a competing fork, a fork of a fork, a
@@ -14,9 +14,13 @@
 //! - `finality_and_fork_gate_matches_the_spec` checks R7–R9 on a long trunk
 //!   delivered in runs, at the production depth, including light forks
 //!   below/above the mark.
-//! - `difficulty_matches_the_spec` checks C5 with custom regtest params that
-//!   enforce the expected-bits rule.
+//! - `difficulty_matches_the_spec` checks C5 with the mainnet expected-bits
+//!   rule.
 //! - `future_time_matches_the_spec` checks C7 against the caller clock.
+//!
+//! The synthetic chain seeds a recent mainnet height and relaxes the
+//! proof-of-work limit, so it mines in no time. The mainnet estimated-work
+//! finality requirement is disabled because a synthetic chain cannot clear it.
 //!
 //! Run just this document's spec:
 //!
@@ -31,19 +35,70 @@ use alloy_primitives::U256;
 use bitcoin::Network;
 use bitcoin::TxMerkleNode;
 use bitcoin::block::{BlockHash, Header as BitcoinHeader, Version};
+use bitcoin::consensus::Params;
 use bitcoin::hashes::Hash as _;
-use bitcoin::pow::CompactTarget;
+use bitcoin::pow::{CompactTarget, Target};
 use proptest::prelude::*;
 use proptest_state_machine::{ReferenceStateMachine, StateMachineTest, prop_state_machine};
 
-use crate::{Action, Core, Error, Outcome, RskState};
+use crate::{Action, Config, Core, Error, Outcome, RskState};
 
-/// The easiest valid Bitcoin target, so synthetic headers mine immediately.
+/// The easiest valid Bitcoin target on the test network, so synthetic headers
+/// mine immediately.
 const EASY_BITS: u32 = 0x207f_ffff;
-const BASE_TIME: u32 = 1_600_000_000;
-/// The clock the future-time machine connects at. It only has to be after the
-/// headers' timestamps; the other machines pass no clock at all.
-const NOW: u64 = 1_700_000_000;
+/// A recent mainnet difficulty-period start (2016 × 481).
+///
+/// Each machine seeds here, so synthetic headers have recent block numbers
+/// without mining recent mainnet difficulty.
+const SEED_HEIGHT: u64 = 969_696;
+/// The seed header's timestamp: 2026-10-14, near the seed height in the real
+/// chain, so the synthetic chain has recent times.
+const SEED_TIME: u32 = 1_792_000_000;
+/// The clock the future-time machine connects at. It is a week after the seed,
+/// so every ordinary header is in the past.
+const NOW: u64 = SEED_TIME as u64 + 7 * 86_400;
+
+/// Mainnet consensus parameters with the proof-of-work limit relaxed to
+/// [`EASY_BITS`], so the specs keep the mainnet difficulty rule but mine with
+/// almost no work.
+fn mainnet_params() -> Params {
+    let mut params = Params::new(Network::Bitcoin);
+    params.max_attainable_target = Target::from_compact(CompactTarget::from_consensus(EASY_BITS));
+    params
+}
+
+/// Mainnet parameters for the delivery machine.
+///
+/// Minimum-difficulty blocks are allowed to skip C5. With the expected-bits
+/// rule on, C5 rejects an out-of-range target before C6 can see it, so the
+/// `BadTarget` transition would be unreachable. C5 has its own machine.
+fn delivery_params() -> Params {
+    let mut params = mainnet_params();
+    params.allow_min_difficulty_blocks = true;
+    params
+}
+
+/// An in-memory mainnet core for the specs.
+///
+/// It keeps the mainnet consensus rules and disables only the estimated-work
+/// finality requirement, which a synthetic chain cannot clear. The trust
+/// anchor is the seed that each machine plants at [`SEED_HEIGHT`].
+fn synthetic_mainnet_core(params: Params) -> Core {
+    Core::new(
+        Config::in_memory(Network::Bitcoin)
+            .with_params(params)
+            .without_partition_safety(),
+    )
+    .expect("in-memory store")
+}
+
+fn mainnet_core() -> Core {
+    synthetic_mainnet_core(mainnet_params())
+}
+
+fn delivery_core() -> Core {
+    synthetic_mainnet_core(delivery_params())
+}
 
 fn mine(prev: BlockHash, time: u32, tag: u32) -> BitcoinHeader {
     let target = CompactTarget::from_consensus(EASY_BITS);
@@ -113,6 +168,16 @@ fn work(core: &Core) -> U256 {
     )
 }
 
+/// The canonical headers from the root seed through the tip.
+///
+/// The seed starts above height 0, so the canonical read starts at the seed.
+fn canonical_chain(core: &Core) -> Vec<BitcoinHeader> {
+    core.canonical_headers()
+        .expect("read")
+        .collect::<Result<_, _>>()
+        .expect("read")
+}
+
 // ── 1. Bitcoin delivery: forks, duplicates, errors ─────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,18 +200,18 @@ struct HeaderUniverse {
 }
 
 fn header_universe() -> HeaderUniverse {
-    let genesis = mine(BlockHash::all_zeros(), BASE_TIME, 0);
+    let genesis = mine(BlockHash::all_zeros(), SEED_TIME, 0);
     let g = genesis.block_hash();
     let mut headers = Vec::new();
     let mut kinds = Vec::new();
 
     // A1..A12, the seed chain. A1 is index 0.
-    let a1 = mine(g, BASE_TIME + 1, 0);
+    let a1 = mine(g, SEED_TIME + 1, 0);
     headers.push(a1);
     kinds.push(HeaderKind::Valid);
     let mut prev = a1;
     for i in 2..=12u32 {
-        let next = mine(prev.block_hash(), BASE_TIME + i, 0);
+        let next = mine(prev.block_hash(), SEED_TIME + i, 0);
         headers.push(next);
         kinds.push(HeaderKind::Valid);
         prev = next;
@@ -178,13 +243,13 @@ fn header_universe() -> HeaderUniverse {
     // Q12: linked to A11 (index 10) but its timestamp equals the median of the
     // previous eleven headers (index 20). The full window makes MTP apply, and
     // equality is the C4 boundary.
-    let q12 = mine(headers[10].block_hash(), BASE_TIME + 6, 77);
+    let q12 = mine(headers[10].block_hash(), SEED_TIME + 6, 77);
     headers.push(q12);
     kinds.push(HeaderKind::BadTime);
 
-    // T2: a valid hash at a target above the regtest proof-of-work limit
-    // (index 21).
-    let t2 = mine_with_bits(a1.block_hash(), BASE_TIME + 2, 88, 0x2100_ffff);
+    // T2: a valid hash at a target above the relaxed mainnet proof-of-work
+    // limit (index 21).
+    let t2 = mine_with_bits(a1.block_hash(), SEED_TIME + 2, 88, 0x2100_ffff);
     headers.push(t2);
     kinds.push(HeaderKind::BadTarget);
 
@@ -354,8 +419,8 @@ impl StateMachineTest for HeaderMachine {
     type Reference = HeaderMachine;
 
     fn init_test(model: &HeaderModel) -> HeaderSut {
-        let core = Core::in_memory(Network::Regtest).expect("in-memory store");
-        core.seed_checkpoints(&[(0, model.universe.genesis)])
+        let core = delivery_core();
+        core.seed_checkpoints(&[(SEED_HEIGHT, model.universe.genesis)])
             .expect("seed");
         let last_work = work(&core);
         HeaderSut {
@@ -380,7 +445,7 @@ impl StateMachineTest for HeaderMachine {
 
         // R6: a best-fork change must be a strict improvement; equal work never
         // promotes the challenger. The mark-crossing half of R6 is out of
-        // reach here because the mark stays at 0.
+        // reach here because the mark stays at the seed height.
         if let (Some(old), Some(new)) = (before.best_fork, after.best_fork)
             && old != new
         {
@@ -434,8 +499,8 @@ impl StateMachineTest for HeaderMachine {
             mark >= before.finalized.unwrap_or(0),
             "the finality mark regressed"
         );
-        while (sut.finalized_prefix.len() as u64) <= mark {
-            let height = sut.finalized_prefix.len() as u64;
+        while SEED_HEIGHT + sut.finalized_prefix.len() as u64 <= mark {
+            let height = SEED_HEIGHT + sut.finalized_prefix.len() as u64;
             let header = sut
                 .core
                 .header_at(height)
@@ -460,12 +525,13 @@ impl StateMachineTest for HeaderMachine {
         assert_eq!(stored, model.stored, "the stored header set diverged");
 
         // R4: the canonical chain is linked and agrees with the best fork.
-        let chain: Vec<BitcoinHeader> = sut
-            .core
-            .canonical_headers()
-            .expect("read")
-            .collect::<Result<_, _>>()
-            .expect("read");
+        let best = state.best_fork.expect("seeded store has a best fork");
+        let best_fork = state
+            .forks
+            .iter()
+            .find(|fork| fork.id == best)
+            .expect("best fork is listed");
+        let chain = canonical_chain(&sut.core);
         assert_eq!(
             chain.first().map(|header| header.block_hash()),
             Some(model.universe.genesis.block_hash())
@@ -477,13 +543,7 @@ impl StateMachineTest for HeaderMachine {
                 "canonical chain is not linked"
             );
         }
-        let best = state.best_fork.expect("seeded store has a best fork");
-        let best_fork = state
-            .forks
-            .iter()
-            .find(|fork| fork.id == best)
-            .expect("best fork is listed");
-        assert_eq!(chain.len() as u64, best_fork.tip_height + 1);
+        assert_eq!(chain.len() as u64, best_fork.tip_height - SEED_HEIGHT + 1);
         assert_eq!(
             chain
                 .last()
@@ -520,11 +580,12 @@ impl StateMachineTest for HeaderMachine {
         // R7: every height at or below the mark still has the block it had.
         let mark = state.finalized.expect("seeded store has a mark");
         assert!(mark <= best_fork.tip_height);
-        assert_eq!(sut.finalized_prefix.len() as u64, mark + 1);
-        for (height, expected) in sut.finalized_prefix.iter().enumerate() {
+        assert_eq!(sut.finalized_prefix.len() as u64, mark - SEED_HEIGHT + 1);
+        for (offset, expected) in sut.finalized_prefix.iter().enumerate() {
+            let height = SEED_HEIGHT + offset as u64;
             assert_eq!(
                 sut.core
-                    .header_at(height as u64)
+                    .header_at(height)
                     .expect("read")
                     .map(|header| header.block_hash()),
                 Some(*expected),
@@ -554,17 +615,17 @@ struct FinalityUniverse {
     genesis: BitcoinHeader,
     headers: Vec<BitcoinHeader>,
     /// A light child of each trunk header, used to attempt forks. The child of
-    /// header `i` has height `i + 2`; it can never outweigh the trunk when the
-    /// parent is below the tip.
+    /// header `i` has height `SEED_HEIGHT + i + 2`; it can never outweigh the
+    /// trunk when the parent is below the tip.
     forks: Vec<BitcoinHeader>,
 }
 
 fn finality_universe() -> FinalityUniverse {
-    let genesis = mine(BlockHash::all_zeros(), BASE_TIME, 0);
+    let genesis = mine(BlockHash::all_zeros(), SEED_TIME, 0);
     let mut headers = Vec::with_capacity(FINALITY_BLOCKS);
     let mut prev = genesis;
     for i in 1..=FINALITY_BLOCKS as u32 {
-        prev = mine(prev.block_hash(), BASE_TIME + i, 0);
+        prev = mine(prev.block_hash(), SEED_TIME + i, 0);
         headers.push(prev);
     }
     let forks = headers
@@ -628,8 +689,8 @@ impl ReferenceStateMachine for FinalityMachine {
         Just(FinalityModel {
             universe,
             stored,
-            tip: 0,
-            mark: 0,
+            tip: SEED_HEIGHT,
+            mark: SEED_HEIGHT,
             last: FinalityPrediction::Noop,
         })
         .boxed()
@@ -637,11 +698,11 @@ impl ReferenceStateMachine for FinalityMachine {
 
     fn transitions(state: &Self::State) -> BoxedStrategy<Self::Transition> {
         let len = state.universe.headers.len();
-        let frontier = state.tip as usize;
+        let frontier = state.tip.saturating_sub(SEED_HEIGHT) as usize;
         let any_deliver = (0..len).prop_map(FinalityTransition::Deliver);
         if frontier >= len {
             // The trunk is exhausted: only duplicates and forks remain.
-            let parents = 0..(state.tip as usize - 1);
+            let parents = 0..(frontier - 1);
             return prop_oneof![
                 1 => any_deliver,
                 2 => parents.prop_map(FinalityTransition::Fork),
@@ -652,12 +713,12 @@ impl ReferenceStateMachine for FinalityMachine {
             start: frontier,
             len: n.min(len - frontier),
         });
-        if state.tip < 3 {
+        if frontier < 3 {
             return prop_oneof![3 => advance, 1 => any_deliver].boxed();
         }
         // A branch must leave the current tip as the tip: parents are kept one
         // below it, so the fork can at most tie the trunk's work.
-        let parents = 0..(state.tip as usize - 1);
+        let parents = 0..(frontier - 1);
         prop_oneof![
             3 => advance,
             1 => any_deliver,
@@ -670,7 +731,7 @@ impl ReferenceStateMachine for FinalityMachine {
         match transition {
             FinalityTransition::Deliver(index) => {
                 let header = state.universe.headers[*index];
-                let height = *index as u64 + 1;
+                let height = SEED_HEIGHT + *index as u64 + 1;
                 if state.stored.contains(&header.block_hash()) {
                     state.last = FinalityPrediction::Noop;
                 } else if !state.stored.contains(&header.prev_blockhash) {
@@ -691,7 +752,7 @@ impl ReferenceStateMachine for FinalityMachine {
                 for offset in 0..*len {
                     let header = state.universe.headers[start + offset];
                     state.stored.insert(header.block_hash());
-                    state.tip = state.tip.max((start + offset) as u64 + 1);
+                    state.tip = state.tip.max(SEED_HEIGHT + (start + offset) as u64 + 1);
                 }
                 // One finality step per batch, like the core: the rule runs after
                 // the whole run is stored.
@@ -708,7 +769,7 @@ impl ReferenceStateMachine for FinalityMachine {
                 } else {
                     // R9: a fork at or below the mark is refused. A fork above
                     // the mark is stored, but it can only tie the trunk here.
-                    let forkpoint = *index as u64 + 2;
+                    let forkpoint = SEED_HEIGHT + *index as u64 + 2;
                     if forkpoint <= state.mark {
                         state.last = FinalityPrediction::ForkBelowFinalized {
                             forkpoint,
@@ -727,8 +788,9 @@ impl ReferenceStateMachine for FinalityMachine {
 
 /// R7/R8: the mark follows the tip at the production depth.
 ///
-/// On a non-mainnet network the requirement is the tip block's own work, which
-/// the tip always carries above the mark, so nothing else gates the advance.
+/// The specs disable the mainnet partition-safety requirement. The remaining
+/// requirement is the tip block's own work, which the tip always carries above
+/// the mark, so nothing else gates the advance.
 fn advance_mark(state: &mut FinalityModel) {
     let candidate = state.tip.saturating_sub(crate::COINBASE_MATURITY);
     if candidate > state.mark {
@@ -747,8 +809,8 @@ impl StateMachineTest for FinalityMachine {
     type Reference = FinalityMachine;
 
     fn init_test(model: &FinalityModel) -> FinalitySut {
-        let core = Core::in_memory(Network::Regtest).expect("in-memory");
-        core.seed_checkpoints(&[(0, model.universe.genesis)])
+        let core = mainnet_core();
+        core.seed_checkpoints(&[(SEED_HEIGHT, model.universe.genesis)])
             .expect("seed");
         let last_work = work(&core);
         FinalitySut {
@@ -837,8 +899,8 @@ impl StateMachineTest for FinalityMachine {
         }
 
         let mark = after.finalized.expect("seeded store has a mark");
-        while (sut.finalized_prefix.len() as u64) <= mark {
-            let height = sut.finalized_prefix.len() as u64;
+        while SEED_HEIGHT + sut.finalized_prefix.len() as u64 <= mark {
+            let height = SEED_HEIGHT + sut.finalized_prefix.len() as u64;
             sut.finalized_prefix.push(
                 sut.core
                     .header_at(height)
@@ -859,7 +921,10 @@ impl StateMachineTest for FinalityMachine {
         assert_eq!(sut.core.tip_height().expect("read"), Some(model.tip));
         assert_eq!(
             model.mark,
-            model.tip.saturating_sub(crate::COINBASE_MATURITY),
+            model
+                .tip
+                .saturating_sub(crate::COINBASE_MATURITY)
+                .max(SEED_HEIGHT),
             "the mark is not tip - depth"
         );
 
@@ -872,7 +937,8 @@ impl StateMachineTest for FinalityMachine {
             .collect();
         assert_eq!(stored, model.stored, "the stored header set diverged");
         // One root fork plus one fork per stored branch header.
-        let branches = model.stored.len() as u64 - (model.tip + 1);
+        let trunk = model.tip - SEED_HEIGHT + 1;
+        let branches = model.stored.len() as u64 - trunk;
         assert_eq!(
             state.forks.len() as u64,
             1 + branches,
@@ -880,21 +946,19 @@ impl StateMachineTest for FinalityMachine {
         );
 
         // R4 (shared): the best chain still links through the trunk.
-        let chain: Vec<BitcoinHeader> = sut
-            .core
-            .canonical_headers()
-            .expect("read")
-            .collect::<Result<_, _>>()
-            .expect("read");
-        assert_eq!(chain.len() as u64, model.tip + 1);
+        let chain = canonical_chain(&sut.core);
+        assert_eq!(chain.len() as u64, trunk);
         assert_eq!(chain[0].block_hash(), model.universe.genesis.block_hash());
         for pair in chain.windows(2) {
             assert_eq!(pair[1].prev_blockhash, pair[0].block_hash());
         }
-        assert_eq!(sut.finalized_prefix.len() as u64, model.mark + 1);
+        assert_eq!(
+            sut.finalized_prefix.len() as u64,
+            model.mark - SEED_HEIGHT + 1
+        );
         assert_eq!(
             sut.finalized_prefix,
-            chain[..=model.mark as usize]
+            chain[..=(model.mark - SEED_HEIGHT) as usize]
                 .iter()
                 .map(|header| header.block_hash())
                 .collect::<Vec<_>>()
@@ -918,11 +982,11 @@ struct DifficultyUniverse {
 }
 
 fn difficulty_universe() -> DifficultyUniverse {
-    let genesis = mine(BlockHash::all_zeros(), BASE_TIME, 0);
-    let good = mine(genesis.block_hash(), BASE_TIME + 1, 0);
+    let genesis = mine(BlockHash::all_zeros(), SEED_TIME, 0);
+    let good = mine(genesis.block_hash(), SEED_TIME + 1, 0);
     // A valid header at a slightly different target. C5 rejects it for the bits,
     // before C6 or PoW.
-    let wrong = mine_with_bits(genesis.block_hash(), BASE_TIME + 1, 1, EASY_BITS - 1);
+    let wrong = mine_with_bits(genesis.block_hash(), SEED_TIME + 1, 1, EASY_BITS - 1);
     DifficultyUniverse {
         genesis,
         good,
@@ -990,8 +1054,8 @@ impl ReferenceStateMachine for DifficultyMachine {
                 state.last = if state.stored.contains(&state.universe.wrong.block_hash()) {
                     DifficultyPrediction::Noop
                 } else {
-                    // C5: these params enforce the retarget schedule. At
-                    // height 1 the child must carry the parent's bits.
+                    // C5: mainnet enforces the retarget schedule. Off a period
+                    // boundary, the child must carry the parent's bits.
                     DifficultyPrediction::BadDifficulty
                 };
             }
@@ -1009,14 +1073,10 @@ impl StateMachineTest for DifficultyMachine {
     type Reference = DifficultyMachine;
 
     fn init_test(model: &DifficultyModel) -> DifficultySut {
-        // Regtest normally permits minimum-difficulty blocks. These params
-        // enable the expected-bits rule while keeping the easy target, so the
-        // test can mine without mainnet work.
-        let mut params = bitcoin::consensus::Params::new(Network::Regtest);
-        params.no_pow_retargeting = false;
-        params.allow_min_difficulty_blocks = false;
-        let core = Core::in_memory_with_params(params).expect("in-memory store");
-        core.seed_checkpoints(&[(0, model.universe.genesis)])
+        // Mainnet enforces the expected-bits rule. Only the proof-of-work limit
+        // is relaxed, so the test can mine without mainnet work.
+        let core = mainnet_core();
+        core.seed_checkpoints(&[(SEED_HEIGHT, model.universe.genesis)])
             .expect("seed");
         DifficultySut { core }
     }
@@ -1054,7 +1114,7 @@ impl StateMachineTest for DifficultyMachine {
                     got,
                 }),
             ) => {
-                assert_eq!(*height, 1);
+                assert_eq!(*height, SEED_HEIGHT + 1);
                 assert_eq!(*expected, EASY_BITS);
                 assert_eq!(*got, EASY_BITS - 1);
                 assert_eq!(before, after, "a bad header changed the store");
@@ -1074,14 +1134,9 @@ impl StateMachineTest for DifficultyMachine {
             .collect();
         assert_eq!(stored, model.stored, "the stored header set diverged");
         assert_eq!(state.best_fork, Some(0));
-        assert_eq!(state.finalized, Some(0));
+        assert_eq!(state.finalized, Some(SEED_HEIGHT));
 
-        let chain: Vec<BitcoinHeader> = sut
-            .core
-            .canonical_headers()
-            .expect("read")
-            .collect::<Result<_, _>>()
-            .expect("read");
+        let chain = canonical_chain(&sut.core);
         assert_eq!(chain[0].block_hash(), model.universe.genesis.block_hash());
         for pair in chain.windows(2) {
             assert_eq!(pair[1].prev_blockhash, pair[0].block_hash());
@@ -1100,8 +1155,8 @@ struct FutureUniverse {
 }
 
 fn future_universe() -> FutureUniverse {
-    let genesis = mine(BlockHash::all_zeros(), BASE_TIME, 0);
-    let good = mine(genesis.block_hash(), BASE_TIME + 1, 0);
+    let genesis = mine(BlockHash::all_zeros(), SEED_TIME, 0);
+    let good = mine(genesis.block_hash(), SEED_TIME + 1, 0);
     // One second beyond the two-hour window in `connect_headers`.
     let future = mine(
         genesis.block_hash(),
@@ -1189,8 +1244,8 @@ impl StateMachineTest for FutureMachine {
     type Reference = FutureMachine;
 
     fn init_test(model: &FutureModel) -> FutureSut {
-        let core = Core::in_memory(Network::Regtest).expect("in-memory store");
-        core.seed_checkpoints(&[(0, model.universe.genesis)])
+        let core = mainnet_core();
+        core.seed_checkpoints(&[(SEED_HEIGHT, model.universe.genesis)])
             .expect("seed");
         FutureSut { core }
     }
@@ -1225,7 +1280,7 @@ impl StateMachineTest for FutureMachine {
                     max_ahead,
                 }),
             ) => {
-                assert_eq!(*height, 1);
+                assert_eq!(*height, SEED_HEIGHT + 1);
                 assert_eq!(*now, NOW);
                 assert_eq!(*got, header.time);
                 assert_eq!(*max_ahead, crate::btc::validation::MAX_FUTURE_BLOCK_TIME);
@@ -1246,14 +1301,9 @@ impl StateMachineTest for FutureMachine {
             .collect();
         assert_eq!(stored, model.stored, "the stored header set diverged");
         assert_eq!(state.best_fork, Some(0));
-        assert_eq!(state.finalized, Some(0));
+        assert_eq!(state.finalized, Some(SEED_HEIGHT));
 
-        let chain: Vec<BitcoinHeader> = sut
-            .core
-            .canonical_headers()
-            .expect("read")
-            .collect::<Result<_, _>>()
-            .expect("read");
+        let chain = canonical_chain(&sut.core);
         assert_eq!(chain[0].block_hash(), model.universe.genesis.block_hash());
         for pair in chain.windows(2) {
             assert_eq!(pair[1].prev_blockhash, pair[0].block_hash());
@@ -1292,7 +1342,7 @@ prop_state_machine! {
         .. ProptestConfig::default()
     })]
 
-    /// C5: with enforced retarget, a child must carry the parent's expected bits.
+    /// C5: on mainnet a child must carry the parent's expected bits.
     #[test]
     fn difficulty_matches_the_spec(sequential 1..8 => DifficultyMachine);
 }

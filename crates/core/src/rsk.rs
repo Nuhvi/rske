@@ -193,7 +193,7 @@ impl Core {
     ) -> Result<RskConnectOutcome, Error> {
         let tail = self.checkpoint_tail()?;
         let txn = self.store.write()?;
-        let verifier = HeaderVerifier::default_rsk(self.rsk_chain.clone());
+        let verifier = HeaderVerifier::default_rsk(self.config.rsk_chain.clone());
         let mut connected = 0usize;
         for entry in entries {
             validate_entry(&txn, &verifier, entry)?;
@@ -231,7 +231,7 @@ impl Core {
         entries: &[RskEntry],
     ) -> Result<RskConnectOutcome, Error> {
         let txn = self.store.write()?;
-        let verifier = HeaderVerifier::default_rsk(self.rsk_chain.clone());
+        let verifier = HeaderVerifier::default_rsk(self.config.rsk_chain.clone());
         let mut connected = 0usize;
         for entry in entries {
             validate_header(&txn, &verifier, entry)?;
@@ -854,7 +854,10 @@ mod tests {
     fn rsk_config_matches_the_network() {
         // Smoke: the Core carries an RSK chain config.
         let core = core();
-        assert_eq!(core.rsk_chain.chain_id, ChainConfig::regtest().chain_id);
-        let _ = Arc::new(core.rsk_chain.clone());
+        assert_eq!(
+            core.config.rsk_chain.chain_id,
+            ChainConfig::regtest().chain_id
+        );
+        let _ = Arc::new(core.config.rsk_chain.clone());
     }
 }

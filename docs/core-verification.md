@@ -24,16 +24,28 @@ PROPTEST_VERBOSE=1 cargo test -p rsk-core --lib specs::
 
 ### Bitcoin headers (`bitcoin-headers.md`)
 
+All four machines run on mainnet parameters. The synthetic chain seeds a recent
+mainnet difficulty-period start, relaxes the proof-of-work limit so mining is
+cheap, and disables the mainnet estimated-work finality requirement, which a
+synthetic chain cannot clear. This keeps the mainnet network, difficulty and
+finality code paths while the headers stay cheap to mine.
+
 `bitcoin_headers_match_the_spec` checks header and batch delivery over a fixed
 universe containing a 12-block trunk, a competing fork, a fork of a fork, a
-bad-PoW header, a stale-timestamp header, duplicate batches and an empty batch:
+bad-PoW header, a stale-timestamp header, an out-of-range target header,
+duplicate batches and an empty batch:
 
 - R1–R2: atomicity and idempotence. A rejected action leaves the store unchanged.
 - C1–C4: parent, linkage, proof of work and median-time-past. The errors are
   `UnknownAncestor`, `LinkBreak`, `BadPow` and `BadTimestamp`.
 - C7: a header more than two hours after `now` gives `TimestampTooNew`.
-- R3–R4: the exact stored header set and canonical-chain linkage.
+- R3–R4: the exact stored header set and canonical-chain linkage, starting at
+  the recent seed.
 - R5–R6: maximum-work fork choice and strict-heavier switching.
+
+This machine allows minimum-difficulty blocks to skip C5, because the
+expected-bits rule would reject an out-of-range target before C6 can see it.
+C5 has its own machine.
 
 `finality_and_fork_gate_matches_the_spec` checks the finality mark and the fork
 gate on a 240-block trunk with the production depth, delivered in short runs:
@@ -44,11 +56,11 @@ gate on a 240-block trunk with the production depth, delivered in short runs:
 - R9: forks at or below the mark are refused, while lighter forks above it are
   stored and never become best.
 
-`difficulty_matches_the_spec` checks C5 through `Core` with custom regtest
-parameters that enforce the retarget rule: a child with the parent's bits is
-accepted, a sibling with different bits is `BadDifficulty`. C6, the target-range
-and pow-limit check, is covered by the delivery machine and by unit tests that
-pin the mainnet pow limit. `the_boundary_retarget_is_enforced` covers the
+`difficulty_matches_the_spec` checks C5 through `Core` with mainnet parameters
+and a relaxed proof-of-work limit: a child with the parent's bits is accepted, a
+sibling with different bits is `BadDifficulty`. C6, the target-range and
+pow-limit check, is covered by the delivery machine and by unit tests that pin
+the mainnet pow limit. `the_boundary_retarget_is_enforced` covers the
 period-boundary retarget through `Core`, which the machine does not reach.
 
 `future_time_matches_the_spec` checks C7 against the caller clock.
@@ -104,9 +116,12 @@ The tests drive only public API:
   `Core::finalized_checkpoints()`, `Core::coinbase_tags()`,
   `Core::rsk_headers_back()` — iterators over the row collections that can grow
   without bound;
-- `Core::in_memory`, `Core::in_memory_with`, `Core::reset`, `Core::reset_rsk`
-  — in-memory fixtures and replay. These are ordinary public methods; no
-  feature flag is needed.
+- `Core::new(Config)` — opens a store from one configuration value;
+  `Config::in_memory`/`Config::open` select the backend, and
+  `Config::with_params`/`Config::without_partition_safety` override the network
+  defaults (`Core::in_memory`/`Core::open` are the default-option shortcuts);
+- `Core::reset`, `Core::reset_rsk` — replay from a clean in-memory fixture.
+  These are ordinary public methods; no feature flag is needed.
 
 If a requirement is not in `specs/` and has no executable counterpart, it is
 covered — if at all — by an ordinary unit test in the module that owns the

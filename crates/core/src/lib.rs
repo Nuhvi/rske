@@ -35,8 +35,8 @@ pub use btc::{
     header_work,
 };
 pub use core::{
-    Action, CanonicalHeaders, Core, CoreState, ForkState, Outcome, RskState, StoredHeader,
-    StoredHeaders,
+    Action, CanonicalHeaders, Config, Core, CoreState, ForkState, Outcome, RskState, StoreConfig,
+    StoredHeader, StoredHeaders,
 };
 pub use error::Error;
 pub use rsk::{

@@ -12,7 +12,7 @@
 //!
 //! The behaviour lives with the domain: [`crate::btc`] and [`crate::rsk`].
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use alloy_primitives::B256;
@@ -29,6 +29,81 @@ use crate::rsk;
 use crate::store::{ForkMeta, ReadTxn, Store};
 use crate::{ConnectOutcome, RskConnectOutcome, RskEntry, Tag};
 
+/// The storage backend a [`Core`] opens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreConfig {
+    /// A file-backed redb store at this path.
+    File(PathBuf),
+    /// A volatile in-memory store.
+    Memory,
+}
+
+/// Everything a [`Core`] is built from.
+///
+/// [`Config::open`] and [`Config::in_memory`] fill the fields from the
+/// network defaults. The public fields let a test change a consensus parameter
+/// or disable the mainnet network-partition safety requirement.
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// Where the store lives.
+    pub store: StoreConfig,
+    /// Bitcoin consensus parameters used for header validation. The network
+    /// they name also selects the finality policy, so there is no second copy
+    /// of the network on the handle. Change them through
+    /// [`Config::with_params`] so the Rootstock configuration follows.
+    pub params: Params,
+    /// Rootstock consensus parameters the RSK tree validates against.
+    /// [`Config::with_params`] keeps this in step with `params.network`.
+    pub rsk_chain: Arc<ChainConfig>,
+    /// Require the mainnet network-partition safety work before the finality
+    /// mark advances.
+    ///
+    /// The default is `true`. A test sets this to `false` to run the mainnet
+    /// difficulty rules on a chain that is cheap to mine. A production node
+    /// must keep this enabled.
+    pub partition_safety: bool,
+}
+
+impl Config {
+    /// A file-backed store at `path`, with the network defaults.
+    pub fn open(path: impl Into<PathBuf>, network: Network) -> Self {
+        Self {
+            store: StoreConfig::File(path.into()),
+            params: Params::new(network),
+            rsk_chain: rsk::chain_config(network),
+            partition_safety: true,
+        }
+    }
+
+    /// An in-memory store, with the network defaults.
+    pub fn in_memory(network: Network) -> Self {
+        Self {
+            store: StoreConfig::Memory,
+            params: Params::new(network),
+            rsk_chain: rsk::chain_config(network),
+            partition_safety: true,
+        }
+    }
+
+    /// Replace the Bitcoin consensus parameters.
+    ///
+    /// The Rootstock configuration follows the network the parameters name.
+    pub fn with_params(mut self, params: Params) -> Self {
+        self.rsk_chain = rsk::chain_config(params.network);
+        self.params = params;
+        self
+    }
+
+    /// Drop the mainnet network-partition safety requirement.
+    ///
+    /// Test-only: finality then needs only the tip block's work, so a
+    /// synthetic mainnet chain can reach the mark in a few blocks.
+    pub fn without_partition_safety(mut self) -> Self {
+        self.partition_safety = false;
+        self
+    }
+}
+
 /// The side-effect-free core: a thin, deterministic layer over a redb-backed
 /// store.
 ///
@@ -36,45 +111,37 @@ use crate::{ConnectOutcome, RskConnectOutcome, RskEntry, Tag};
 /// supplies data, time and reads back outcomes.
 pub struct Core {
     pub(crate) store: Store,
-    /// Bitcoin consensus parameters used for header validation. The network
-    /// they name also selects the finality policy, so there is no second copy
-    /// of the network on the handle.
-    pub(crate) params: Params,
-    /// Rootstock consensus parameters the RSK tree validates against.
-    pub(crate) rsk_chain: Arc<ChainConfig>,
+    pub(crate) config: Config,
 }
 
 impl Core {
+    /// Open a core with the given configuration.
+    pub fn new(config: Config) -> Result<Self, Error> {
+        let store = match &config.store {
+            StoreConfig::File(path) => Store::open(path)?,
+            StoreConfig::Memory => Store::in_memory()?,
+        };
+        Ok(Self { store, config })
+    }
+
     /// Open a file-backed store for the given network.
     ///
     /// The finality rule is selected by the network recorded in the store:
     /// mainnet prices elapsed time, every other network falls back to the tip's
     /// difficulty.
     pub fn open(path: &Path, network: Network) -> Result<Self, Error> {
-        Ok(Self {
-            store: Store::open(path)?,
-            params: Params::new(network),
-            rsk_chain: rsk::chain_config(network),
-        })
+        Self::new(Config::open(path, network))
     }
 
     /// Open an in-memory store (no disk I/O) for the given network.
     pub fn in_memory(network: Network) -> Result<Self, Error> {
-        Ok(Self {
-            store: Store::in_memory()?,
-            params: Params::new(network),
-            rsk_chain: rsk::chain_config(network),
-        })
+        Self::new(Config::in_memory(network))
     }
 
     /// Open an in-memory store with explicit consensus parameters. The network
     /// they name selects the finality policy and the Rootstock configuration.
     pub fn in_memory_with_params(params: Params) -> Result<Self, Error> {
-        Ok(Self {
-            store: Store::in_memory()?,
-            rsk_chain: rsk::chain_config(params.network),
-            params,
-        })
+        Self::new(Config::in_memory(params.network).with_params(params))
     }
 
     /// Drop every Bitcoin table (destructive: replay from a clean seed).
@@ -199,9 +266,9 @@ impl Core {
 
     /// The canonical chain, oldest first, streamed from one read snapshot.
     ///
-    /// Yields an [`Error::Internal`] once if a canonical height has no stored
-    /// row. A spine-only seed (for example checkpoints at 0 and 2016 with no
-    /// blocks between them) has such gaps; a full chain does not.
+    /// The first row is the root seed, which may be above height 0. Yields an
+    /// [`Error::Internal`] once if a canonical height has no stored row. A
+    /// sparse seed has such gaps; a full chain does not.
     pub fn canonical_headers(&self) -> Result<CanonicalHeaders, Error> {
         let txn = self.store.read()?;
         let Some(best) = txn.best_fork()? else {
@@ -210,10 +277,14 @@ impl Core {
         let Some((tip, _)) = txn.fork_tip(best)? else {
             return Ok(CanonicalHeaders::empty());
         };
+        // A seed may start above height 0 (the shipped spine or a test seed).
+        // The canonical read starts at the root seed, not at the virtual block
+        // below it.
+        let start = txn.fork_meta(0)?.map_or(0, |meta| meta.forkpoint);
         Ok(CanonicalHeaders {
             txn: Some(txn),
             best,
-            next: 0,
+            next: start,
             tip,
         })
     }
@@ -338,7 +409,7 @@ impl Iterator for StoredHeaders {
     }
 }
 
-/// Streams the canonical Bitcoin chain, oldest first.
+/// Streams the canonical Bitcoin chain, oldest first, starting at the seed.
 ///
 /// Created by [`Core::canonical_headers`]. Holds one read snapshot while it
 /// yields rows.

@@ -266,7 +266,8 @@ impl Value for CoinbaseRow {
 }
 
 /// Metadata for one Bitcoin chain (fork) in the tree. The root chain (id 0)
-/// has `forkpoint == 0`, `parent == None`, and is the initial best chain.
+/// has `parent == None`, starts at its first seed height, and is the initial
+/// best chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ForkMeta {
     /// Height of this fork's first header.
@@ -593,7 +594,7 @@ impl WriteTxn {
             .1
             .block_hash();
         let root = ForkMeta {
-            forkpoint: 0,
+            forkpoint: sorted[0].0,
             parent: None,
             forkpoint_hash: sorted[0].1.block_hash(),
             tip_height: last,

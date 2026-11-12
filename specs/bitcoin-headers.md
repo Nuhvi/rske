@@ -47,18 +47,22 @@ The machine is configured, once, with:
 - **Network.** Selects the Bitcoin consensus parameters. The expected-difficulty
   rule applies on mainnet and signet. Testnet, testnet4 and regtest permit
   minimum-difficulty blocks.
+- **Partition safety.** Whether the mainnet network-partition safety rule runs.
+  The default is on. A test disables it to run the mainnet consensus rules over
+  a low-work synthetic chain (R8).
 
-Network-partition safety is not configured: the work the best chain must carry
-above the mark follows the network recorded in the store. Mainnet prices elapsed
-time from the anchor and floors the result at a coinbase-maturity window of
-work. Every other network uses the tip block's own work, which the tip always
-carries above the mark, so finality there is decided by the depth alone.
+The network selects the default requirement: mainnet prices elapsed time from
+the anchor and floors the result at a coinbase-maturity window of work. Every
+other network uses the tip block's own work, which the tip always carries above
+the mark, so finality there is decided by the depth alone. With partition
+safety disabled, every network uses the tip-work rule.
 
 The machine also starts from a trust anchor:
 
 - **Seed.** One or more trusted headers at difficulty-period boundaries. The seed
-  may be sparse. Seeding creates fork `0` and sets the first finality mark
-  (S2, S4).
+  may be sparse, and its first height may be above 0. Seeding creates fork `0`
+  and sets the first finality mark (S2, S4). The canonical chain starts at the
+  first seed header.
 
 ## 2. State
 
@@ -182,7 +186,9 @@ clears the requirement (`have >= need`), the mark advances to `tip - 100` when
 that is greater than the current mark. Mainnet takes `need` from the estimated
 work since the mark, floored at a coinbase-maturity window; every other network
 takes it from the work of the tip block, which the tip always carries, so on
-those networks the depth is the only gate.
+those networks the depth is the only gate. With partition safety disabled,
+every network uses the tip-work rule. This switch is test-only; a production
+mainnet node keeps it on.
 
 **R9 — fork gate.** A fork is created only when its forkpoint is above the
 finality mark. At or below the mark the action fails with
