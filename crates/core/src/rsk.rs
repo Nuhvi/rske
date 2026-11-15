@@ -117,11 +117,11 @@ impl Iterator for RskHeadersBack {
     }
 }
 
-/// Outcome of a [`Core::connect_rsk_headers`] call.
+/// Outcome of a [`Core::submit_rsk_headers`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RskConnectOutcome {
-    /// Headers newly stored.
-    pub connected: usize,
+pub struct RskSubmitOutcome {
+    /// Headers newly accepted.
+    pub accepted: usize,
     /// The checkpoint this batch established, if any: a proposed checkpoint
     /// whose tree first cleared the trust threshold.
     pub checkpoint: Option<EphemeralChainCheckpoint>,
@@ -189,19 +189,19 @@ impl Core {
     ///
     /// Batches are incremental — feed them as they arrive, ascending, each
     /// parent already stored. After storing, the call attempts to establish a
-    /// checkpoint and reports it in [`RskConnectOutcome::checkpoint`].
-    pub(crate) fn connect_rsk_headers_impl(
+    /// checkpoint and reports it in [`RskSubmitOutcome::checkpoint`].
+    pub(crate) fn submit_rsk_headers_impl(
         &self,
         entries: &[RskEntry],
-    ) -> Result<RskConnectOutcome, Error> {
+    ) -> Result<RskSubmitOutcome, Error> {
         let tail = self.checkpoint_tail()?;
         let txn = self.store.write()?;
         let verifier = HeaderVerifier::default_rsk(self.config.rsk_chain.clone());
-        let mut connected = 0usize;
+        let mut accepted = 0usize;
         for entry in entries {
             validate_entry(&txn, &verifier, entry)?;
             txn.rsk_put_entry(entry)?;
-            connected += 1;
+            accepted += 1;
         }
         let checkpoint = match tail {
             Some((tail_start, btc_tail_work)) => {
@@ -210,8 +210,8 @@ impl Core {
             None => None,
         };
         txn.commit()?;
-        Ok(RskConnectOutcome {
-            connected,
+        Ok(RskSubmitOutcome {
+            accepted,
             checkpoint,
         })
     }
@@ -227,23 +227,23 @@ impl Core {
     ///
     /// Because the stored entries have no uncle lists, their cumulative
     /// difficulty understates the true chain and this call deliberately never
-    /// establishes a checkpoint. Use [`Core::connect_rsk_headers`] once bodies
+    /// establishes a checkpoint. Use [`Core::submit_rsk_headers`] once bodies
     /// are available.
-    pub(crate) fn connect_rsk_headers_without_uncles_impl(
+    pub(crate) fn submit_rsk_headers_without_uncles_impl(
         &self,
         entries: &[RskEntry],
-    ) -> Result<RskConnectOutcome, Error> {
+    ) -> Result<RskSubmitOutcome, Error> {
         let txn = self.store.write()?;
         let verifier = HeaderVerifier::default_rsk(self.config.rsk_chain.clone());
-        let mut connected = 0usize;
+        let mut accepted = 0usize;
         for entry in entries {
             validate_header(&txn, &verifier, entry)?;
             txn.rsk_put_entry(entry)?;
-            connected += 1;
+            accepted += 1;
         }
         txn.commit()?;
-        Ok(RskConnectOutcome {
-            connected,
+        Ok(RskSubmitOutcome {
+            accepted,
             checkpoint: None,
         })
     }
@@ -475,21 +475,21 @@ impl Core {
     }
 
     /// Validate and store a contiguous ascending run of RSK headers.
-    pub fn connect_rsk_headers(&self, entries: &[RskEntry]) -> Result<RskConnectOutcome, Error> {
-        match self.apply(crate::Action::ConnectRskHeaders { entries })? {
-            crate::Outcome::RskConnected(outcome) => Ok(outcome),
-            other => Err(unexpected("connect_rsk_headers", other)),
+    pub fn submit_rsk_headers(&self, entries: &[RskEntry]) -> Result<RskSubmitOutcome, Error> {
+        match self.apply(crate::Action::SubmitRskHeaders { entries })? {
+            crate::Outcome::RskSubmitted(outcome) => Ok(outcome),
+            other => Err(unexpected("submit_rsk_headers", other)),
         }
     }
 
     /// Validate and store an ascending run of RSK headers without uncle bodies.
-    pub fn connect_rsk_headers_without_uncles(
+    pub fn submit_rsk_headers_without_uncles(
         &self,
         entries: &[RskEntry],
-    ) -> Result<RskConnectOutcome, Error> {
-        match self.apply(crate::Action::ConnectRskHeadersWithoutUncles { entries })? {
-            crate::Outcome::RskConnected(outcome) => Ok(outcome),
-            other => Err(unexpected("connect_rsk_headers_without_uncles", other)),
+    ) -> Result<RskSubmitOutcome, Error> {
+        match self.apply(crate::Action::SubmitRskHeadersWithoutUncles { entries })? {
+            crate::Outcome::RskSubmitted(outcome) => Ok(outcome),
+            other => Err(unexpected("submit_rsk_headers_without_uncles", other)),
         }
     }
 
@@ -618,7 +618,7 @@ mod tests {
         }
         // A clock 1,200,000 s (~2000 blocks) past the anchor: the bar asks for
         // 2000 blocks of work, and the tail above the anchor carries 2016.
-        core.connect_headers(&run, 1_600_000_001 + 1_200_000)
+        core.submit_bitcoin_headers(&run, 1_600_000_001 + 1_200_000)
             .unwrap();
         core
     }
@@ -711,7 +711,7 @@ mod tests {
         // A header claiming one uncle but carrying none.
         let mut bad = entry(1, f, 10, 0);
         bad.header.uncle_count = 1;
-        let err = core.connect_rsk_headers(&[bad]).unwrap_err();
+        let err = core.submit_rsk_headers(&[bad]).unwrap_err();
         assert!(matches!(err, Error::Rootstock(_)), "got {err:?}");
     }
 
@@ -747,7 +747,7 @@ mod tests {
     }
 
     #[test]
-    fn connect_rsk_headers_reports_an_established_checkpoint() {
+    fn submit_rsk_headers_reports_an_established_checkpoint() {
         let core = btc_with_tail();
         assert_eq!(core.finalized_checkpoint().unwrap(), Some(2016));
 
@@ -759,8 +759,8 @@ mod tests {
             txn.commit().unwrap();
         }
 
-        let out = core.connect_rsk_headers(&[]).unwrap();
-        assert_eq!(out.connected, 0);
+        let out = core.submit_rsk_headers(&[]).unwrap();
+        assert_eq!(out.accepted, 0);
         let cp = out.checkpoint.expect("a checkpoint");
         assert_eq!(cp.hash, f);
         assert_eq!(cp.tail_start, 2016);
@@ -819,9 +819,9 @@ mod tests {
         child.header.encode(&mut child.raw);
 
         let out = core
-            .connect_rsk_headers_without_uncles(std::slice::from_ref(&child))
+            .submit_rsk_headers_without_uncles(std::slice::from_ref(&child))
             .unwrap();
-        assert_eq!(out.connected, 1);
+        assert_eq!(out.accepted, 1);
         assert!(
             out.checkpoint.is_none(),
             "an entry without its uncles must not establish a checkpoint"

@@ -37,7 +37,7 @@ const BTC_META: TableDefinition<&str, Meta> = TableDefinition::new("btc_meta");
 /// from, and the period starts at or below it are the **checkpoints**. See
 /// [`crate::btc::finality`] for the rule.
 const META_FINALIZED: &str = "finalized_height";
-/// The greatest clock ([`crate::Core::connect_headers`]'s `now`) ever seen, so
+/// The greatest clock ([`crate::Core::submit_bitcoin_headers`]'s `now`) ever seen, so
 /// a later one cannot shrink the bar by winding the clock back.
 const META_NOW: &str = "finality_now";
 const META_BEST_FORK: &str = "best_fork";
@@ -57,7 +57,7 @@ pub(super) fn open_tables(txn: &WriteTransaction) -> Result<(), Error> {
 
 /// The Bitcoin reads the finality rule needs. Implemented for both transaction
 /// types so the rule runs identically in a read snapshot (status output) and in
-/// the writer (a connect).
+/// the writer (a submission).
 pub(crate) trait BtcReads {
     fn network(&self) -> Result<Option<Network>, Error>;
     fn best_fork(&self) -> Result<Option<u64>, Error>;
@@ -276,7 +276,7 @@ pub(crate) struct ForkMeta {
     pub parent: Option<u64>,
     /// Hash of the block at `forkpoint` (this fork's identity).
     pub forkpoint_hash: BlockHash,
-    /// Highest connected height on this fork.
+    /// Highest accepted height on this fork.
     pub tip_height: u64,
     /// Hash of the block at `tip_height`.
     pub tip_hash: BlockHash,
@@ -331,7 +331,7 @@ impl Value for ForkMeta {
 /// Sentinel `parent` for a root fork (`ForkMeta::parent == None`).
 const NO_PARENT: u64 = u64::MAX;
 
-/// Bitcoin reads shared by [`ReadTxn`] and [`WriteTxn`], so a connect can read
+/// Bitcoin reads shared by [`ReadTxn`] and [`WriteTxn`], so a submission can read
 /// what it has already staged.
 macro_rules! btc_read_methods {
     () => {
@@ -410,7 +410,7 @@ macro_rules! btc_read_methods {
             }
         }
 
-        /// The finality mark, if seeded. Monotonic: only the connect path
+        /// The finality mark, if seeded. Monotonic: only the submit path
         /// advances it, and only forward.
         pub(crate) fn finalized_height(&self) -> Result<Option<u64>, Error> {
             self.meta_u64(META_FINALIZED)
@@ -783,7 +783,7 @@ impl WriteTxn {
     }
 
     /// Record the network this chain is seeded for (read back by the network
-    /// check at the top of [`crate::Core::connect_headers`]).
+    /// check at the top of [`crate::Core::submit_bitcoin_headers`]).
     pub(crate) fn set_network(&self, network: Network) -> Result<(), Error> {
         let mut meta = self.txn.open_table(BTC_META)?;
         meta.insert(META_NETWORK, Meta::Text(network.to_string()))?;

@@ -31,7 +31,7 @@ mod specs;
 pub use btc::finality::{COINBASE_MATURITY, FinalityStatus, is_checkpoint};
 pub use btc::validation::MEDIAN_TIME_PAST;
 pub use btc::{
-    Coinbase, CoinbaseTag, CoinbaseTags, ConnectOutcome, FinalizedCheckpoints, bip34_height,
+    Coinbase, CoinbaseTag, CoinbaseTags, FinalizedCheckpoints, SubmitBitcoinOutcome, bip34_height,
     header_work,
 };
 pub use core::{
@@ -40,8 +40,8 @@ pub use core::{
 };
 pub use error::Error;
 pub use rsk::{
-    EphemeralChainCheckpoint, FIVE_SIGMA_ALPHA, HeaderRef, RootScore, RskConnectOutcome, RskEntry,
-    RskHeadersBack, Scoreboard, Share, WORK_EQUIVALENT_BLOCKS, min_tags_for_fraud_proof,
+    EphemeralChainCheckpoint, FIVE_SIGMA_ALPHA, HeaderRef, RootScore, RskEntry, RskHeadersBack,
+    RskSubmitOutcome, Scoreboard, Share, WORK_EQUIVALENT_BLOCKS, min_tags_for_fraud_proof,
     oldest_checkpoint, required_endorsements, score,
 };
 pub use rsk_consensus::validation::merged_mining::Tag;

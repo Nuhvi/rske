@@ -28,7 +28,7 @@ use rsk_consensus::config::ChainConfig;
 use crate::error::Error;
 use crate::rsk;
 use crate::store::{ForkMeta, ReadTxn, Store};
-use crate::{ConnectOutcome, RskConnectOutcome, RskEntry, Tag};
+use crate::{RskEntry, RskSubmitOutcome, SubmitBitcoinOutcome, Tag};
 
 /// The storage backend a [`Core`] opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,8 +230,8 @@ impl Core {
     pub fn apply(&self, action: Action<'_>) -> Result<Outcome, Error> {
         Ok(match action {
             Action::ReanchorShipped => Outcome::Reanchored(self.reanchor_shipped_impl()?),
-            Action::ConnectHeaders { headers, now } => {
-                Outcome::Connected(self.connect_headers_impl(headers, now)?)
+            Action::SubmitBitcoinHeaders { headers, now } => {
+                Outcome::BitcoinSubmitted(self.submit_bitcoin_headers_impl(headers, now)?)
             }
             Action::StoreCoinbase {
                 height,
@@ -249,11 +249,11 @@ impl Core {
             Action::ProposeCheckpoint { entry } => {
                 Outcome::CheckpointProposed(self.propose_checkpoint_impl(entry)?)
             }
-            Action::ConnectRskHeaders { entries } => {
-                Outcome::RskConnected(self.connect_rsk_headers_impl(entries)?)
+            Action::SubmitRskHeaders { entries } => {
+                Outcome::RskSubmitted(self.submit_rsk_headers_impl(entries)?)
             }
-            Action::ConnectRskHeadersWithoutUncles { entries } => {
-                Outcome::RskConnected(self.connect_rsk_headers_without_uncles_impl(entries)?)
+            Action::SubmitRskHeadersWithoutUncles { entries } => {
+                Outcome::RskSubmitted(self.submit_rsk_headers_without_uncles_impl(entries)?)
             }
             Action::SetRskSyncTip { hash } => {
                 self.set_rsk_sync_tip_impl(hash)?;
@@ -362,8 +362,8 @@ impl Core {
 pub enum Action<'a> {
     /// Adopt the newest configured Bitcoin period boundary the store holds.
     ReanchorShipped,
-    /// Connect a run of Bitcoin headers at the caller's clock.
-    ConnectHeaders {
+    /// Submit a run of Bitcoin headers at the caller's clock.
+    SubmitBitcoinHeaders {
         headers: &'a [BitcoinHeader],
         /// The caller's clock, when it has one. `None` skips the future-time
         /// check and runs the requirement on the stored high-water mark and
@@ -384,9 +384,9 @@ pub enum Action<'a> {
     /// Propose an RSK checkpoint block and make it a forest root.
     ProposeCheckpoint { entry: &'a RskEntry },
     /// Validate and store a contiguous RSK run with its uncle lists.
-    ConnectRskHeaders { entries: &'a [RskEntry] },
+    SubmitRskHeaders { entries: &'a [RskEntry] },
     /// Validate and store a contiguous RSK run without uncle bodies.
-    ConnectRskHeadersWithoutUncles { entries: &'a [RskEntry] },
+    SubmitRskHeadersWithoutUncles { entries: &'a [RskEntry] },
     /// Record the newest committed RSK header.
     SetRskSyncTip { hash: B256 },
 }
@@ -395,12 +395,12 @@ pub enum Action<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     Reanchored(Option<(u64, u64)>),
-    Connected(ConnectOutcome),
+    BitcoinSubmitted(SubmitBitcoinOutcome),
     CoinbaseStored,
     CoinbaseTagUpdated(bool),
     CoinbasesPruned(usize),
     CheckpointProposed(B256),
-    RskConnected(RskConnectOutcome),
+    RskSubmitted(RskSubmitOutcome),
     SyncTipSet,
 }
 

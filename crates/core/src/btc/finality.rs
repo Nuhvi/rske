@@ -196,9 +196,9 @@ fn estimated_hashrate(t: u64, genesis_time: u64) -> f64 {
     difficulty * (1u64 << 32) as f64 / TARGET_BLOCK_SECONDS as f64
 }
 
-/// Network-partition safety as seen from one connect: what the best chain
+/// Network-partition safety as seen from one submission: what the best chain
 /// carries above the anchor and what the rule demands. Reported on
-/// [`crate::ConnectOutcome`] so a driver can say *why* a boundary has not
+/// [`crate::SubmitBitcoinOutcome`] so a driver can say *why* a boundary has not
 /// settled yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FinalityStatus {

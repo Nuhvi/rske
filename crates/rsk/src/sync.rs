@@ -4,7 +4,7 @@
 //! Headers come from a small pool of peers, round-robining across all of them
 //! with the next batch prefetched while the current one validates. The store is
 //! durable, so a re-run resumes from the tip. Every header is validated by
-//! [`rsk_core::Core::connect_headers`]; this module only moves bytes.
+//! [`rsk_core::Core::submit_bitcoin_headers`]; this module only moves bytes.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -323,15 +323,15 @@ pub(crate) fn run(
 
         let first = core.tip_height()?.unwrap_or(0) + 1;
         let now = unix_now();
-        let out = core.connect_headers(&headers, now)?;
+        let out = core.submit_bitcoin_headers(&headers, now)?;
         stats.batches += 1;
-        stats.total += out.connected;
+        stats.total += out.accepted;
         stats.last_status = out.finality;
         stats
             .works
-            .push(core.chainwork()?.context("chainwork after connect")?);
-        let tip = core.tip_height()?.context("tip after connect")?;
-        let seen = first + out.connected as u64 - 1;
+            .push(core.chainwork()?.context("chainwork after submission")?);
+        let tip = core.tip_height()?.context("tip after submission")?;
+        let seen = first + out.accepted as u64 - 1;
 
         // Every mark advance is reported, whenever it happens. The first one
         // also says whether the run looks partitioned.

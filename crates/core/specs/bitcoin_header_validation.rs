@@ -28,24 +28,24 @@ use crate::btc::validation::MAX_FUTURE_BLOCK_TIME;
 use crate::{Action, Config, Core, Error, Outcome};
 
 /// Submit `headers` and return the outcome, or panic.
-fn connect(core: &Core, headers: &[BitcoinHeader], now: Option<u64>) -> Outcome {
-    core.apply(Action::ConnectHeaders { headers, now })
+fn submit(core: &Core, headers: &[BitcoinHeader], now: Option<u64>) -> Outcome {
+    core.apply(Action::SubmitBitcoinHeaders { headers, now })
         .unwrap_or_else(|err| panic!("unexpected refusal: {err:?}"))
 }
 
 /// Submit `headers` and return the error, or panic.
 fn expect_err(core: &Core, headers: &[BitcoinHeader], now: Option<u64>) -> Error {
-    match core.apply(Action::ConnectHeaders { headers, now }) {
+    match core.apply(Action::SubmitBitcoinHeaders { headers, now }) {
         Ok(_) => panic!("expected a refusal"),
         Err(err) => err,
     }
 }
 
 /// Submit `headers` and return the accepted count, or panic.
-fn expect_connected(core: &Core, headers: &[BitcoinHeader], now: Option<u64>) -> usize {
-    match connect(core, headers, now) {
-        Outcome::Connected(result) => result.connected,
-        other => panic!("expected a connected outcome, got {other:?}"),
+fn expect_accepted(core: &Core, headers: &[BitcoinHeader], now: Option<u64>) -> usize {
+    match submit(core, headers, now) {
+        Outcome::BitcoinSubmitted(result) => result.accepted,
+        other => panic!("expected a submitted outcome, got {other:?}"),
     }
 }
 
@@ -90,7 +90,7 @@ fn hdr_01_parent_of_the_first_new_header_is_known() {
     );
 
     let child = mine(genesis.block_hash(), SEED_TIME + 1, 0);
-    assert_eq!(expect_connected(&core, &[child], None), 1);
+    assert_eq!(expect_accepted(&core, &[child], None), 1);
 }
 
 /// HDR-02: the compact target must be in range.
@@ -139,7 +139,7 @@ fn hdr_03_proof_of_work() {
     );
 
     let good = mine(parent, SEED_TIME + 2, 0);
-    assert_eq!(expect_connected(&core, &[good], None), 1);
+    assert_eq!(expect_accepted(&core, &[good], None), 1);
 }
 
 /// HDR-04: on mainnet, inside a period, the child carries the parent's bits.
@@ -150,7 +150,7 @@ fn hdr_04_expected_bits_inside_a_period() {
     let parent = genesis.block_hash();
 
     let good = mine(parent, SEED_TIME + 1, 0);
-    assert_eq!(expect_connected(&core, &[good], None), 1);
+    assert_eq!(expect_accepted(&core, &[good], None), 1);
 
     let wrong = mine_with_bits(parent, SEED_TIME + 2, 1, EASY_BITS - 1);
     let err = expect_err(&core, &[wrong], None);
@@ -171,11 +171,11 @@ fn hdr_05_minimum_difficulty_networks() {
 
     let t1 = SEED_TIME + 600;
     let block1 = mine_with_bits(parent, t1, 0, normal);
-    assert_eq!(expect_connected(&core, &[block1], None), 1);
+    assert_eq!(expect_accepted(&core, &[block1], None), 1);
 
     let t2 = t1 + 1201;
     let block2 = mine_with_bits(block1.block_hash(), t2, 0, EASY_BITS);
-    assert_eq!(expect_connected(&core, &[block2], None), 1);
+    assert_eq!(expect_accepted(&core, &[block2], None), 1);
 
     // A long gap must carry the limit, not the parent's normal bits.
     let stale = mine_with_bits(block1.block_hash(), t2, 1, normal);
@@ -196,7 +196,7 @@ fn hdr_05_minimum_difficulty_networks() {
     // A normal block after a minimum-difficulty parent walks back to block1.
     let t3 = t2 + 600;
     let block3 = mine_with_bits(block2.block_hash(), t3, 0, normal);
-    assert_eq!(expect_connected(&core, &[block3], None), 1);
+    assert_eq!(expect_accepted(&core, &[block3], None), 1);
 
     // Skipping the walk-back and keeping the limit is refused.
     let limit = mine_with_bits(block2.block_hash(), t3, 1, EASY_BITS);
@@ -234,7 +234,7 @@ fn hdr_06_mainnet_and_regtest_boundaries() {
         run.push(header);
         parent = header;
     }
-    assert_eq!(expect_connected(&core, &run, None), 2015);
+    assert_eq!(expect_accepted(&core, &run, None), 2015);
 
     let timespan = u64::from(parent.time) - u64::from(genesis.time);
     let expected = CompactTarget::from_next_work_required(parent.bits, timespan, &params);
@@ -250,7 +250,7 @@ fn hdr_06_mainnet_and_regtest_boundaries() {
         0,
         expected.to_consensus(),
     );
-    assert_eq!(expect_connected(&core, &[boundary], None), 1);
+    assert_eq!(expect_accepted(&core, &[boundary], None), 1);
 
     let stale = mine_with_bits(parent.block_hash(), parent.time + 150, 1, EASY_BITS);
     let err = expect_err(&core, &[stale], None);
@@ -280,7 +280,7 @@ fn hdr_06_mainnet_and_regtest_boundaries() {
         config: config.with_params(Params::new(Network::Regtest)),
     };
     let boundary = mine(parent.block_hash(), parent.time + 1, 0);
-    assert_eq!(expect_connected(&core, &[boundary], None), 1);
+    assert_eq!(expect_accepted(&core, &[boundary], None), 1);
 
     let wrong = mine_with_bits(parent.block_hash(), parent.time + 2, 1, EASY_BITS - 1);
     let err = expect_err(&core, &[wrong], None);
@@ -296,7 +296,7 @@ fn hdr_07_median_time_past() {
     let universe = header_universe();
     let core = mainnet_core(&[(SEED_HEIGHT, universe.genesis)]);
     let trunk = &universe.headers[..11];
-    assert_eq!(expect_connected(&core, trunk, None), 11);
+    assert_eq!(expect_accepted(&core, trunk, None), 11);
 
     // A1..A11 carry SEED_TIME + 1..=11, so their median is SEED_TIME + 6.
     let equal = mine(trunk[10].block_hash(), SEED_TIME + 6, 1);
@@ -310,14 +310,14 @@ fn hdr_07_median_time_past() {
     // One second above the previous-11 median. A window that wrongly includes
     // this header has median SEED_TIME + 7 and would reject it.
     let above = mine(trunk[10].block_hash(), SEED_TIME + 7, 2);
-    assert_eq!(expect_connected(&core, &[above], None), 1);
+    assert_eq!(expect_accepted(&core, &[above], None), 1);
 
     // A fresh store has only the seed, so the window is sparse and the check
     // does not apply, even for an old timestamp.
     let seed = mine(BlockHash::all_zeros(), SEED_TIME, 0);
     let sparse = mainnet_core(&[(SEED_HEIGHT, seed)]);
     let old = mine(seed.block_hash(), SEED_TIME - 1_000, 3);
-    assert_eq!(expect_connected(&sparse, &[old], None), 1);
+    assert_eq!(expect_accepted(&sparse, &[old], None), 1);
 }
 
 /// HDR-08: the two-hour future-time window is inclusive, and optional.
@@ -328,7 +328,7 @@ fn hdr_08_future_time() {
     let parent = genesis.block_hash();
 
     let at_limit = mine(parent, (NOW + MAX_FUTURE_BLOCK_TIME) as u32, 0);
-    assert_eq!(expect_connected(&core, &[at_limit], Some(NOW)), 1);
+    assert_eq!(expect_accepted(&core, &[at_limit], Some(NOW)), 1);
 
     let over = mine(parent, (NOW + MAX_FUTURE_BLOCK_TIME + 1) as u32, 1);
     let err = expect_err(&core, &[over], Some(NOW));
@@ -341,5 +341,5 @@ fn hdr_08_future_time() {
     );
 
     let no_clock = mine(parent, (NOW + 1_000_000) as u32, 2);
-    assert_eq!(expect_connected(&core, &[no_clock], None), 1);
+    assert_eq!(expect_accepted(&core, &[no_clock], None), 1);
 }

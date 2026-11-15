@@ -192,11 +192,11 @@ impl Iterator for CoinbaseTags {
     }
 }
 
-/// Outcome of a [`Core::connect_headers`] call./// Outcome of a [`Core::connect_headers`] call.
+/// Outcome of a [`Core::submit_bitcoin_headers`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConnectOutcome {
+pub struct SubmitBitcoinOutcome {
     /// Headers newly accepted and stored (across whatever fork they landed on).
-    pub connected: usize,
+    pub accepted: usize,
     /// The fork that was current before this batch. `None` on the very first
     /// connection or when the batch stayed on the same chain.
     pub prev_best_fork: Option<u64>,
@@ -205,7 +205,7 @@ pub struct ConnectOutcome {
     /// Canonical tip height after this batch.
     pub tip_height: u64,
     /// The new finality mark, if this batch advanced it: the mark is advanced
-    /// automatically, inside the same transaction as the connect.
+    /// automatically, inside the same transaction as the submission.
     pub finalized: Option<u64>,
     /// Network-partition safety as this batch left it: what the best chain carries
     /// above the mark and what the rule demands. `None` when the store is
@@ -312,7 +312,7 @@ impl Core {
 
     /// Network-partition safety as the rule sees it right now: the mark it is measured
     /// from, the estimated work it demands, and what the best chain carries
-    /// above the mark. A read-only view of the decision the connect path makes,
+    /// above the mark. A read-only view of the decision the submit path makes,
     /// for status output. A core with partition safety disabled reports the
     /// tip-work requirement instead.
     pub fn finality_status(&self, now: u64) -> Result<Option<FinalityStatus>, Error> {
@@ -577,7 +577,7 @@ impl Core {
     ///
     /// The table is **sparse**, not a complete window: the IBD scan fetches only
     /// the coinbases it reads. This is that scan's retention floor, and
-    /// [`Core::connect_headers`] deletes rows below a newly reached boundary.
+    /// [`Core::submit_bitcoin_headers`] deletes rows below a newly reached boundary.
     pub fn coinbase_retention_floor(&self) -> Result<Option<u64>, Error> {
         let Some(tip) = self.tip_height()? else {
             return Ok(None);
@@ -592,7 +592,7 @@ impl Core {
     /// finalized checkpoint and any row whose block is no longer canonical.
     /// Returns the number of rows removed.
     ///
-    /// `connect_headers` does this automatically when the mark advances or the
+    /// `submit_bitcoin_headers` does this automatically when the mark advances or the
     /// best chain changes; this method is for a maintenance pass.
     pub(crate) fn prune_coinbases_impl(&self) -> Result<usize, Error> {
         let txn = self.store.write()?;
@@ -655,11 +655,11 @@ impl Core {
     /// advance below — runs inside one write transaction, so nothing can change
     /// the store between the reads a decision is based on and the writes that
     /// act on it.
-    pub(crate) fn connect_headers_impl(
+    pub(crate) fn submit_bitcoin_headers_impl(
         &self,
         headers: &[BitcoinHeader],
         now: Option<u64>,
-    ) -> Result<ConnectOutcome, Error> {
+    ) -> Result<SubmitBitcoinOutcome, Error> {
         // One transaction for the entire read → validate → write → advance
         // sequence. Dropping it without committing (the early returns) aborts.
         let txn = self.store.write()?;
@@ -677,14 +677,14 @@ impl Core {
 
         let prev_best = txn.best_fork()?;
 
-        // Nothing to connect: report the current tip (the transaction aborts).
+        // Nothing to submit: report the current tip (the transaction aborts).
         if headers.is_empty() {
             let tip = match prev_best {
                 Some(f) => txn.fork_tip(f)?.unwrap_or((0, BlockHash::all_zeros())).0,
                 None => 0,
             };
-            return Ok(ConnectOutcome {
-                connected: 0,
+            return Ok(SubmitBitcoinOutcome {
+                accepted: 0,
                 prev_best_fork: prev_best,
                 best_fork: prev_best,
                 tip_height: tip,
@@ -703,8 +703,8 @@ impl Core {
                 Some(f) => txn.fork_tip(f)?.unwrap_or((0, BlockHash::all_zeros())).0,
                 None => 0,
             };
-            return Ok(ConnectOutcome {
-                connected: 0,
+            return Ok(SubmitBitcoinOutcome {
+                accepted: 0,
                 prev_best_fork: prev_best,
                 best_fork: prev_best,
                 tip_height: tip,
@@ -913,8 +913,8 @@ impl Core {
         }
         txn.commit()?;
 
-        Ok(ConnectOutcome {
-            connected: headers.len() - start,
+        Ok(SubmitBitcoinOutcome {
+            accepted: headers.len() - start,
             prev_best_fork: prev_best,
             best_fork: Some(best),
             tip_height,
@@ -923,25 +923,25 @@ impl Core {
         })
     }
 
-    /// Connect a single header (Electrum's near-tip `save_header` path) at the
+    /// Submit a single header (Electrum's near-tip `save_header` path) at the
     /// caller's clock.
     ///
-    /// Test-only: the sync callers use [`Core::connect_headers`] directly.
+    /// Test-only: the sync callers use [`Core::submit_bitcoin_headers`] directly.
     #[cfg(test)]
-    pub fn connect_header(
+    pub fn submit_bitcoin_header(
         &self,
         header: &BitcoinHeader,
         now: u64,
-    ) -> Result<ConnectOutcome, Error> {
-        self.connect_headers(std::slice::from_ref(header), now)
+    ) -> Result<SubmitBitcoinOutcome, Error> {
+        self.submit_bitcoin_headers(std::slice::from_ref(header), now)
     }
 
     /// Advance the finality mark to the newest difficulty-period boundary that
     /// is at least a full period below the tip, if the requirement allows it. Returns
     /// the new mark.
     ///
-    /// This runs automatically at the end of every [`Core::connect_headers`]
-    /// batch (reported in [`ConnectOutcome::finalized`]); you do not normally
+    /// This runs automatically at the end of every [`Core::submit_bitcoin_headers`]
+    /// batch (reported in [`SubmitBitcoinOutcome::finalized`]); you do not normally
     /// need to call it.
     ///
     /// Only advances when the work above the mark clears the requirement: on
@@ -957,7 +957,7 @@ impl Core {
     /// (fork 0) is assumed canonical.
     ///
     /// Test-only: production advancement rides inside
-    /// [`Core::connect_headers`].
+    /// [`Core::submit_bitcoin_headers`].
     #[cfg(test)]
     pub fn finalize_period(&self, now: u64) -> Result<Option<u64>, Error> {
         let txn = self.store.write()?;
@@ -972,17 +972,17 @@ impl Core {
     }
 }
 
-/// What the finality rule concluded for one connect.
+/// What the finality rule concluded for one submission.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct Finality {
-    /// The new mark, if this connect advanced it.
+    /// The new mark, if this submission advanced it.
     advanced: Option<u64>,
     /// The requirement as judged, if it could be measured.
     status: Option<FinalityStatus>,
 }
 
 impl Finality {
-    /// The requirement was measured but no boundary was settled this connect.
+    /// The requirement was measured but no boundary was settled this submission.
     fn not_yet(status: FinalityStatus) -> Self {
         Self {
             advanced: None,
@@ -992,7 +992,7 @@ impl Finality {
 }
 
 /// The finality rule, applied through an open transaction. Factored out so
-/// `connect_headers` can run it inside the same transaction as the connect.
+/// `submit_bitcoin_headers` can run it inside the same transaction as the submission.
 fn finalize_in_txn(
     txn: &WriteTxn,
     now: Option<u64>,
@@ -1068,7 +1068,7 @@ fn chain_time_at<R: BtcReads>(reads: &R, fork: u64, tip: u64) -> Result<u64, Err
     Ok(u64::from(validation::median_time_past(times)))
 }
 
-/// The clock a connect or a status read runs on: the greatest supplied value,
+/// The clock a submission or a status read runs on: the greatest supplied value,
 /// the stored high-water mark, and the chain time at the best tip.
 ///
 /// The first two keep a wound-back or absent caller clock from shrinking the
@@ -1098,7 +1098,7 @@ struct Measurement {
 }
 
 /// The requirement through an open transaction, writing nothing of its own.
-/// Shared by the connect path and [`Core::finality_status`], so a status read
+/// Shared by the submit path and [`Core::finality_status`], so a status read
 /// and a decision can never drift.
 ///
 /// The anchor is the mark itself: any history the node has already finalized is
@@ -1353,7 +1353,7 @@ mod last_normal_bits_tests {
 // ── proof-of-work helper ────────────────────────────────────────────────────
 
 /// Compute the `Work` carried by a header (needed by callers that assemble
-/// branches before handing them to [`Core::connect_headers`]).
+/// branches before handing them to [`Core::submit_bitcoin_headers`]).
 pub fn header_work(header: &BitcoinHeader) -> Work {
     header.target().to_work()
 }
@@ -1370,33 +1370,33 @@ impl Core {
         }
     }
 
-    /// Connect a run of Bitcoin headers at the caller's clock.
-    pub fn connect_headers(
+    /// Submit a run of Bitcoin headers at the caller's clock.
+    pub fn submit_bitcoin_headers(
         &self,
         headers: &[BitcoinHeader],
         now: u64,
-    ) -> Result<ConnectOutcome, Error> {
-        self.connect_headers_with_clock(headers, Some(now))
+    ) -> Result<SubmitBitcoinOutcome, Error> {
+        self.submit_bitcoin_headers_with_clock(headers, Some(now))
     }
 
-    /// Connect a run of Bitcoin headers with no caller clock. The clock is the
+    /// Submit a run of Bitcoin headers with no caller clock. The clock is the
     /// greatest of the stored high-water mark and the chain time at the best
     /// tip: the median of its last 11 header times.
-    pub fn connect_headers_clockless(
+    pub fn submit_bitcoin_headers_clockless(
         &self,
         headers: &[BitcoinHeader],
-    ) -> Result<ConnectOutcome, Error> {
-        self.connect_headers_with_clock(headers, None)
+    ) -> Result<SubmitBitcoinOutcome, Error> {
+        self.submit_bitcoin_headers_with_clock(headers, None)
     }
 
-    fn connect_headers_with_clock(
+    fn submit_bitcoin_headers_with_clock(
         &self,
         headers: &[BitcoinHeader],
         now: Option<u64>,
-    ) -> Result<ConnectOutcome, Error> {
-        match self.apply(crate::Action::ConnectHeaders { headers, now })? {
-            crate::Outcome::Connected(outcome) => Ok(outcome),
-            other => Err(unexpected("connect_headers", other)),
+    ) -> Result<SubmitBitcoinOutcome, Error> {
+        match self.apply(crate::Action::SubmitBitcoinHeaders { headers, now })? {
+            crate::Outcome::BitcoinSubmitted(outcome) => Ok(outcome),
+            other => Err(unexpected("submit_bitcoin_headers", other)),
         }
     }
 
@@ -1463,7 +1463,7 @@ mod tests {
     /// A fixed base timestamp for synthetic headers.
     const BASE_TIME: u32 = 1_600_000_000;
 
-    /// The clock the synthetic tests connect at: 2,400,000 s (40 days) past
+    /// The clock the synthetic tests submit at: 2,400,000 s (40 days) past
     /// [`BASE_TIME`]. It is comfortably after every synthetic header time and
     /// before any real clock, so it never trips HDR-08 — the neutral setting for
     /// tests that are not about time.
@@ -1648,8 +1648,8 @@ mod tests {
         assert_eq!(chain.best_fork()?, Some(0));
 
         let run = easy_chain(&canonical(&chain, 0), 5, 1);
-        let out = chain.connect_headers(&run, NOW)?;
-        assert_eq!(out.connected, 5);
+        let out = chain.submit_bitcoin_headers(&run, NOW)?;
+        assert_eq!(out.accepted, 5);
         assert_eq!(out.best_fork, Some(0));
         assert_eq!(out.tip_height, 5);
 
@@ -1663,7 +1663,7 @@ mod tests {
     fn a_conflicting_anchor_is_refused_and_leaves_the_chain_intact() -> eyre::Result<()> {
         let chain = seeded();
         let run = easy_chain(&canonical(&chain, 0), 5, 1);
-        chain.connect_headers(&run, NOW)?;
+        chain.submit_bitcoin_headers(&run, NOW)?;
         let tip = chain.tip_height()?;
         let work = chain.chainwork()?;
 
@@ -1693,7 +1693,7 @@ mod tests {
         while bad[0].validate_pow(bad[0].target()).is_ok() {
             bad[0].nonce = bad[0].nonce.wrapping_add(1);
         }
-        let err = chain.connect_headers(&bad, NOW).unwrap_err();
+        let err = chain.submit_bitcoin_headers(&bad, NOW).unwrap_err();
         assert!(matches!(err, Error::BadPow { .. }), "got {err:?}");
         Ok(())
     }
@@ -1702,7 +1702,7 @@ mod tests {
     fn rejects_unknown_ancestor() -> eyre::Result<()> {
         let chain = seeded();
         let run = [mine_at(BlockHash::all_zeros(), BASE_TIME + 1, EASY_BITS)]; // links to nothing stored
-        let err = chain.connect_headers(&run, NOW).unwrap_err();
+        let err = chain.submit_bitcoin_headers(&run, NOW).unwrap_err();
         assert!(matches!(err, Error::UnknownAncestor(_)), "got {err:?}");
         Ok(())
     }
@@ -1711,8 +1711,8 @@ mod tests {
     fn single_header_connects() -> eyre::Result<()> {
         let chain = seeded();
         let h = mine_child(&canonical(&chain, 0), EASY_BITS, 1);
-        let out = chain.connect_header(&h, NOW)?;
-        assert_eq!(out.connected, 1);
+        let out = chain.submit_bitcoin_header(&h, NOW)?;
+        assert_eq!(out.accepted, 1);
         assert_eq!(out.tip_height, 1);
         assert!(chain.is_canonical(1, &h.block_hash())?);
         Ok(())
@@ -1722,15 +1722,15 @@ mod tests {
     fn lighter_fork_is_kept_not_rejected() -> eyre::Result<()> {
         let chain = seeded();
         let main = easy_chain(&canonical(&chain, 0), 5, 1);
-        chain.connect_headers(&main, NOW)?;
+        chain.submit_bitcoin_headers(&main, NOW)?;
         assert_eq!(chain.tip_height()?, Some(5));
 
         // A lighter fork from height 3 (parent = main[2]) with 2 blocks. Its
         // tip (height 5) ties, but with strictly less work it must not become
         // best — and crucially it must be *stored*, not rejected.
         let fork = easy_chain(&main[2], 2, 1000);
-        let out = chain.connect_headers(&fork, NOW)?;
-        assert_eq!(out.connected, 2);
+        let out = chain.submit_bitcoin_headers(&fork, NOW)?;
+        assert_eq!(out.accepted, 2);
         assert_eq!(out.best_fork, Some(0), "best chain must stay the root");
 
         // The fork survives in the tree and its headers are locatable.
@@ -1750,12 +1750,12 @@ mod tests {
     fn chainwork_at_resolves_the_ancestor_fork() -> eyre::Result<()> {
         let chain = seeded();
         let main = easy_chain(&canonical(&chain, 0), 5, 1);
-        chain.connect_headers(&main, NOW)?;
+        chain.submit_bitcoin_headers(&main, NOW)?;
 
         // A heavier fork from height 3 (parent = main[2]) wins; its forkpoint is
         // 4, so heights below it live on the root chain.
         let fork = easy_chain(&main[2], 5, 1000);
-        chain.connect_headers(&fork, NOW)?;
+        chain.submit_bitcoin_headers(&fork, NOW)?;
         let best = chain.best_fork()?.expect("a best fork");
         assert_ne!(best, 0);
 
@@ -1775,7 +1775,7 @@ mod tests {
         // back too — the whole read/validate/write/advance runs in one txn.
         let chain = seeded();
         let main = easy_chain(&canonical(&chain, 0), 5, 1);
-        chain.connect_headers(&main, NOW)?;
+        chain.submit_bitcoin_headers(&main, NOW)?;
         assert_eq!(chain.store.read()?.fork_count()?, 1);
 
         // Fork from height 3 (parent = main[2], not the tip), second header
@@ -1785,7 +1785,7 @@ mod tests {
         while fork[1].validate_pow(fork[1].target()).is_ok() {
             fork[1].nonce = fork[1].nonce.wrapping_add(1);
         }
-        let err = chain.connect_headers(&fork, NOW).unwrap_err();
+        let err = chain.submit_bitcoin_headers(&fork, NOW).unwrap_err();
         assert!(matches!(err, Error::BadPow { .. }), "got {err:?}");
 
         // No orphan fork, and no header of the batch was committed.
@@ -1798,12 +1798,12 @@ mod tests {
     fn heavier_fork_wins() -> eyre::Result<()> {
         let chain = seeded();
         let main = easy_chain(&canonical(&chain, 0), 5, 1);
-        chain.connect_headers(&main, NOW)?;
+        chain.submit_bitcoin_headers(&main, NOW)?;
 
         // Fork from height 3 with 5 blocks → tip 8, strictly more work.
         let fork = easy_chain(&main[2], 5, 1000);
-        let out = chain.connect_headers(&fork, NOW)?;
-        assert_eq!(out.connected, 5);
+        let out = chain.submit_bitcoin_headers(&fork, NOW)?;
+        assert_eq!(out.accepted, 5);
         assert_eq!(out.tip_height, 8);
         let best = chain.best_fork()?.unwrap();
         assert_ne!(best, 0, "fork must become best");
@@ -1825,7 +1825,7 @@ mod tests {
         let genesis = canonical(&chain, 0);
 
         // Main to 4,132 so the mark is 4,032.
-        chain.connect_headers(&easy_chain(&genesis, 4_132, 1), NOW)?;
+        chain.submit_bitcoin_headers(&easy_chain(&genesis, 4_132, 1), NOW)?;
         assert_eq!(chain.finalized_height()?, Some(4_032));
 
         // Prepare both runs first: once the fork is best, the canonical reads
@@ -1833,11 +1833,11 @@ mod tests {
         let root = easy_chain(&canonical(&chain, 4_132), 4_000, 3_000);
         // A fork above the mark (forkpoint 4,101) can still win if it is heavier.
         let fork = easy_chain(&canonical(&chain, 4_100), 3_000, 2_000);
-        chain.connect_headers(&fork, NOW)?;
+        chain.submit_bitcoin_headers(&fork, NOW)?;
         assert_ne!(chain.best_fork()?, Some(0), "the heavier fork is best");
 
         // The root chain wins back once it is heavier; the guard must exempt it.
-        chain.connect_headers(&root, NOW)?;
+        chain.submit_bitcoin_headers(&root, NOW)?;
         assert_eq!(
             chain.best_fork()?,
             Some(0),
@@ -1850,7 +1850,7 @@ mod tests {
     fn fork_below_finalized_is_refused() -> eyre::Result<()> {
         let chain = seeded();
         let main = easy_chain(&canonical(&chain, 0), 6, 1);
-        chain.connect_headers(&main, NOW)?;
+        chain.submit_bitcoin_headers(&main, NOW)?;
 
         // Advance the finality mark to height 1, as an advance would.
         let txn = chain.store.write()?;
@@ -1860,7 +1860,7 @@ mod tests {
 
         // A fork starting at height 1 (forkpoint 1 <= finalized 1) is refused.
         let fork = easy_chain(&canonical(&chain, 0), 3, 1000);
-        let err = chain.connect_headers(&fork, NOW).unwrap_err();
+        let err = chain.submit_bitcoin_headers(&fork, NOW).unwrap_err();
         assert!(
             matches!(err, Error::ForkBelowFinalized { .. }),
             "got {err:?}"
@@ -1874,19 +1874,19 @@ mod tests {
         // later when more of its headers arrive.
         let chain = seeded();
         let main = easy_chain(&canonical(&chain, 0), 5, 1);
-        chain.connect_headers(&main, NOW)?;
+        chain.submit_bitcoin_headers(&main, NOW)?;
         assert_eq!(chain.best_fork()?, Some(0));
 
         // First arrives a short, lighter slice of a fork from height 3.
         let fork_part1 = easy_chain(&main[2], 1, 1000);
-        let out = chain.connect_headers(&fork_part1, NOW)?;
-        assert_eq!(out.connected, 1);
+        let out = chain.submit_bitcoin_headers(&fork_part1, NOW)?;
+        assert_eq!(out.accepted, 1);
         assert_eq!(chain.best_fork()?, Some(0), "still root while lighter");
 
         // Later, more headers of the same fork arrive, tipping it heavier.
         let fork_part2 = easy_chain(&fork_part1[0], 4, 1001);
-        let out = chain.connect_headers(&fork_part2, NOW)?;
-        assert_eq!(out.connected, 4);
+        let out = chain.submit_bitcoin_headers(&fork_part2, NOW)?;
+        assert_eq!(out.accepted, 4);
         assert_eq!(out.tip_height, 8);
         let best = chain.best_fork()?.unwrap();
         assert_ne!(best, 0, "fork wins once it becomes heavier");
@@ -1909,10 +1909,10 @@ mod tests {
             2 * DIFFICULTY_PERIOD as usize + 100,
             1,
         );
-        let out = chain.connect_headers(&run, NOW)?;
+        let out = chain.submit_bitcoin_headers(&run, NOW)?;
         assert_eq!(chain.tip_height()?, Some(2 * DIFFICULTY_PERIOD + 100));
 
-        // The mark advanced automatically as part of the connect.
+        // The mark advanced automatically as part of the submission.
         assert_eq!(out.finalized, Some(2 * DIFFICULTY_PERIOD));
         assert_eq!(chain.finalized_height()?, Some(2 * DIFFICULTY_PERIOD));
 
@@ -1946,7 +1946,7 @@ mod tests {
         // boundary, and the next boundary (6,048) is above it.
         let parent = canonical(&chain, 0);
         let run = easy_chain(&parent, 2 * DIFFICULTY_PERIOD as usize + 100, 1);
-        chain.connect_headers(&run, NOW)?;
+        chain.submit_bitcoin_headers(&run, NOW)?;
 
         let finalized = chain.finalized_height()?.expect("a finality mark");
         assert_eq!(finalized, 2 * DIFFICULTY_PERIOD);
@@ -1973,8 +1973,8 @@ mod tests {
             2 * DIFFICULTY_PERIOD as usize + 100,
             1,
         );
-        // The connect advances the tail and does NOT prune.
-        let out = chain.connect_headers(&run, NOW)?;
+        // The submission advances the tail and does NOT prune.
+        let out = chain.submit_bitcoin_headers(&run, NOW)?;
         assert_eq!(out.finalized, Some(2 * DIFFICULTY_PERIOD));
 
         // The checkpoint spine still resolves: height 0 (the seeded genesis)
@@ -2029,8 +2029,8 @@ mod tests {
         // And we can extend on top of the real genesis hash with synthetic
         // headers (continuity is what matters here, not difficulty).
         let run = mine_chain_from(&genesis, 2, EASY_BITS, 1);
-        let out = chain.connect_headers(&run, NOW)?;
-        assert_eq!(out.connected, 2);
+        let out = chain.submit_bitcoin_headers(&run, NOW)?;
+        assert_eq!(out.accepted, 2);
         assert_eq!(out.tip_height, 2);
         Ok(())
     }
@@ -2044,7 +2044,7 @@ mod tests {
         let checkpoint = DIFFICULTY_PERIOD as usize;
 
         let run1 = easy_chain(&canonical(&chain, 0), checkpoint, 1);
-        let out = chain.connect_headers(&run1, NOW)?;
+        let out = chain.submit_bitcoin_headers(&run1, NOW)?;
         assert_eq!(chain.tip_height()?, Some(checkpoint as u64));
         assert_eq!(
             out.finalized,
@@ -2052,7 +2052,7 @@ mod tests {
         );
 
         let run2 = easy_chain(&canonical(&chain, checkpoint as u64), checkpoint + 100, 1);
-        let out = chain.connect_headers(&run2, NOW)?;
+        let out = chain.submit_bitcoin_headers(&run2, NOW)?;
         assert_eq!(chain.tip_height()?, Some((2 * checkpoint + 100) as u64));
         assert_eq!(
             out.finalized,
@@ -2080,7 +2080,7 @@ mod tests {
                 .with_anchor(&[(0, genesis)]),
         )?;
         let run = easy_chain(&genesis, 110, 1);
-        let out = chain.connect_headers(&run, NOW)?;
+        let out = chain.submit_bitcoin_headers(&run, NOW)?;
         assert_eq!(out.tip_height, 110);
         assert_eq!(out.finalized, Some(10));
         let status = out.finality.expect("the requirement is measurable");
@@ -2101,7 +2101,7 @@ mod tests {
 
         // 90 blocks: the tip is shallower than the window, so the candidate
         // underflows to 0 and the mark stays where it is.
-        let short = chain.connect_headers(&easy_chain(&genesis, 90, 1), NOW)?;
+        let short = chain.submit_bitcoin_headers(&easy_chain(&genesis, 90, 1), NOW)?;
         assert_eq!(short.finalized, None);
         assert_eq!(chain.finalized_height()?, Some(0));
         let status = short.finality.expect("the requirement is measurable");
@@ -2115,7 +2115,7 @@ mod tests {
 
         // 101 blocks: one above the window, so the mark moves to height 1.
         let run = easy_chain(&canonical(&chain, 90), 11, 1);
-        let out = chain.connect_headers(&run, NOW)?;
+        let out = chain.submit_bitcoin_headers(&run, NOW)?;
         assert_eq!(chain.tip_height()?, Some(101));
         assert_eq!(out.finalized, Some(1));
         assert_eq!(chain.finalized_height()?, Some(1));
@@ -2131,7 +2131,7 @@ mod tests {
         let w = crate::btc::header_work(&genesis);
 
         let run = easy_chain(&genesis, 10, 1);
-        let out = chain.connect_headers(&run, genesis.time as u64)?;
+        let out = chain.submit_bitcoin_headers(&run, genesis.time as u64)?;
         let status = out.finality.expect("the requirement is measurable");
         assert_eq!(
             finality::work_to_u256(status.have),
@@ -2143,7 +2143,7 @@ mod tests {
         Ok(())
     }
 
-    /// A wound-back clock is floored by the high-water mark: the connect
+    /// A wound-back clock is floored by the high-water mark: the submission
     /// succeeds and the stored clock is not lowered.
     #[test]
     fn a_wound_back_clock_is_floored() -> eyre::Result<()> {
@@ -2153,13 +2153,13 @@ mod tests {
 
         let first = easy_chain(&genesis, 5, 1);
         let high = anchor_time + 86_400;
-        chain.connect_headers(&first, high)?;
+        chain.submit_bitcoin_headers(&first, high)?;
         assert_eq!(chain.state()?.now_hwm, Some(high));
 
         // A day earlier than the clock already seen.
         let second = mine_child(&canonical(&chain, 5), EASY_BITS, 1);
-        let out = chain.connect_headers(&[second], anchor_time)?;
-        assert_eq!(out.connected, 1, "a stale clock must not refuse the batch");
+        let out = chain.submit_bitcoin_headers(&[second], anchor_time)?;
+        assert_eq!(out.accepted, 1, "a stale clock must not refuse the batch");
         assert_eq!(chain.state()?.now_hwm, Some(high), "the floor did not hold");
         Ok(())
     }
@@ -2174,7 +2174,7 @@ mod tests {
 
         let child = mine_at(genesis.block_hash(), genesis.time + 600, EASY_BITS);
         let stale = anchor_time - 86_400;
-        let err = chain.connect_headers(&[child], stale).unwrap_err();
+        let err = chain.submit_bitcoin_headers(&[child], stale).unwrap_err();
         assert!(
             matches!(err, Error::TimestampTooNew { now, .. } if now == stale),
             "got {err:?}"
@@ -2182,7 +2182,7 @@ mod tests {
         Ok(())
     }
 
-    /// A clockless connect runs on the chain's own time and skips HDR-08: with no
+    /// A clockless submission runs on the chain's own time and skips HDR-08: with no
     /// clock there is no frame of reference for the future-time check.
     #[test]
     fn a_clockless_connect_runs_on_the_chain_time() -> eyre::Result<()> {
@@ -2191,8 +2191,8 @@ mod tests {
         let anchor_time = genesis.time as u64;
 
         let run = easy_chain(&genesis, 3, 1);
-        let out = chain.connect_headers_clockless(&run)?;
-        assert_eq!(out.connected, 3);
+        let out = chain.submit_bitcoin_headers_clockless(&run)?;
+        assert_eq!(out.accepted, 3);
         // Three headers are fewer than the median window, so the chain time
         // falls back to the new tip's own time, recorded as the mark.
         assert_eq!(chain.state()?.now_hwm, Some(anchor_time + 3));
@@ -2201,8 +2201,8 @@ mod tests {
         // rejected for its timestamp alone.
         let tip = canonical(&chain, 3);
         let ahead = mine_at(tip.block_hash(), (anchor_time + 10_000) as u32, EASY_BITS);
-        let out = chain.connect_headers_clockless(&[ahead])?;
-        assert_eq!(out.connected, 1, "no future-time bound without a clock");
+        let out = chain.submit_bitcoin_headers_clockless(&[ahead])?;
+        assert_eq!(out.accepted, 1, "no future-time bound without a clock");
         Ok(())
     }
 
@@ -2216,7 +2216,7 @@ mod tests {
 
         // Twelve headers fill the 11-header window that ends at the tip.
         let run = easy_chain(&genesis, 12, 1);
-        chain.connect_headers_clockless(&run)?;
+        chain.submit_bitcoin_headers_clockless(&run)?;
         assert_eq!(chain.tip_height()?, Some(12));
 
         // Times are one second apart, so the median of heights 2..=12 is the
@@ -2227,7 +2227,7 @@ mod tests {
         // slides, and the outlier is one value of eleven.
         let tip = canonical(&chain, 12);
         let ahead = mine_at(tip.block_hash(), tip.time + 2 * 60 * 60, EASY_BITS);
-        chain.connect_headers_clockless(&[ahead])?;
+        chain.submit_bitcoin_headers_clockless(&[ahead])?;
         assert_eq!(chain.state()?.now_hwm, Some(anchor_time + 8));
         Ok(())
     }
@@ -2238,11 +2238,11 @@ mod tests {
     fn a_heavier_fork_cannot_move_the_mark() -> eyre::Result<()> {
         let chain = seeded();
         let main = easy_chain(&canonical(&chain, 0), 5, 1);
-        chain.connect_headers(&main, NOW)?;
+        chain.submit_bitcoin_headers(&main, NOW)?;
 
         // A strictly heavier fork off height 3 (parent = main[2]).
         let fork = easy_chain(&main[2], 5, 1000);
-        let out = chain.connect_headers(&fork, NOW)?;
+        let out = chain.submit_bitcoin_headers(&fork, NOW)?;
         assert_ne!(out.best_fork, Some(0), "the fork is best");
         assert_eq!(out.finalized, None);
         assert_eq!(
@@ -2284,7 +2284,7 @@ mod tests {
     fn a_resumed_store_adopts_the_newest_shipped_checkpoint_it_holds() -> eyre::Result<()> {
         let chain = seeded();
         let run = easy_chain(&canonical(&chain, 0), 4_032, 1);
-        chain.connect_headers(&run, NOW)?;
+        chain.submit_bitcoin_headers(&run, NOW)?;
         // The mark is at the reorg depth, not quantized to a boundary.
         let mark = 4_032 - finality::COINBASE_MATURITY;
         assert_eq!(chain.finalized_height()?, Some(mark));
@@ -2343,25 +2343,25 @@ mod tests {
         // Build the main chain to 2,100: the mark is 2,000, so a fork at 2,001
         // is still above it and may be created.
         let main = easy_chain(&genesis, 2_100, 1);
-        chain.connect_headers(&main, NOW)?;
+        chain.submit_bitcoin_headers(&main, NOW)?;
         assert_eq!(chain.finalized_height()?, Some(2_000));
 
         // Keep the branch lighter than the trunk for now, so the trunk stays
         // the best chain and the mark can advance.
         let fork = easy_chain(&main[1_999], 50, 2_000);
-        chain.connect_headers(&fork, NOW)?;
+        chain.submit_bitcoin_headers(&fork, NOW)?;
         assert_eq!(chain.best_fork()?, Some(0));
 
         // Advance the main chain past the forkpoint: the mark reaches 3,132.
         let rest = easy_chain(&canonical(&chain, 2_100), 1_132, 1);
-        chain.connect_headers(&rest, NOW)?;
+        chain.submit_bitcoin_headers(&rest, NOW)?;
         assert_eq!(chain.tip_height()?, Some(3_232));
         assert_eq!(chain.finalized_height()?, Some(3_132));
 
         // Make the fork heavier than the main chain: it must not win.
         let extension = easy_chain(&fork[49], 2_000, 3_000);
-        let out = chain.connect_headers(&extension, NOW)?;
-        assert_eq!(out.connected, 2_000);
+        let out = chain.submit_bitcoin_headers(&extension, NOW)?;
+        assert_eq!(out.accepted, 2_000);
         assert_eq!(chain.best_fork()?, Some(0), "the finality mark is a floor");
         assert_eq!(chain.tip_height()?, Some(3_232));
         assert_eq!(chain.finalized_height()?, Some(3_132));
@@ -2385,8 +2385,8 @@ mod tests {
         )?;
         let high = genesis.time as u64 + 4_000 * finality::TARGET_BLOCK_SECONDS;
 
-        // A connect at the high clock stores the HWM (no finalization yet).
-        let out = chain.connect_headers(&easy_chain(&genesis, 10, 1), high)?;
+        // A submission at the high clock stores the HWM (no finalization yet).
+        let out = chain.submit_bitcoin_headers(&easy_chain(&genesis, 10, 1), high)?;
         let need = out.finality.expect("the requirement is measurable").need;
 
         let status = chain
@@ -2413,7 +2413,7 @@ mod tests {
         // 100.
         let now = g2016.time as u64 + 4_000 * finality::TARGET_BLOCK_SECONDS;
         let run = easy_chain(&g2016, 4_100, 1);
-        let out = chain.connect_headers(&run, now)?;
+        let out = chain.submit_bitcoin_headers(&run, now)?;
         let status = out.finality.expect("the requirement is measurable");
         assert_eq!(status.anchor, DIFFICULTY_PERIOD);
         assert_eq!(status.anchor_time, g2016.time as u64);
@@ -2424,7 +2424,7 @@ mod tests {
         // seeded tip.
         let tip = chain.tip_height()?.expect("a tip");
         let more = easy_chain(&canonical(&chain, tip), 10, 1);
-        let out = chain.connect_headers(&more, now + 6_000)?;
+        let out = chain.submit_bitcoin_headers(&more, now + 6_000)?;
         assert_eq!(
             out.finality.expect("measurable").anchor,
             6_016,
@@ -2438,14 +2438,14 @@ mod tests {
         let chain = seeded();
         // 11 headers so a 12th has a full median-time-past window.
         let run = easy_chain(&canonical(&chain, 0), 11, 1);
-        chain.connect_headers(&run, NOW)?;
+        chain.submit_bitcoin_headers(&run, NOW)?;
 
         // A sibling of height 12 whose timestamp is below the median of the
         // previous 11 (the median is the 6th, well above the first block's time).
         let parent = canonical(&chain, 11);
         let too_early = canonical(&chain, 1).time;
         let bad = mine_at(parent.block_hash(), too_early, EASY_BITS);
-        let err = chain.connect_headers(&[bad], NOW).unwrap_err();
+        let err = chain.submit_bitcoin_headers(&[bad], NOW).unwrap_err();
         assert!(
             matches!(err, Error::BadTimestamp { height: 12, .. }),
             "got {err:?}"
@@ -2478,7 +2478,7 @@ mod tests {
             run.push(header);
             parent = header;
         }
-        chain.connect_headers_clockless(&run)?;
+        chain.submit_bitcoin_headers_clockless(&run)?;
         assert_eq!(chain.tip_height()?, Some(2_015));
 
         // The boundary header must carry the recomputed bits.
@@ -2493,12 +2493,14 @@ mod tests {
             BASE_TIME + 2_016 * 150,
             expected.to_consensus(),
         );
-        chain.connect_headers_clockless(&[boundary])?;
+        chain.submit_bitcoin_headers_clockless(&[boundary])?;
         assert_eq!(chain.tip_height()?, Some(2_016));
 
         // A sibling that keeps the old bits is refused at the boundary.
         let wrong = mine_at(parent.block_hash(), BASE_TIME + 2_016 * 150 + 1, EASY_BITS);
-        let err = chain.connect_headers_clockless(&[wrong]).unwrap_err();
+        let err = chain
+            .submit_bitcoin_headers_clockless(&[wrong])
+            .unwrap_err();
         assert!(
             matches!(err, Error::BadDifficulty { height: 2_016, .. }),
             "got {err:?}"
@@ -2510,13 +2512,15 @@ mod tests {
             BASE_TIME + 2_017 * 150,
             expected.to_consensus(),
         );
-        chain.connect_headers_clockless(&[after])?;
+        chain.submit_bitcoin_headers_clockless(&[after])?;
         let stale = mine_at(
             boundary.block_hash(),
             BASE_TIME + 2_017 * 150 + 1,
             EASY_BITS,
         );
-        let err = chain.connect_headers_clockless(&[stale]).unwrap_err();
+        let err = chain
+            .submit_bitcoin_headers_clockless(&[stale])
+            .unwrap_err();
         assert!(
             matches!(err, Error::BadDifficulty { height: 2_017, .. }),
             "got {err:?}"
@@ -2530,7 +2534,7 @@ mod tests {
         assert_eq!(chain.store.read()?.network()?, Some(Network::Regtest));
 
         // Re-open the same store believing it is mainnet: the recorded network
-        // wins over the caller's claim, at open and again at the first connect.
+        // wins over the caller's claim, at open and again at the first submission.
         let Core { store, config } = chain;
         let chain = Core {
             store,
@@ -2541,7 +2545,7 @@ mod tests {
             Err(Error::NetworkMismatch { .. })
         ));
         let header = mine_child(&canonical(&chain, 0), EASY_BITS, 1);
-        let err = chain.connect_headers(&[header], NOW).unwrap_err();
+        let err = chain.submit_bitcoin_headers(&[header], NOW).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -2564,7 +2568,7 @@ mod tests {
         let chain = seeded();
         let mut bad = easy_chain(&canonical(&chain, 0), 1, 1);
         bad[0].bits = CompactTarget::from_consensus(0x1d00_ffff);
-        let err = chain.connect_headers(&bad, NOW).unwrap_err();
+        let err = chain.submit_bitcoin_headers(&bad, NOW).unwrap_err();
         assert!(
             matches!(err, Error::BadDifficulty { height: 1, .. }),
             "got {err:?}"
@@ -2588,11 +2592,11 @@ mod tests {
 
         // A gap lets a minimum-difficulty block through.
         let min = mine_at(seed.block_hash(), seed.time + 2 * 600 + 1, EASY_BITS);
-        assert_eq!(chain.connect_headers(&[min], NOW)?.connected, 1);
+        assert_eq!(chain.submit_bitcoin_headers(&[min], NOW)?.accepted, 1);
 
         // Without a gap, the next header carries the last normal bits.
         let normal = mine_at(min.block_hash(), min.time + 1, 0x207f_fffe);
-        assert_eq!(chain.connect_headers(&[normal], NOW)?.connected, 1);
+        assert_eq!(chain.submit_bitcoin_headers(&[normal], NOW)?.accepted, 1);
         Ok(())
     }
 
@@ -2615,7 +2619,7 @@ mod tests {
 
         // 100 blocks is less than a period: work[0 .. 2016) is not stored.
         let run = easy_chain(&canonical(&chain, 0), 100, 1);
-        chain.connect_headers(&run, NOW)?;
+        chain.submit_bitcoin_headers(&run, NOW)?;
         assert_eq!(chain.finalized_height()?.unwrap(), 0, "no finalize yet");
         assert_eq!(chain.btc_tail_work(0)?, None);
         Ok(())
@@ -2629,7 +2633,7 @@ mod tests {
         let parent = canonical(&chain, 0);
         let n = 2 * DIFFICULTY_PERIOD as usize + 100;
         let run = mine_chain_from(&parent, n, EASY_BITS, 1);
-        chain.connect_headers(&run, NOW)?;
+        chain.submit_bitcoin_headers(&run, NOW)?;
 
         assert_eq!(chain.finalized_height()?.unwrap(), 2 * DIFFICULTY_PERIOD);
         let window = chain.chainwork_at(2 * DIFFICULTY_PERIOD)?.unwrap()
@@ -2652,7 +2656,7 @@ mod tests {
         // check does not reject them.
         let now = canonical(&chain, 0).time as u64 + 1_000 * finality::TARGET_BLOCK_SECONDS;
         let run1 = mine_chain_from(&canonical(&chain, 0), period, WORK22_BITS, 1);
-        chain.connect_headers(&run1, now)?;
+        chain.submit_bitcoin_headers(&run1, now)?;
 
         // Tail after boundary 2016 at the lower work 20, enough to outweigh the
         // period before it and finalize.
@@ -2663,7 +2667,7 @@ mod tests {
             WORK20_BITS,
             1,
         );
-        chain.connect_headers(&tail, now)?;
+        chain.submit_bitcoin_headers(&tail, now)?;
 
         assert_eq!(
             chain.finalized_height()?.unwrap(),
@@ -2729,13 +2733,13 @@ mod tests {
         // The same shape as `finalizes_at_the_reorg_depth`: 4,132 blocks put
         // the mark at 4,032.
         let run1 = easy_chain(&canonical(&chain, 0), DIFFICULTY_PERIOD as usize, 1);
-        chain.connect_headers(&run1, NOW)?;
+        chain.submit_bitcoin_headers(&run1, NOW)?;
         let run2 = easy_chain(
             &canonical(&chain, DIFFICULTY_PERIOD),
             DIFFICULTY_PERIOD as usize + 100,
             1,
         );
-        let out = chain.connect_headers(&run2, NOW)?;
+        let out = chain.submit_bitcoin_headers(&run2, NOW)?;
         assert_eq!(out.finalized, Some(2 * DIFFICULTY_PERIOD));
         assert!(chain.coinbase_at(0)?.is_none(), "superseded period pruned");
         Ok(())

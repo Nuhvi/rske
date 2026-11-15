@@ -177,7 +177,7 @@ struct HeaderTransition {
     batch: Vec<usize>,
 }
 
-/// The model's reading of `connect_headers`. It mirrors the skip-stored-prefix
+/// The model's reading of `submit_bitcoin_headers`. It mirrors the skip-stored-prefix
 /// step, the parent lookup, then link and PoW validation in the same order as
 /// the implementation, so it can predict the exact error variant.
 ///
@@ -305,7 +305,7 @@ impl StateMachineTest for HeaderMachine {
             .map(|&i| model.universe.headers[i])
             .collect();
         let before = sut.core.state().expect("state");
-        let outcome = sut.core.apply(Action::ConnectHeaders {
+        let outcome = sut.core.apply(Action::SubmitBitcoinHeaders {
             headers: &headers,
             now: None,
         });
@@ -336,12 +336,12 @@ impl StateMachineTest for HeaderMachine {
         // E1: an error leaves the store untouched, checked below.
         match (&model.last, &outcome) {
             // E2: an all-stored batch is a no-op.
-            (HeaderPrediction::Noop, Ok(Outcome::Connected(result))) => {
-                assert_eq!(result.connected, 0, "model expected a no-op");
+            (HeaderPrediction::Noop, Ok(Outcome::BitcoinSubmitted(result))) => {
+                assert_eq!(result.accepted, 0, "model expected a no-op");
                 assert_eq!(before, after, "a no-op changed the store");
             }
-            (HeaderPrediction::Connected(expected), Ok(Outcome::Connected(result))) => {
-                assert_eq!(result.connected, *expected, "connected count diverged");
+            (HeaderPrediction::Connected(expected), Ok(Outcome::BitcoinSubmitted(result))) => {
+                assert_eq!(result.accepted, *expected, "accepted count diverged");
                 assert_eq!(
                     result.best_fork, after.best_fork,
                     "the outcome's best fork disagrees with the store"
@@ -703,14 +703,14 @@ impl StateMachineTest for FinalityMachine {
         let before = sut.core.state().expect("state");
         let outcome = sut
             .core
-            .apply(Action::ConnectHeaders { headers, now: None });
+            .apply(Action::SubmitBitcoinHeaders { headers, now: None });
         let after = sut.core.state().expect("state");
 
-        // E6: `ConnectOutcome::finalized` reports exactly the mark movement the
+        // E6: `SubmitBitcoinOutcome::finalized` reports exactly the mark movement the
         // model predicted.
         match (&model.last, &outcome) {
-            (FinalityPrediction::Noop, Ok(Outcome::Connected(result))) => {
-                assert_eq!(result.connected, 0, "model expected a no-op");
+            (FinalityPrediction::Noop, Ok(Outcome::BitcoinSubmitted(result))) => {
+                assert_eq!(result.accepted, 0, "model expected a no-op");
                 assert!(result.finalized.is_none(), "a no-op advanced the mark");
             }
             (FinalityPrediction::UnknownAncestor, Err(Error::UnknownAncestor(_))) => {
@@ -721,14 +721,14 @@ impl StateMachineTest for FinalityMachine {
                     connected,
                     advanced: true,
                 },
-                Ok(Outcome::Connected(result)),
+                Ok(Outcome::BitcoinSubmitted(result)),
             ) => {
-                assert_eq!(result.connected, *connected);
+                assert_eq!(result.accepted, *connected);
                 assert_eq!(result.tip_height, model.tip);
                 assert_eq!(
                     result.finalized,
                     Some(model.mark),
-                    "the connect did not report the new mark"
+                    "the submission did not report the new mark"
                 );
             }
             (
@@ -736,14 +736,14 @@ impl StateMachineTest for FinalityMachine {
                     connected,
                     advanced: false,
                 },
-                Ok(Outcome::Connected(result)),
+                Ok(Outcome::BitcoinSubmitted(result)),
             ) => {
-                assert_eq!(result.connected, *connected);
+                assert_eq!(result.accepted, *connected);
                 assert_eq!(result.tip_height, model.tip);
                 assert_eq!(result.finalized, None, "the mark advanced unexpectedly");
             }
-            (FinalityPrediction::ForkStored, Ok(Outcome::Connected(result))) => {
-                assert_eq!(result.connected, 1);
+            (FinalityPrediction::ForkStored, Ok(Outcome::BitcoinSubmitted(result))) => {
+                assert_eq!(result.accepted, 1);
                 assert_eq!(after.best_fork, Some(0), "a light fork became best");
                 assert!(result.finalized.is_none(), "a fork advanced the mark");
             }
@@ -955,19 +955,19 @@ impl StateMachineTest for DifficultyMachine {
             DifficultyTransition::Wrong => model.universe.wrong,
         };
         let before = sut.core.state().expect("state");
-        let outcome = sut.core.apply(Action::ConnectHeaders {
+        let outcome = sut.core.apply(Action::SubmitBitcoinHeaders {
             headers: std::slice::from_ref(&header),
             now: None,
         });
         let after = sut.core.state().expect("state");
 
         match (&model.last, &outcome) {
-            (DifficultyPrediction::Noop, Ok(Outcome::Connected(result))) => {
-                assert_eq!(result.connected, 0, "model expected a no-op");
+            (DifficultyPrediction::Noop, Ok(Outcome::BitcoinSubmitted(result))) => {
+                assert_eq!(result.accepted, 0, "model expected a no-op");
                 assert_eq!(before, after, "a no-op changed the store");
             }
-            (DifficultyPrediction::Connected, Ok(Outcome::Connected(result))) => {
-                assert_eq!(result.connected, 1);
+            (DifficultyPrediction::Connected, Ok(Outcome::BitcoinSubmitted(result))) => {
+                assert_eq!(result.accepted, 1);
                 assert_eq!(after.best_fork, Some(0));
             }
             (
@@ -1021,7 +1021,7 @@ pub(super) struct FutureUniverse {
 pub(super) fn future_universe() -> FutureUniverse {
     let genesis = mine(BlockHash::all_zeros(), SEED_TIME, 0);
     let good = mine(genesis.block_hash(), SEED_TIME + 1, 0);
-    // One second beyond the two-hour window in `connect_headers`.
+    // One second beyond the two-hour window in `submit_bitcoin_headers`.
     let future = mine(
         genesis.block_hash(),
         (NOW + crate::btc::validation::MAX_FUTURE_BLOCK_TIME + 1) as u32,
@@ -1118,19 +1118,19 @@ impl StateMachineTest for FutureMachine {
             FutureTransition::Future => model.universe.future,
         };
         let before = sut.core.state().expect("state");
-        let outcome = sut.core.apply(Action::ConnectHeaders {
+        let outcome = sut.core.apply(Action::SubmitBitcoinHeaders {
             headers: std::slice::from_ref(&header),
             now: Some(NOW),
         });
         let after = sut.core.state().expect("state");
 
         match (&model.last, &outcome) {
-            (FuturePrediction::Noop, Ok(Outcome::Connected(result))) => {
-                assert_eq!(result.connected, 0, "model expected a no-op");
+            (FuturePrediction::Noop, Ok(Outcome::BitcoinSubmitted(result))) => {
+                assert_eq!(result.accepted, 0, "model expected a no-op");
                 assert_eq!(before, after, "a no-op changed the store");
             }
-            (FuturePrediction::Connected, Ok(Outcome::Connected(result))) => {
-                assert_eq!(result.connected, 1);
+            (FuturePrediction::Connected, Ok(Outcome::BitcoinSubmitted(result))) => {
+                assert_eq!(result.accepted, 1);
                 assert_eq!(after.best_fork, Some(0));
             }
             (
@@ -1225,15 +1225,15 @@ fn the_finality_requirement_gates_the_mark() {
     )
     .expect("in-memory store");
     let outcome = core
-        .apply(Action::ConnectHeaders {
+        .apply(Action::SubmitBitcoinHeaders {
             headers: &universe.headers,
             now: None,
         })
-        .expect("connect");
-    let Outcome::Connected(result) = outcome else {
-        panic!("expected a connected outcome");
+        .expect("submit");
+    let Outcome::BitcoinSubmitted(result) = outcome else {
+        panic!("expected a submitted outcome");
     };
-    assert_eq!(result.connected, FINALITY_BLOCKS);
+    assert_eq!(result.accepted, FINALITY_BLOCKS);
     assert_eq!(result.tip_height, SEED_HEIGHT + FINALITY_BLOCKS as u64);
 
     let finality = result.finality.expect("the requirement is measurable");
