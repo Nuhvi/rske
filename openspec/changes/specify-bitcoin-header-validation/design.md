@@ -33,8 +33,8 @@ this machine.
 
 - Put every requirement of `bitcoin-header-validation` behind one scenario test
   that drives `Core::apply`.
-- Separate rule scenarios, shared fixtures, external vectors and the existing
-  state machines into different files.
+- Separate rule scenarios, shared fixtures and the existing state machines
+  into different files.
 - Record every known difference from Bitcoin Core in one place.
 
 **Non-Goals:**
@@ -174,7 +174,6 @@ crates/core/specs/
   mod.rs                       declares the test modules
   support.rs                   shared mining and Core builders (new)
   bitcoin_header_validation.rs rule scenarios, HDR-00..HDR-08 (new)
-  vectors.rs                   external retarget vectors (new)
   bitcoin_headers.rs           the four state machines only (smaller)
   rootstock_checkpoints.rs     unchanged
 ```
@@ -192,11 +191,6 @@ crates/core/specs/
 - `store_identity_matches_the_spec` (O1) and
   `the_finality_requirement_gates_the_mark` (E6) stay in the machine file until
   the chain and finality capabilities exist.
-- `vectors.rs` holds a small table of `(network, first_time, parent_time,
-  parent_bits, expected_bits, source)`. The test asserts
-  `CompactTarget::from_next_work_required(parent_bits, first_to_parent,
-  params)` against `expected_bits`. The expected value comes from Bitcoin Core,
-  not from `rust-bitcoin`. Record the mainnet height and the tool used.
 - The file name mirrors the capability path, so the ID-to-file mapping is
   obvious.
 
@@ -212,8 +206,8 @@ crates/core/specs/
 | HDR-03 | anchor + 2 headers (bad hash, good hash) | 2 | valid range |
 | HDR-04 | mainnet anchor + parent + child | 2 | re-mine the wrong-bits child |
 | HDR-05 | testnet3 params, relaxed limit, anchor + 3 | 3 | normal bits must differ from the relaxed limit |
-| HDR-06 mainnet | boundary anchor + 2015 + boundary | ~8 s | quarter timespan; group three assertions |
-| HDR-06 regtest | anchor at boundary-1 + boundary | 1 | no retarget |
+| HDR-06 mainnet | boundary anchor + 2015 + boundary | ~16 s | quarter timespan; the hard boundary mine dominates |
+| HDR-06 regtest | reuse the stored chain with regtest params | 0 extra blocks | no retarget; the seed must start at a boundary |
 | HDR-07 full | boundary anchor + 11 + probe | 12 | equality and exclusion |
 | HDR-07 sparse | anchor + 1 | 1 | deviation |
 | HDR-08 | anchor + 1 per case | 1 | inclusive boundary |
@@ -226,8 +220,11 @@ Rules for negative tests:
 - If an earlier rule necessarily fails first, either repair the fixture or
   assert only that the submission is refused. Do not assert a later rule's error
   through a shadowed fixture.
-- Only HDR-06 needs the 2015-block chain. Group the assertions per network in
-  one test. Do not build the chain once per scenario.
+- Only HDR-06 needs the 2015-block chain. Build it once and reuse the store for
+  the regtest cases; the seed must start at a period boundary, so an anchor at
+  2015 is not possible.
+- When the intended rule runs before proof of work, the fixture needs no valid
+  hash. HDR-06 uses that for the unclamped value.
 
 The new scenario file does not use the `without_difficulty_check` seam. The
 delivery machine still uses it to keep `BadTarget` reachable.
@@ -255,18 +252,16 @@ should match Core for the same view.
 | Version floor | above the BIP34/66/65 heights | accepts more | a later change |
 | Error order | all rules | the error differs, the verdict is equal | none |
 
-### D10. External vector
+### D10. Retarget arithmetic: accepted dependency risk
 
-One Core-derived retarget vector is enough to break the shared-oracle problem.
-The row is a difficulty period with a non-no-op retarget: the period-start time
-and bits, the last block's time, and the compact target that Core computes for
-the next boundary. Prefer a real mainnet period. A Core-computed synthetic pair
-is acceptable when it isolates the lower clamp or the upper cap. The test calls
-`from_next_work_required` and compares. The comment records the heights and the
-tool that produced the value.
+The retarget formula comes from `rust-bitcoin`. The synthetic boundary fixture
+uses a base at the relaxed proof-of-work limit, so `parent_target * timespan`
+overflows 256 bits. Its expected value is the library's wrapped result, not a
+real retarget. No test checks the formula against Bitcoin Core.
 
-The vector does not replace the Core-level boundary test. It checks the
-arithmetic; the boundary test checks that the right inputs reach it.
+Accept that risk for this change. The dependency is widely used, and the normal
+mainnet path does not overflow. If a future change needs independent proof of
+the formula, add a real mainnet vector then.
 
 A differential harness against `bitcoind submitheader` is out of scope. It
 cannot exercise the retarget on regtest (`no_pow_retargeting`), and it needs its
@@ -314,12 +309,13 @@ name the API, so the two changes are independent.
 - **[MTP skip accepts non-Core headers near the seed]** → bounded to 11 heights
   above a trusted boundary; no work advantage; stated in HDR-07 and the ledger
   in D9; option (a) remains a follow-up.
-- **[Retarget arithmetic is not independently verified]** → one Core-derived
-  vector; the shared-library risk is stated, not hidden.
+- **[Retarget arithmetic is not independently verified]** → the formula comes
+  from `rust-bitcoin`, and the synthetic fixture's base overflows the 256-bit
+  multiply. Accepted for this change; add a vector later if needed.
 - **[A new `Error` variant breaks exhaustive matches]** → check in-workspace
   callers; the crate is not published.
-- **[The mainnet boundary fixture costs ~8 s]** → one grouped test; the
-  regtest cases are cheap.
+- **[The mainnet boundary fixture costs ~17 s]** → one grouped test; the
+  regtest cases reuse the store.
 - **[A future RSK network uses testnet4 or signet]** → both are refused today;
   add a requirement and its tests in a new change. The IDs are append-only.
 - **[Version floor is not checked]** → declared deviation; no work gain; a

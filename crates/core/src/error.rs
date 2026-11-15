@@ -69,6 +69,9 @@ pub enum Error {
     #[error("chain was seeded for {seeded}, not {opened}")]
     NetworkMismatch { seeded: Network, opened: Network },
 
+    #[error("network {0} is not supported; use mainnet, testnet3, or regtest")]
+    UnsupportedNetwork(Network),
+
     #[error("fork at height {fork} is at or below the finality mark {finalized}")]
     ForkBelowFinalized { fork: u64, finalized: u64 },
 

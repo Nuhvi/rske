@@ -29,9 +29,6 @@ so it needs one reviewable home first.
   `skip_specs`.
 - Add a Core-level scenario test file for the rules. Move the plain boundary
   tests out of the state-machine file. Add a shared fixture module.
-- Add one retarget vector that comes from Bitcoin Core, not from `rust-bitcoin`.
-  The current boundary test computes its expected value with the same library
-  the implementation uses.
 - Declare the version floor as an out-of-scope deviation for this capability.
   The design records the decision and the follow-up.
 
@@ -54,8 +51,8 @@ None.
   IDs in comments and the testnet4 base-branch removal.
 - `crates/core/src/rsk.rs`, `crates/rsk/src/rootstock.rs`: the network mapping
   cleanup.
-- `crates/core/specs/`: a new scenario file, a shared fixture module, a vector
-  module, and a smaller state-machine file.
+- `crates/core/specs/`: a new scenario file, a shared fixture module, and a
+  smaller state-machine file.
 - The repository-root `specs/` and `docs/` stay read-only. The change does not
   edit them and does not depend on them.
 - The public API keeps `connect_headers` until the separate rename change.

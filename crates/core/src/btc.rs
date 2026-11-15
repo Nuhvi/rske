@@ -640,8 +640,8 @@ impl Core {
     ///   overtaken its `forkpoint`; it is kept stored instead.
     ///
     /// `now` is the caller's clock (unix seconds), when the caller has one. The
-    /// core keeps no internal clock. The future-time check (C7) runs only on
-    /// this value; without it, C7 is skipped. The finality rule runs on the
+    /// core keeps no internal clock. The future-time check (HDR-08) runs only on
+    /// this value; without it, HDR-08 is skipped. The finality rule runs on the
     /// clock floor instead: the greatest of the supplied value, the stored
     /// high-water mark and the chain time at the best tip — the median of its
     /// last 11 header times, or the tip's own time when that window is not
@@ -814,7 +814,7 @@ impl Core {
                 });
             }
 
-            // C7: the timestamp may lead the caller clock by at most two hours.
+            // HDR-08: the timestamp may lead the caller clock by at most two hours.
             // Without an explicit clock there is no frame of reference for it,
             // so the check is skipped rather than fed a chain-derived value.
             if let Some(now) = now
@@ -1003,9 +1003,9 @@ fn finalize_in_txn(
     // tip. The chain time is the median of the last 11 header times, so one
     // miner's timestamp cannot move it. A caller with no clock therefore
     // measures the requirement from the chain's consensus time, and a stale
-    // value can never put the rule behind the chain it already holds. C7 does
+    // value can never put the rule behind the chain it already holds. HDR-08 does
     // not use this value: a chain-derived clock would reject the very headers
-    // it is meant to admit, so C7 runs only on an explicit clock.
+    // it is meant to admit, so HDR-08 runs only on an explicit clock.
     let hwm = txn.now_hwm()?;
     let now = effective_clock(txn, now, hwm)?;
     if hwm.is_none_or(|seen| now > seen) {
@@ -1465,7 +1465,7 @@ mod tests {
 
     /// The clock the synthetic tests connect at: 2,400,000 s (40 days) past
     /// [`BASE_TIME`]. It is comfortably after every synthetic header time and
-    /// before any real clock, so it never trips C7 — the neutral setting for
+    /// before any real clock, so it never trips HDR-08 — the neutral setting for
     /// tests that are not about time.
     const NOW: u64 = BASE_TIME as u64 + 2_400_000;
 
@@ -2164,7 +2164,7 @@ mod tests {
         Ok(())
     }
 
-    /// An explicit clock is the only basis for C7: a stale one rejects a
+    /// An explicit clock is the only basis for HDR-08: a stale one rejects a
     /// header that the chain itself would allow.
     #[test]
     fn a_stale_clock_fails_the_future_time_check() -> eyre::Result<()> {
@@ -2182,7 +2182,7 @@ mod tests {
         Ok(())
     }
 
-    /// A clockless connect runs on the chain's own time and skips C7: with no
+    /// A clockless connect runs on the chain's own time and skips HDR-08: with no
     /// clock there is no frame of reference for the future-time check.
     #[test]
     fn a_clockless_connect_runs_on_the_chain_time() -> eyre::Result<()> {
@@ -2197,7 +2197,7 @@ mod tests {
         // falls back to the new tip's own time, recorded as the mark.
         assert_eq!(chain.state()?.now_hwm, Some(anchor_time + 3));
 
-        // C7 is skipped without an explicit clock, so a future header is not
+        // HDR-08 is skipped without an explicit clock, so a future header is not
         // rejected for its timestamp alone.
         let tip = canonical(&chain, 3);
         let ahead = mine_at(tip.block_hash(), (anchor_time + 10_000) as u32, EASY_BITS);

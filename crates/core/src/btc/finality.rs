@@ -406,7 +406,7 @@ mod tests {
         let anchor = work_from_bits(0x207f_ffff);
         let tip = work_from_bits(0x1d00_ffff);
         let t0 = 1_600_000_000;
-        for network in [Network::Testnet, Network::Testnet4, Network::Regtest] {
+        for network in [Network::Testnet, Network::Regtest] {
             assert_eq!(
                 partition_safety_required(network, anchor, t0, GENESIS, tip, t0 + 30 * 86_400),
                 work_to_u256(tip)

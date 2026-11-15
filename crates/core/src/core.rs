@@ -63,7 +63,7 @@ pub struct Config {
     /// difficulty rules on a chain that is cheap to mine. A production node
     /// must keep this enabled.
     pub partition_safety: bool,
-    /// Check the expected `bits` of every new header (V5). The default is
+    /// Check the expected `bits` of every new header (HDR-04..HDR-06). The default is
     /// `true`. A test turns it off to exercise other checks on a fixture that
     /// does not follow the schedule.
     pub(crate) difficulty_check: bool,
@@ -126,7 +126,7 @@ impl Config {
 
     /// Turn off the expected-bits check.
     ///
-    /// Test-only: V5 has its own machine, and the delivery universe needs to
+    /// Test-only: HDR-04 has its own machine, and the delivery universe needs to
     /// reach the other checks with a target that the schedule would reject.
     #[cfg(test)]
     pub(crate) fn without_difficulty_check(mut self) -> Self {
@@ -178,6 +178,9 @@ impl Core {
     /// The store is anchored before the handle is returned: a fresh store gets
     /// the configured checkpoints, and an existing store must agree with them.
     pub fn new(config: Config) -> Result<Self, Error> {
+        if matches!(config.params.network, Network::Testnet4 | Network::Signet) {
+            return Err(Error::UnsupportedNetwork(config.params.network));
+        }
         let store = match &config.store {
             StoreConfig::File(path) => Store::open(path)?,
             StoreConfig::Memory => Store::in_memory()?,

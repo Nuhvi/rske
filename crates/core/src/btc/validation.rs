@@ -27,7 +27,6 @@
 //! - **Transaction / merkle validity** — not visible in a header; out of scope.
 //! - **Version rules** (BIP34/65/66/9) — height-activated and of no SPV value.
 
-use bitcoin::Network;
 use bitcoin::block::Header as BitcoinHeader;
 use bitcoin::consensus::Params;
 use bitcoin::pow::{CompactTarget, Target};
@@ -67,8 +66,7 @@ pub const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
 /// spacing after its parent must carry the proof-of-work limit, and any other
 /// header expects the bits of the last non-minimum-difficulty block in the
 /// period (see [`last_normal_bits`](crate::btc)). At a period boundary the
-/// retarget runs; testnet4 starts from the period-start bits (BIP94), every
-/// other network from the parent's, and regtest keeps the parent's.
+/// retarget runs from the parent's bits; regtest keeps the parent's.
 ///
 /// Returns `None` at a boundary without a period-start header. The connect path
 /// treats that as an internal error: a seed at a period boundary makes it
@@ -98,14 +96,11 @@ pub fn expected_bits(
         return Some(parent.bits);
     }
     let first = period_start?;
-    let last_bits = if params.network == Network::Testnet4 {
-        first.bits
-    } else {
-        parent.bits
-    };
     let timespan = u64::from(parent.time).saturating_sub(u64::from(first.time));
     Some(CompactTarget::from_next_work_required(
-        last_bits, timespan, params,
+        parent.bits,
+        timespan,
+        params,
     ))
 }
 
@@ -209,36 +204,6 @@ mod tests {
             expected_bits(5, parent.time + 1, &parent, None, last_normal, &params),
             Some(last_normal),
         );
-    }
-
-    /// Testnet4 (BIP94) starts the retarget from the period-start bits; testnet3
-    /// starts from the parent's.
-    #[test]
-    fn testnet4_takes_the_retarget_from_the_period_start() {
-        let first = header_with(1_600_000_000, 0x1d00_ffff);
-        let parent = header_with(1_600_000_000 + 1_209_600, 0x1c00_ffff);
-        let testnet3 = Params::new(Network::Testnet);
-        let testnet4 = Params::new(Network::Testnet4);
-        let e3 = expected_bits(
-            DIFFICULTY_PERIOD,
-            parent.time + 1,
-            &parent,
-            Some(&first),
-            parent.bits,
-            &testnet3,
-        );
-        let e4 = expected_bits(
-            DIFFICULTY_PERIOD,
-            parent.time + 1,
-            &parent,
-            Some(&first),
-            parent.bits,
-            &testnet4,
-        );
-        // A full timespan makes the retarget a no-op: the starting bits survive.
-        assert_eq!(e3, Some(parent.bits));
-        assert_eq!(e4, Some(first.bits));
-        assert_ne!(e3, e4);
     }
 
     /// Regtest never retargets, so a boundary keeps the parent's bits.

@@ -29,7 +29,10 @@ pub(crate) fn chain_config(network: Network) -> std::sync::Arc<rsk_consensus::co
     use rsk_consensus::config::ChainConfig;
     std::sync::Arc::new(match network {
         Network::Bitcoin => ChainConfig::mainnet(),
-        Network::Testnet | Network::Testnet4 | Network::Signet => ChainConfig::testnet(),
+        Network::Testnet => ChainConfig::testnet(),
+        // `Core::new` refuses these networks. Keep a total match so `Config`
+        // construction stays infallible.
+        Network::Testnet4 | Network::Signet => ChainConfig::testnet(),
         Network::Regtest => ChainConfig::regtest(),
     })
 }

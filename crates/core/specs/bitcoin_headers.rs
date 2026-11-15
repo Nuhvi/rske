@@ -1,24 +1,25 @@
 //! Executable specification for `specs/bitcoin-headers.md`.
 //!
-//! Clause IDs in comments (`O1`, `V1`, `E1`, ...) point at clauses in that
-//! document. The Markdown is the human source; this file is the executable
-//! form that is expected to fail when a clause is broken. When a clause changes,
-//! update its comment here in the same change.
+//! Clause IDs in comments (`O1`, `HDR-01`, `E1`, ...) point at the OpenSpec
+//! capability for validation and the machine clauses for the rest. This file is
+//! the executable form that is expected to fail when a clause is broken.
 //!
 //! Four machines, all on mainnet parameters:
 //!
-//! - `bitcoin_headers_match_the_spec` checks E1–E2, V1–V6 and E3–E5 over a
+//! - `bitcoin_headers_match_the_spec` checks E1–E2, HDR-01–HDR-03, HDR-07 and E3–E5 over a
 //!   delivery universe with a trunk, a competing fork, a fork of a fork, a
 //!   bad-PoW header, a stale-timestamp header, an out-of-range target header,
 //!   duplicates and empty batches.
 //! - `finality_and_fork_gate_matches_the_spec` checks E3 and E6 on a long trunk
 //!   delivered in runs, at the production depth, including light forks
 //!   below/above the mark.
-//! - `difficulty_matches_the_spec` checks V5 with the mainnet expected-bits
+//! - `difficulty_matches_the_spec` checks HDR-04 with the mainnet expected-bits
 //!   rule.
-//! - `future_time_matches_the_spec` checks V7 against the caller clock.
+//! - `future_time_matches_the_spec` checks HDR-08 against the caller clock.
 //!
 //! A plain test, `store_identity_matches_the_spec`, checks O1 at open.
+//! `the_finality_requirement_gates_the_mark` pins E6. The rule scenarios live in
+//! `bitcoin_header_validation.rs`.
 //!
 //! The synthetic chain seeds a recent mainnet height and relaxes the
 //! proof-of-work limit, so it mines in no time. The mainnet estimated-work
@@ -35,148 +36,17 @@ use std::collections::HashSet;
 
 use alloy_primitives::U256;
 use bitcoin::Network;
-use bitcoin::TxMerkleNode;
-use bitcoin::block::{BlockHash, Header as BitcoinHeader, Version};
+use bitcoin::block::{BlockHash, Header as BitcoinHeader};
 use bitcoin::consensus::Params;
 use bitcoin::hashes::Hash as _;
-use bitcoin::pow::{CompactTarget, Target};
 use proptest::prelude::*;
 use proptest_state_machine::{ReferenceStateMachine, StateMachineTest, prop_state_machine};
 
+use super::support::{
+    EASY_BITS, NOW, SEED_HEIGHT, SEED_TIME, canonical_chain, delivery_core, mainnet_core,
+    mainnet_params, mine, mine_bad, mine_with_bits, work,
+};
 use crate::{Action, Config, Core, Error, Outcome, RskState};
-
-/// The easiest valid Bitcoin target on the test network, so synthetic headers
-/// mine immediately.
-const EASY_BITS: u32 = 0x207f_ffff;
-/// A recent mainnet difficulty-period start (2016 × 481).
-///
-/// Each machine seeds here, so synthetic headers have recent block numbers
-/// without mining recent mainnet difficulty.
-const SEED_HEIGHT: u64 = 969_696;
-/// The seed header's timestamp: 2026-10-14, near the seed height in the real
-/// chain, so the synthetic chain has recent times.
-const SEED_TIME: u32 = 1_792_000_000;
-/// The clock the future-time machine connects at. It is a week after the seed,
-/// so every ordinary header is in the past.
-const NOW: u64 = SEED_TIME as u64 + 7 * 86_400;
-
-/// Mainnet consensus parameters with the proof-of-work limit relaxed to
-/// [`EASY_BITS`], so the specs keep the mainnet difficulty rule but mine with
-/// almost no work.
-fn mainnet_params() -> Params {
-    let mut params = Params::new(Network::Bitcoin);
-    params.max_attainable_target = Target::from_compact(CompactTarget::from_consensus(EASY_BITS));
-    params
-}
-
-/// An in-memory mainnet core for the specs.
-///
-/// It keeps the mainnet consensus rules and disables only the estimated-work
-/// finality requirement, which a synthetic chain cannot clear. `anchor` is the
-/// seed the machine starts from; production code cannot replace the embedded
-/// spine. `check_difficulty` is false for the delivery machine: with V5 on, an
-/// out-of-range target fails before V6 can see it, so the `BadTarget`
-/// transition would be unreachable. V5 has its own machine.
-fn synthetic_mainnet_core(
-    params: Params,
-    anchor: &[(u64, BitcoinHeader)],
-    check_difficulty: bool,
-) -> Core {
-    let mut config = Config::in_memory(Network::Bitcoin)
-        .with_params(params)
-        .without_partition_safety()
-        .with_anchor(anchor);
-    if !check_difficulty {
-        config = config.without_difficulty_check();
-    }
-    Core::new(config).expect("in-memory store")
-}
-
-fn mainnet_core(anchor: &[(u64, BitcoinHeader)]) -> Core {
-    synthetic_mainnet_core(mainnet_params(), anchor, true)
-}
-
-fn delivery_core(anchor: &[(u64, BitcoinHeader)]) -> Core {
-    synthetic_mainnet_core(mainnet_params(), anchor, false)
-}
-
-fn mine(prev: BlockHash, time: u32, tag: u32) -> BitcoinHeader {
-    let target = CompactTarget::from_consensus(EASY_BITS);
-    let mut nonce = tag;
-    loop {
-        let header = BitcoinHeader {
-            version: Version::ONE,
-            prev_blockhash: prev,
-            merkle_root: TxMerkleNode::all_zeros(),
-            time,
-            bits: target,
-            nonce,
-        };
-        if header.validate_pow(header.target()).is_ok() {
-            return header;
-        }
-        nonce = nonce.wrapping_add(1);
-        assert!(nonce != 0, "could not mine a header");
-    }
-}
-
-fn mine_bad(prev: BlockHash, time: u32) -> BitcoinHeader {
-    let target = CompactTarget::from_consensus(EASY_BITS);
-    let mut nonce = 0u32;
-    loop {
-        let header = BitcoinHeader {
-            version: Version::ONE,
-            prev_blockhash: prev,
-            merkle_root: TxMerkleNode::all_zeros(),
-            time,
-            bits: target,
-            nonce,
-        };
-        if header.validate_pow(header.target()).is_err() {
-            return header;
-        }
-        nonce = nonce.wrapping_add(1);
-    }
-}
-
-fn mine_with_bits(prev: BlockHash, time: u32, tag: u32, bits: u32) -> BitcoinHeader {
-    let target = CompactTarget::from_consensus(bits);
-    let mut nonce = tag;
-    loop {
-        let header = BitcoinHeader {
-            version: Version::ONE,
-            prev_blockhash: prev,
-            merkle_root: TxMerkleNode::all_zeros(),
-            time,
-            bits: target,
-            nonce,
-        };
-        if header.validate_pow(header.target()).is_ok() {
-            return header;
-        }
-        nonce = nonce.wrapping_add(1);
-    }
-}
-
-fn work(core: &Core) -> U256 {
-    U256::from_be_slice(
-        &core
-            .chainwork()
-            .expect("read")
-            .expect("seeded")
-            .to_be_bytes(),
-    )
-}
-
-/// The canonical headers from the root seed through the tip.
-///
-/// The seed starts above height 0, so the canonical read starts at the seed.
-fn canonical_chain(core: &Core) -> Vec<BitcoinHeader> {
-    core.canonical_headers()
-        .expect("read")
-        .collect::<Result<_, _>>()
-        .expect("read")
-}
 
 // ── 1. Bitcoin delivery: forks, duplicates, errors ─────────────────────────
 
@@ -189,9 +59,9 @@ enum HeaderKind {
 }
 
 #[derive(Clone, Debug)]
-struct HeaderUniverse {
-    genesis: BitcoinHeader,
-    headers: Vec<BitcoinHeader>,
+pub(super) struct HeaderUniverse {
+    pub(super) genesis: BitcoinHeader,
+    pub(super) headers: Vec<BitcoinHeader>,
     kinds: Vec<HeaderKind>,
     /// Contiguous batches the peer can deliver: every header alone, every
     /// adjacent pair and triple in a run, plus link-break, bad-PoW, duplicate
@@ -199,7 +69,7 @@ struct HeaderUniverse {
     batches: Vec<Vec<usize>>,
 }
 
-fn header_universe() -> HeaderUniverse {
+pub(super) fn header_universe() -> HeaderUniverse {
     let genesis = mine(BlockHash::all_zeros(), SEED_TIME, 0);
     let g = genesis.block_hash();
     let mut headers = Vec::new();
@@ -229,20 +99,20 @@ fn header_universe() -> HeaderUniverse {
         prev = next;
     }
 
-    // C8 from B7 (index 16): a fork of a fork.
+    // From B7 (index 16): a fork of a fork.
     let b7 = headers[16];
     let c8 = mine(b7.block_hash(), b7.time + 500, 70);
     headers.push(c8);
     kinds.push(HeaderKind::Valid);
 
     // P4: linked to A1 but fails proof of work (index 19).
-    let p4 = mine_bad(a1.block_hash(), a1.time + 900);
+    let p4 = mine_bad(a1.block_hash(), a1.time + 900, EASY_BITS);
     headers.push(p4);
     kinds.push(HeaderKind::BadPow);
 
     // Q12: linked to A11 (index 10) but its timestamp equals the median of the
     // previous eleven headers (index 20). The full window makes MTP apply, and
-    // equality is the V4 boundary.
+    // equality is the HDR-07 boundary.
     let q12 = mine(headers[10].block_hash(), SEED_TIME + 6, 77);
     headers.push(q12);
     kinds.push(HeaderKind::BadTime);
@@ -328,7 +198,7 @@ fn predict(
         return (HeaderPrediction::Noop, Vec::new());
     };
 
-    // V1: the parent of the first new header must be stored.
+    // HDR-01: the parent of the first new header must be stored.
     let parent_known = if start == 0 {
         stored.contains(&headers[0].prev_blockhash)
     } else {
@@ -344,15 +214,15 @@ fn predict(
         headers[start - 1].block_hash()
     };
     for (offset, header) in headers[start..].iter().enumerate() {
-        // V2: the run must link, and the first new header must link to the
+        // E2: the run must link, and the first new header must link to the
         // batch's parent (the previous element when a prefix was skipped).
         if header.prev_blockhash != prev {
             return (HeaderPrediction::LinkBreak, Vec::new());
         }
-        // V4: with eleven ancestors available, the timestamp must beat their
+        // HDR-07: with eleven ancestors available, the timestamp must beat their
         // median. Q12 is positioned so that its parent implies the full window.
-        // V6: the target must be in range and at or below the pow limit.
-        // V3: the header must satisfy its own target.
+        // HDR-02: the target must be in range and at or below the pow limit.
+        // HDR-03: the header must satisfy its own target.
         match universe.kinds[batch[start + offset]] {
             HeaderKind::Valid => {}
             HeaderKind::BadPow => return (HeaderPrediction::BadPow, Vec::new()),
@@ -484,7 +354,7 @@ impl StateMachineTest for HeaderMachine {
                 assert_eq!(before, after, "a rejected batch changed the store");
             }
             (HeaderPrediction::BadTarget, Err(Error::BadPow { detail, .. }))
-                if detail.contains("target") =>
+                if detail == "target out of range" =>
             {
                 assert_eq!(before, after, "a rejected target changed the store");
             }
@@ -980,8 +850,8 @@ struct DifficultyUniverse {
 fn difficulty_universe() -> DifficultyUniverse {
     let genesis = mine(BlockHash::all_zeros(), SEED_TIME, 0);
     let good = mine(genesis.block_hash(), SEED_TIME + 1, 0);
-    // A valid header at a slightly different target. V5 rejects it for the bits,
-    // before V6 or PoW.
+    // A valid header at a slightly different target. HDR-04 rejects it for the
+    // bits, before HDR-02 or PoW.
     let wrong = mine_with_bits(genesis.block_hash(), SEED_TIME + 1, 1, EASY_BITS - 1);
     DifficultyUniverse {
         genesis,
@@ -1050,7 +920,7 @@ impl ReferenceStateMachine for DifficultyMachine {
                 state.last = if state.stored.contains(&state.universe.wrong.block_hash()) {
                     DifficultyPrediction::Noop
                 } else {
-                    // V5: mainnet enforces the retarget schedule. Off a period
+                    // HDR-04: mainnet enforces the retarget schedule. Off a period
                     // boundary, the child must carry the parent's bits.
                     DifficultyPrediction::BadDifficulty
                 };
@@ -1142,13 +1012,13 @@ impl StateMachineTest for DifficultyMachine {
 // ── 4. Future time: a header beyond the caller clock ────────────────────────
 
 #[derive(Clone, Debug)]
-struct FutureUniverse {
-    genesis: BitcoinHeader,
+pub(super) struct FutureUniverse {
+    pub(super) genesis: BitcoinHeader,
     good: BitcoinHeader,
     future: BitcoinHeader,
 }
 
-fn future_universe() -> FutureUniverse {
+pub(super) fn future_universe() -> FutureUniverse {
     let genesis = mine(BlockHash::all_zeros(), SEED_TIME, 0);
     let good = mine(genesis.block_hash(), SEED_TIME + 1, 0);
     // One second beyond the two-hour window in `connect_headers`.
@@ -1220,7 +1090,7 @@ impl ReferenceStateMachine for FutureMachine {
                 state.last = if state.stored.contains(&state.universe.future.block_hash()) {
                     FuturePrediction::Noop
                 } else {
-                    // V7: the timestamp is more than two hours after `now`.
+                    // HDR-08: the timestamp is more than two hours after `now`.
                     FuturePrediction::TimestampTooNew
                 };
             }
@@ -1339,13 +1209,53 @@ fn store_identity_matches_the_spec() {
     ));
 }
 
+// ── clause boundaries the machines cannot reach ─────────────────────────────
+
+/// E6: on mainnet the requirement gates the mark, not the depth alone. The
+/// synthetic chain is deeper than the window but cannot clear the estimated
+/// work, so the mark must not move.
+#[test]
+fn the_finality_requirement_gates_the_mark() {
+    let universe = finality_universe();
+    // The default configuration keeps the mainnet partition safety on.
+    let core = Core::new(
+        Config::in_memory(Network::Bitcoin)
+            .with_params(mainnet_params())
+            .with_anchor(&[(SEED_HEIGHT, universe.genesis)]),
+    )
+    .expect("in-memory store");
+    let outcome = core
+        .apply(Action::ConnectHeaders {
+            headers: &universe.headers,
+            now: None,
+        })
+        .expect("connect");
+    let Outcome::Connected(result) = outcome else {
+        panic!("expected a connected outcome");
+    };
+    assert_eq!(result.connected, FINALITY_BLOCKS);
+    assert_eq!(result.tip_height, SEED_HEIGHT + FINALITY_BLOCKS as u64);
+
+    let finality = result.finality.expect("the requirement is measurable");
+    assert!(
+        !finality.clears(),
+        "a synthetic mainnet chain must not clear the estimated work"
+    );
+    assert_eq!(result.finalized, None, "the mark advanced without the work");
+    assert_eq!(
+        core.state().expect("state").finalized,
+        Some(SEED_HEIGHT),
+        "the mark advanced without the required work"
+    );
+}
+
 prop_state_machine! {
     #![proptest_config(ProptestConfig {
         cases: 64,
         .. ProptestConfig::default()
     })]
 
-    /// E1–E2, V1–V6, E3–E5: acceptance, storage and fork choice on the delivery universe.
+    /// E1–E2, HDR-01–HDR-03, HDR-07, E3–E5: acceptance, storage and fork choice on the delivery universe.
     #[test]
     fn bitcoin_headers_match_the_spec(sequential 1..32 => HeaderMachine);
 }
@@ -1367,7 +1277,7 @@ prop_state_machine! {
         .. ProptestConfig::default()
     })]
 
-    /// V5: on mainnet a child must carry the parent's expected bits.
+    /// HDR-04: on mainnet a child must carry the parent's expected bits.
     #[test]
     fn difficulty_matches_the_spec(sequential 1..8 => DifficultyMachine);
 }
@@ -1378,7 +1288,7 @@ prop_state_machine! {
         .. ProptestConfig::default()
     })]
 
-    /// V7: a header more than two hours ahead of `now` is rejected.
+    /// HDR-08: a header more than two hours ahead of `now` is rejected.
     #[test]
     fn future_time_matches_the_spec(sequential 1..8 => FutureMachine);
 }
