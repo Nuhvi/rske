@@ -1,6 +1,6 @@
 //! How the node is configured: where its store lives, which network it speaks
-//! and how to find peers. The trust anchor is not a node option: `rsk-core`
-//! selects it from the network.
+//! and how to find peers. The trusted checkpoints are not a node option:
+//! `rsk-core` selects them from the network.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

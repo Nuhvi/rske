@@ -173,7 +173,7 @@ mod tests {
         let h0 = mine(BlockHash::all_zeros(), 0);
         let h2016 = mine(h0.block_hash(), 1);
         let chain = Core::new(
-            crate::Config::in_memory(Network::Regtest).with_anchor(&[(0, h0), (2016, h2016)]),
+            crate::Config::in_memory(Network::Regtest).with_checkpoints(&[(0, h0), (2016, h2016)]),
         )
         .unwrap();
 

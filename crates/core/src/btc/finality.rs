@@ -16,9 +16,9 @@
 //! below that mark: [`is_checkpoint`]. The mark itself may be *any* height — it
 //! is a reorg depth, not a boundary — and the newest checkpoint is simply the
 //! last period start the mark has reached. The store's `btc_checkpoints` table
-//! is the broader *boundary ladder* — every period start, settled or not —
-//! which is what makes the whole chain's work computable from the spine; only
-//! the part of it at or below the mark is a checkpoint.
+//! is the checkpoint table — every period start, settled or not — which is what
+//! makes the whole chain's work computable; only the part of it at or below the
+//! mark is a checkpoint.
 //!
 //! ## Network-partition safety
 //!
@@ -60,11 +60,12 @@
 //!
 //! ## The anchor is the mark
 //!
-//! The anchor is the finality mark itself, not the compiled-in spine tip. Any
-//! history the node already trusts anchors the next measurement, so a node that
-//! has synced before measures from its own finalized chain, and each advance
-//! re-anchors. The compiled-in spine is the anchor only for a first-ever sync:
-//! it seeds the mark.
+//! The anchor is the finality mark itself, not the tip of the compiled-in
+//! trusted checkpoints. Any history the node already trusts anchors the next
+//! measurement, so a node that has synced before measures from its own
+//! finalized chain, and each advance re-anchors. The compiled-in trusted
+//! checkpoints are the anchor only for a first-ever sync: they set the initial
+//! mark.
 //!
 //! ## The clock
 //!
@@ -129,8 +130,10 @@ pub fn is_checkpoint(height: u64) -> bool {
 /// On mainnet the requirement is the estimated work the network did since the
 /// anchor — the bottom of the price law — floored by the coinbase-maturity
 /// window. A genesis anchor fails closed (`U256::MAX`): the price law is
-/// undefined at the network's birth, so a genesis-only seed cannot price modern
-/// work. A store seeded only from genesis is a development path without the
+/// undefined at the network's birth, so a genesis-only checkpoint set cannot
+/// price modern
+/// work. A store initialized only from genesis is a development path without
+/// the
 /// guarantee.
 ///
 /// Every other network permits minimum-difficulty blocks, so elapsed time is not
@@ -360,13 +363,14 @@ mod tests {
         );
     }
 
-    /// A month after the shipped spine tip the requirement is a few thousand
+    /// A month after the shipped trusted checkpoint tip the requirement is a few
+    /// thousand
     /// blocks — well below the `T/600` age term, because the bottom law prices
     /// the network below its realised work.
     #[test]
     fn a_modern_anchor_is_priced_below_its_age() {
-        let spine = crate::btc::checkpoints::parse().expect("embedded spine parses");
-        let (_, header) = *spine.last().expect("non-empty spine");
+        let checkpoints = crate::btc::checkpoints::parse().expect("embedded checkpoints parse");
+        let (_, header) = *checkpoints.last().expect("non-empty checkpoints");
         let w0 = header.target().to_work();
         let t0 = header.time as u64;
         let now = t0 + 31 * 86_400;

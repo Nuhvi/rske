@@ -1,11 +1,11 @@
 # Rootstock checkpoint trust
 
-Status: draft
-Executable form: [`crates/core/specs/rootstock_checkpoints.rs`](../crates/core/specs/rootstock_checkpoints.rs)
+Status: draft Executable form:
+[`crates/core/specs/rootstock_checkpoints.rs`](../crates/core/specs/rootstock_checkpoints.rs)
 
 This document describes the Rootstock trust policy on top of a finalized Bitcoin
-tail. It covers `ProposeCheckpoint`, the checkpoint attempt triggered by an empty
-`ConnectRskHeaders`, and `SetRskSyncTip`.
+tail. It covers `ProposeCheckpoint`, the checkpoint attempt triggered by an
+empty `ConnectRskHeaders`, and `SetRskSyncTip`.
 
 ## Scope
 
@@ -36,8 +36,8 @@ Out of scope:
 
 ## 2. Actions
 
-- **A1 — propose(i).** Validate entry `i`'s anchor and, if accepted, store it and
-  mark it a root.
+- **A1 — propose(i).** Validate entry `i`'s anchor and, if accepted, store it
+  and mark it a root.
 - **A2 — attempt.** Connect an empty batch; this runs the checkpoint attempt
   without changing the tree.
 - **A3 — sync(i).** Record entry `i`'s hash as the sync tip.
@@ -67,8 +67,8 @@ clearing root with the greatest subtree work. Its number, work, `tail_start` and
 difficulty of the root and every stored descendant. A parent's subtree work is
 strictly greater than each child's.
 
-**R7 — sync tip.** The recorded sync-tip hash is exactly the last one written. It
-resolves to `(hash, number)` iff that header is stored.
+**R7 — sync tip.** The recorded sync-tip hash is exactly the last one written.
+It resolves to `(hash, number)` iff that header is stored.
 
 **R8 — attempt is read-only.** An attempt changes no forest, root or sync-tip
 state.

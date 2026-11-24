@@ -48,9 +48,9 @@
 - [x] 4.1 Add `hdr_01_parent_of_the_first_new_header_is_known`,
   `hdr_02_target_range` and `hdr_03_proof_of_work` to
   `bitcoin_header_validation.rs`, one test per requirement. Cover every scenario
-  of those requirements, including the range-before-PoW case. Verify
-  `cargo test -p rsk-core --lib specs::bitcoin_header_validation` passes and each
-  test asserts the exact `Error` variant.
+  of those requirements, including the range-before-PoW case. Verify `cargo test
+  -p rsk-core --lib specs::bitcoin_header_validation` passes and each test
+  asserts the exact `Error` variant.
 - [x] 4.2 Add `hdr_04_expected_bits_inside_a_period` and
   `hdr_05_minimum_difficulty_networks`. Use mainnet params for HDR-04 and
   testnet3 params with a relaxed limit for HDR-05. Verify the five HDR-05
@@ -96,8 +96,9 @@ not lost. Create a separate change for an item when you pick it up.
   network requirement and the rules that network needs in a separate change.
 - **Differential harness.** Compare accept/reject decisions with `bitcoind
   submitheader`. Regtest cannot exercise the retarget.
-- **Proptest regression seeds.** Check in `crates/core/specs/bitcoin_headers.txt`
-  when the state-machine changes are committed.
+- **Proptest regression seeds.** Check in
+  `crates/core/specs/bitcoin_headers.txt` when the state-machine changes are
+  committed.
 
 ## Workflow follow-up
 

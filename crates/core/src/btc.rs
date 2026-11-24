@@ -7,15 +7,17 @@
 //! whose parent is a known block but not a chain tip starts a **new fork**,
 //! which is kept (not rejected) and can later win if it becomes heavier.
 //!
-//! The trust anchor is a **Bitcoin spine**: one header per difficulty-period
-//! boundary (2016 blocks), seeded from this crate's embedded `checkpoints.txt`.
-//! "Checkpoint" in this module always means that Bitcoin period boundary —
-//! never an RSK checkpoint (a trusted RSK block) and never a CPV sample.
-//! Because Bitcoin difficulty is constant within a period, each spine header
-//! pins the work of its whole period, so the cumulative work of the *entire*
-//! chain is known without holding every block.
+//! The **trusted checkpoints** are one header per difficulty-period boundary
+//! (2016 blocks). They come from this crate's embedded `checkpoints.txt` and
+//! are written to the store when it is initialized. "Checkpoint" in this
+//! module always means that Bitcoin period boundary — never an RSK checkpoint
+//! (a trusted RSK block) and never a CPV sample. Because Bitcoin difficulty is
+//! constant within a period, each trusted checkpoint pins the work of its whole
+//! period, so the cumulative work of the *entire* chain is known without
+//! holding every block.
 //!
-//! The spine also sets the **finality mark**: a pointer to the newest header we
+//! The trusted checkpoints also set the **finality mark**: a pointer to the
+//! newest header we
 //! treat as un-reorgable. The mark may be any height — the rule keeps it a
 //! coinbase-maturity window below the tip — and a **checkpoint** is the newest
 //! difficulty-period start at or below it ([`finality::is_checkpoint`]). Like
@@ -23,14 +25,15 @@
 //! checkpoint height, we refuse forks whose `forkpoint` falls at or below the
 //! mark. We **do not prune** the chain when it advances — headers are retained
 //! until Rootstock establishes a checkpoint, at which point pruning can occur.
-//! The spine's own table is the broader *boundary ladder*, which is what makes
-//! the whole chain's work computable. [`crate::btc::finality`] holds the rule
-//! that gates the mark.
+//! The checkpoint table (`btc_checkpoints`) is broader: it starts with the
+//! trusted checkpoints and grows with validated root-chain boundaries, which is
+//! what makes the whole chain's work computable. [`crate::btc::finality`] holds
+//! the rule that gates the mark.
 //!
 //! Simplifications for this slice, stated explicitly so they are easy to lift:
 //!
-//! - The spine is trusted wholesale. Nothing before the first checkpoint is
-//!   ever validated.
+//! - The trusted checkpoints are trusted wholesale. Nothing below the first
+//!   one is ever validated.
 //! - Version and transaction/merkle checks are not made: the core has no
 //!   internal clock (the caller supplies `now`), and those checks add no SPV
 //!   value. See [`crate::btc::validation`] for the exact rule set.
@@ -197,8 +200,9 @@ impl Iterator for CoinbaseTags {
 pub struct SubmitBitcoinOutcome {
     /// Headers newly accepted and stored (across whatever fork they landed on).
     pub accepted: usize,
-    /// The fork that was current before this batch. `None` on the very first
-    /// connection or when the batch stayed on the same chain.
+    /// The best fork before this batch. An initialized store always has one,
+    /// so a successful submission always reports it; the type stays `Option`
+    /// for the case with no trusted checkpoints.
     pub prev_best_fork: Option<u64>,
     /// The chain that is best after this batch.
     pub best_fork: Option<u64>,
@@ -209,36 +213,39 @@ pub struct SubmitBitcoinOutcome {
     pub finalized: Option<u64>,
     /// Network-partition safety as this batch left it: what the best chain carries
     /// above the mark and what the rule demands. `None` when the store is
-    /// unseeded or a fork (not the chain the mark is measured on) is best.
+    /// a store with no trusted checkpoints or a fork (not the chain the mark
+    /// is measured on) is best.
     pub finality: Option<FinalityStatus>,
 }
 
 impl Core {
-    /// Apply the configured trust anchor to the store: seed a fresh store, or
-    /// refuse a stored checkpoint that the configuration disagrees with.
+    /// Apply the configured trusted checkpoints to the store: initialize a
+    /// fresh store, or refuse a stored checkpoint that the configuration
+    /// disagrees with.
     ///
-    /// The anchor is a crate decision, so a store always reopens against the
-    /// same chain identity. Seeding never extends an existing store: a
-    /// configured checkpoint the store does not hold is left unplanted.
-    pub(crate) fn ensure_anchor(&self) -> Result<(), Error> {
+    /// The checkpoints are a crate decision, so a store always reopens against
+    /// the same chain identity. Initialization never extends an existing store:
+    /// a configured checkpoint that the store does not hold is not written.
+    pub(crate) fn initialize_with_checkpoints(&self) -> Result<(), Error> {
         {
             let txn = self.store.read()?;
-            // The network is recorded at seed time. Refuse a different one
-            // before any header is validated against the wrong parameters.
-            if let Some(seeded) = txn.network()?
-                && seeded != self.config.params.network
+            // The network is recorded when the store is initialized. Refuse a
+            // different one before any header is validated against the wrong
+            // parameters.
+            if let Some(stored) = txn.network()?
+                && stored != self.config.params.network
             {
                 return Err(Error::NetworkMismatch {
-                    seeded,
+                    stored,
                     opened: self.config.params.network,
                 });
             }
             if txn.fork_meta(0)?.is_some() {
-                for (height, header) in &self.config.resolve_anchor()? {
+                for (height, header) in &self.config.resolve_checkpoints()? {
                     if let Some(stored) = txn.checkpoint_at(*height)?
                         && stored.block_hash() != header.block_hash()
                     {
-                        return Err(Error::AnchorMismatch {
+                        return Err(Error::CheckpointMismatch {
                             height: *height,
                             stored: stored.block_hash(),
                             configured: header.block_hash(),
@@ -249,22 +256,22 @@ impl Core {
             }
         }
 
-        let anchor = self.config.resolve_anchor()?;
-        if anchor.is_empty() {
+        let checkpoints = self.config.resolve_checkpoints()?;
+        if checkpoints.is_empty() {
             return Ok(());
         }
         let txn = self.store.write()?;
-        txn.seed_checkpoints(&anchor)?;
+        txn.put_checkpoints(&checkpoints)?;
         txn.set_network(self.config.params.network)?;
         txn.commit()
     }
 
-    /// The best (heaviest) chain id, if seeded.
+    /// The best (heaviest) chain id, if the store is initialized.
     pub fn best_fork(&self) -> Result<Option<u64>, Error> {
         self.store.read()?.best_fork()
     }
 
-    /// The canonical tip height, if the chain has been seeded.
+    /// The canonical tip height, if the store is initialized.
     pub fn tip_height(&self) -> Result<Option<u64>, Error> {
         let txn = self.store.read()?;
         match txn.best_fork()? {
@@ -296,7 +303,7 @@ impl Core {
     /// The finality **mark**: the newest header that has cleared the requirement
     /// treated as un-reorgable. It may be any height (the rule keeps it at
     /// least [`finality::COINBASE_MATURITY`] blocks below the tip), monotonic,
-    /// and `None` before the store is seeded.
+    /// and `None` before the store is initialized.
     pub fn finalized_height(&self) -> Result<Option<u64>, Error> {
         self.store.read()?.finalized_height()
     }
@@ -321,54 +328,6 @@ impl Core {
         // floored by the high-water mark and the chain time at the best tip.
         let now = effective_clock(&txn, Some(now), txn.now_hwm()?)?;
         Ok(measure_finality(&txn, now, self.config.partition_safety)?.map(|m| m.status))
-    }
-
-    /// Move the finality mark forward to the newest **shipped** checkpoint the
-    /// store already holds, if that is newer than the current mark. Returns
-    /// `(from, to)` when the mark moved.
-    ///
-    /// The configured anchor is the binary's subjective trust anchor. A store
-    /// seeded from an older or shorter spine would otherwise never benefit from
-    /// a newer one: the mark is the anchor, and seeding happens only once. This
-    /// is the "upgrade — trust a newer checkpoint shipped in the new binary"
-    /// path, applied to a store that already exists.
-    ///
-    /// Forward-only, and only to a header the store can prove it holds: the
-    /// exact hash at that height on the anchor's own chain. That is the same
-    /// trust the seed takes, no more.
-    pub(crate) fn reanchor_shipped_impl(&self) -> Result<Option<(u64, u64)>, Error> {
-        let txn = self.store.write()?;
-        let Some(current) = txn.finalized_height()? else {
-            // Unseeded: seeding decides the first mark.
-            return Ok(None);
-        };
-
-        let trusted = self.config.resolve_anchor()?;
-        let mut adopted = None;
-        for (height, header) in trusted.iter().rev() {
-            if *height <= current {
-                break;
-            }
-            if txn
-                .header_at(0, *height)?
-                .is_some_and(|stored| stored.block_hash() == header.block_hash())
-            {
-                adopted = Some(*height);
-                break;
-            }
-        }
-
-        match adopted {
-            Some(height) => {
-                txn.set_finalized(height)?;
-                let checkpoint = (height / DIFFICULTY_PERIOD) * DIFFICULTY_PERIOD;
-                txn.delete_coinbases_below(checkpoint)?;
-                txn.commit()?;
-                Ok(Some((current, height)))
-            }
-            // No writes were staged; dropping the transaction aborts it.
-            None => Ok(None),
-        }
     }
 
     /// The work of the first difficulty period after `tail_start`:
@@ -396,8 +355,8 @@ impl Core {
     ///
     /// A height is one exactly when it starts a difficulty period
     /// ([`finality::is_checkpoint`]) *and* the mark has reached it. These are
-    /// the headers safe to treat as irreversible, e.g. to embed as a trust
-    /// anchor. The tip's nearest boundary is deliberately **excluded**: the
+    /// the headers safe to treat as irreversible, e.g. to embed as trusted
+    /// checkpoints. The tip's nearest boundary is deliberately **excluded**: the
     /// mark never reaches into the last [`finality::COINBASE_MATURITY`] blocks.
     pub fn finalized_checkpoints(&self) -> Result<FinalizedCheckpoints, Error> {
         let txn = self.store.read()?;
@@ -541,7 +500,7 @@ impl Core {
         merkle_block: &MerkleBlock,
     ) -> Result<(), Error> {
         let txn = self.store.write()?;
-        let best = txn.best_fork()?.ok_or(Error::Unseeded)?;
+        let best = txn.best_fork()?.ok_or(Error::NoChain)?;
         let header = txn
             .header_at(best, height)?
             .ok_or(Error::CoinbaseNotCanonical { height, block_hash })?;
@@ -572,7 +531,8 @@ impl Core {
 
     /// The lowest height the coinbase table is allowed to hold: the newest
     /// finalized difficulty-period boundary. Before the first boundary has
-    /// settled (a genesis-anchored or very fresh store), this falls back to one
+    /// settled (a store initialized at genesis, or a very fresh store), this falls
+    /// back to one
     /// period below the tip rather than allowing a scan to walk the whole chain.
     ///
     /// The table is **sparse**, not a complete window: the IBD scan fetches only
@@ -648,7 +608,7 @@ impl Core {
     /// stored. The store remembers the greatest floor used on a batch that
     /// stores headers.
     ///
-    /// Returns [`Error::NetworkMismatch`] if the store was seeded for a
+    /// Returns [`Error::NetworkMismatch`] if the store was initialized for a
     /// different network than this [`Core`] validates against.
     ///
     /// The whole operation — reads, validation, writes and the automatic mark
@@ -664,13 +624,13 @@ impl Core {
         // sequence. Dropping it without committing (the early returns) aborts.
         let txn = self.store.write()?;
 
-        // The store records the network it was seeded for; refuse to validate
-        // real headers against the wrong consensus parameters.
-        if let Some(seeded) = txn.network()?
-            && seeded != self.config.params.network
+        // The store records the network it was initialized for; refuse to
+        // validate real headers against the wrong consensus parameters.
+        if let Some(stored) = txn.network()?
+            && stored != self.config.params.network
         {
             return Err(Error::NetworkMismatch {
-                seeded,
+                stored,
                 opened: self.config.params.network,
             });
         }
@@ -869,7 +829,7 @@ impl Core {
             // passed its divergence point, letting it win would reorg finalized
             // history: the fork stays stored but never becomes the best chain.
             let mark = txn.finalized_height()?.unwrap_or(0);
-            // Fork 0 is the spine's own chain (the mark lives on it), so it is
+            // Fork 0 is the root fork (the mark lives on it), so it is
             // always allowed to win back. Any other fork may only win if it
             // carries the mark's block. The fork's own `forkpoint` is not
             // enough: a fork branched off another fork can start above the mark
@@ -950,10 +910,10 @@ impl Core {
     /// safety disabled uses the tip-work requirement on every network. The
     /// mark is also the anchor: each advance re-anchors, so the next
     /// requirement is measured from a fresher point. Cumulative work is known
-    /// at every period boundary (the spine), so both sides are plain
+    /// at every period boundary (the checkpoint table), so both sides are plain
     /// differences of stored cumulative work.
     ///
-    /// Nothing advances while a fork is the best chain, since the spine
+    /// Nothing advances while a fork is the best chain, since the root fork
     /// (fork 0) is assumed canonical.
     ///
     /// Test-only: production advancement rides inside
@@ -1012,7 +972,7 @@ fn finalize_in_txn(
         txn.set_now_hwm(now)?;
     }
 
-    // Only the spine's chain settles a boundary: a fork that is best has no
+    // Only the root fork's chain settles a boundary: a fork that is best has no
     // trusted history behind it, and moving the mark onto it is exactly the
     // capture the rule exists to prevent.
     let Some(measurement) = measure_finality(txn, now, partition_safety)? else {
@@ -1049,7 +1009,8 @@ fn finalize_in_txn(
 ///
 /// A header time is one miner's claim; the median cannot move without a
 /// majority of the window. The tip's own time is the fallback when the window
-/// is not fully stored — a sparse seed, or a chain shorter than the window.
+/// is not fully stored — a sparse checkpoint set, or a chain shorter than the
+/// window.
 /// Returns 0 when the tip header itself is missing.
 fn chain_time_at<R: BtcReads>(reads: &R, fork: u64, tip: u64) -> Result<u64, Error> {
     let Some(tip_header) = reads.header_at(fork, tip)? else {
@@ -1103,7 +1064,8 @@ struct Measurement {
 ///
 /// The anchor is the mark itself: any history the node has already finalized is
 /// trusted, so a returning node measures from its own chain and a fresh store
-/// measures from the seeded spine tip. Each advance re-anchors, resetting `T`.
+/// measures from the tip of its trusted checkpoints. Each advance re-anchors,
+/// resetting `T`.
 ///
 /// The rule is selected by the network recorded in the store and the core's
 /// partition-safety switch: mainnet prices elapsed time, every other network
@@ -1361,15 +1323,6 @@ pub fn header_work(header: &BitcoinHeader) -> Work {
 /// The public mutators: thin wrappers over [`Core::apply`], so the node and the
 /// tests go through the same state machine.
 impl Core {
-    /// Move the finality mark forward to the newest configured checkpoint the
-    /// store already holds, if that is newer than the current mark.
-    pub fn reanchor_shipped(&self) -> Result<Option<(u64, u64)>, Error> {
-        match self.apply(crate::Action::ReanchorShipped)? {
-            crate::Outcome::Reanchored(adopted) => Ok(adopted),
-            other => Err(unexpected("reanchor_shipped", other)),
-        }
-    }
-
     /// Submit a run of Bitcoin headers at the caller's clock.
     pub fn submit_bitcoin_headers(
         &self,
@@ -1594,30 +1547,33 @@ mod tests {
         mine_chain_from(parent, n, EASY_BITS, tag_offset)
     }
 
-    /// A fresh in-memory chain anchored on `entries`, with the network defaults.
-    fn anchored(network: Network, entries: &[(u64, BitcoinHeader)]) -> Core {
-        Core::new(crate::Config::in_memory(network).with_anchor(entries)).expect("in-memory store")
+    /// A fresh in-memory chain initialized with `entries`, with the network
+    /// defaults.
+    fn initialized_with(network: Network, entries: &[(u64, BitcoinHeader)]) -> Core {
+        Core::new(crate::Config::in_memory(network).with_checkpoints(entries))
+            .expect("in-memory store")
     }
 
     /// The same, with the expected-bits check off. Fixtures that vary the
     /// target (to exercise work arithmetic or a bad-PoW header) use this.
-    fn anchored_unchecked(network: Network, entries: &[(u64, BitcoinHeader)]) -> Core {
+    fn initialized_with_unchecked(network: Network, entries: &[(u64, BitcoinHeader)]) -> Core {
         Core::new(
             crate::Config::in_memory(network)
                 .without_difficulty_check()
-                .with_anchor(entries),
+                .with_checkpoints(entries),
         )
         .expect("in-memory store")
     }
 
-    /// A fresh in-memory regtest chain seeded with a synthetic checkpoint at 0.
+    /// A fresh in-memory regtest chain initialized with a synthetic checkpoint
+    /// at 0.
     ///
     /// Regtest permits minimum-difficulty blocks, so (like Electrum) the
     /// difficulty rule is skipped; the tests here exercise the fork/finality
     /// machinery and the median-time-past rule. The difficulty rule itself is
     /// tested in [`crate::btc::validation`] and against real mainnet data.
-    fn seeded() -> Core {
-        anchored(Network::Regtest, &[(0, mine_genesis(0))])
+    fn initialized() -> Core {
+        initialized_with(Network::Regtest, &[(0, mine_genesis(0))])
     }
 
     /// The header at `height` on the canonical chain.
@@ -1641,8 +1597,8 @@ mod tests {
     }
 
     #[test]
-    fn seeds_and_extends() -> eyre::Result<()> {
-        let chain = seeded();
+    fn initializes_and_extends() -> eyre::Result<()> {
+        let chain = initialized();
         assert_eq!(chain.tip_height()?, Some(0));
         assert_eq!(chain.finalized_height()?, Some(0));
         assert_eq!(chain.best_fork()?, Some(0));
@@ -1660,8 +1616,8 @@ mod tests {
     }
 
     #[test]
-    fn a_conflicting_anchor_is_refused_and_leaves_the_chain_intact() -> eyre::Result<()> {
-        let chain = seeded();
+    fn a_conflicting_checkpoint_is_refused_and_leaves_the_chain_intact() -> eyre::Result<()> {
+        let chain = initialized();
         let run = easy_chain(&canonical(&chain, 0), 5, 1);
         chain.submit_bitcoin_headers(&run, NOW)?;
         let tip = chain.tip_height()?;
@@ -1672,11 +1628,11 @@ mod tests {
         let Core { store, config } = chain;
         let chain = Core {
             store,
-            config: config.with_anchor(&[(0, mine_genesis(42))]),
+            config: config.with_checkpoints(&[(0, mine_genesis(42))]),
         };
-        let err = chain.ensure_anchor().unwrap_err();
+        let err = chain.initialize_with_checkpoints().unwrap_err();
         assert!(
-            matches!(err, Error::AnchorMismatch { height: 0, .. }),
+            matches!(err, Error::CheckpointMismatch { height: 0, .. }),
             "got {err:?}"
         );
 
@@ -1687,7 +1643,7 @@ mod tests {
 
     #[test]
     fn rejects_bad_pow() -> eyre::Result<()> {
-        let chain = seeded();
+        let chain = initialized();
         let mut bad = easy_chain(&canonical(&chain, 0), 1, 1);
         // Keep the expected bits and break only the proof of work.
         while bad[0].validate_pow(bad[0].target()).is_ok() {
@@ -1700,7 +1656,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_ancestor() -> eyre::Result<()> {
-        let chain = seeded();
+        let chain = initialized();
         let run = [mine_at(BlockHash::all_zeros(), BASE_TIME + 1, EASY_BITS)]; // links to nothing stored
         let err = chain.submit_bitcoin_headers(&run, NOW).unwrap_err();
         assert!(matches!(err, Error::UnknownAncestor(_)), "got {err:?}");
@@ -1709,7 +1665,7 @@ mod tests {
 
     #[test]
     fn single_header_connects() -> eyre::Result<()> {
-        let chain = seeded();
+        let chain = initialized();
         let h = mine_child(&canonical(&chain, 0), EASY_BITS, 1);
         let out = chain.submit_bitcoin_header(&h, NOW)?;
         assert_eq!(out.accepted, 1);
@@ -1720,7 +1676,7 @@ mod tests {
 
     #[test]
     fn lighter_fork_is_kept_not_rejected() -> eyre::Result<()> {
-        let chain = seeded();
+        let chain = initialized();
         let main = easy_chain(&canonical(&chain, 0), 5, 1);
         chain.submit_bitcoin_headers(&main, NOW)?;
         assert_eq!(chain.tip_height()?, Some(5));
@@ -1748,7 +1704,7 @@ mod tests {
     /// (absent) rows.
     #[test]
     fn chainwork_at_resolves_the_ancestor_fork() -> eyre::Result<()> {
-        let chain = seeded();
+        let chain = initialized();
         let main = easy_chain(&canonical(&chain, 0), 5, 1);
         chain.submit_bitcoin_headers(&main, NOW)?;
 
@@ -1773,7 +1729,7 @@ mod tests {
         // A batch whose parent is not a chain tip starts a new fork; if a later
         // header in the same batch fails validation, the fork must be rolled
         // back too — the whole read/validate/write/advance runs in one txn.
-        let chain = seeded();
+        let chain = initialized();
         let main = easy_chain(&canonical(&chain, 0), 5, 1);
         chain.submit_bitcoin_headers(&main, NOW)?;
         assert_eq!(chain.store.read()?.fork_count()?, 1);
@@ -1796,7 +1752,7 @@ mod tests {
 
     #[test]
     fn heavier_fork_wins() -> eyre::Result<()> {
-        let chain = seeded();
+        let chain = initialized();
         let main = easy_chain(&canonical(&chain, 0), 5, 1);
         chain.submit_bitcoin_headers(&main, NOW)?;
 
@@ -1821,7 +1777,7 @@ mod tests {
     /// back when it becomes heavier than a fork that forked above the mark.
     #[test]
     fn the_root_chain_can_win_back() -> eyre::Result<()> {
-        let chain = seeded();
+        let chain = initialized();
         let genesis = canonical(&chain, 0);
 
         // Main to 4,132 so the mark is 4,032.
@@ -1848,7 +1804,7 @@ mod tests {
 
     #[test]
     fn fork_below_finalized_is_refused() -> eyre::Result<()> {
-        let chain = seeded();
+        let chain = initialized();
         let main = easy_chain(&canonical(&chain, 0), 6, 1);
         chain.submit_bitcoin_headers(&main, NOW)?;
 
@@ -1872,7 +1828,7 @@ mod tests {
     fn lighter_fork_then_extends_to_win() -> eyre::Result<()> {
         // Electrum's grace: a fork is kept even while lighter, so it can win
         // later when more of its headers arrive.
-        let chain = seeded();
+        let chain = initialized();
         let main = easy_chain(&canonical(&chain, 0), 5, 1);
         chain.submit_bitcoin_headers(&main, NOW)?;
         assert_eq!(chain.best_fork()?, Some(0));
@@ -1901,7 +1857,7 @@ mod tests {
 
     #[test]
     fn finalizes_period_retains_headers() -> eyre::Result<()> {
-        let chain = seeded();
+        let chain = initialized();
         // Build past two full difficulty periods (4032) plus a bit; the tip is
         // 4,132, so the mark advances to tip - 100 = 4,032.
         let run = easy_chain(
@@ -1941,7 +1897,7 @@ mod tests {
 
     #[test]
     fn finalized_checkpoints_stop_at_the_floor() -> eyre::Result<()> {
-        let chain = seeded();
+        let chain = initialized();
         // Two full periods plus a bit: the mark is 4,032, which happens to be a
         // boundary, and the next boundary (6,048) is above it.
         let parent = canonical(&chain, 0);
@@ -1966,8 +1922,8 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_spine_survives_pruning() -> eyre::Result<()> {
-        let chain = seeded();
+    fn trusted_checkpoints_survive_pruning() -> eyre::Result<()> {
+        let chain = initialized();
         let run = easy_chain(
             &canonical(&chain, 0),
             2 * DIFFICULTY_PERIOD as usize + 100,
@@ -1977,7 +1933,8 @@ mod tests {
         let out = chain.submit_bitcoin_headers(&run, NOW)?;
         assert_eq!(out.finalized, Some(2 * DIFFICULTY_PERIOD));
 
-        // The checkpoint spine still resolves: height 0 (the seeded genesis)
+        // The trusted checkpoints still resolve: height 0 (the initial
+        // genesis checkpoint)
         // survives, its hash maps to its height, and its work is intact.
         assert!(chain.header_at(0)?.is_some());
         let genesis_hash = canonical_hash(&chain, 0);
@@ -1988,16 +1945,17 @@ mod tests {
     }
 
     #[test]
-    fn spine_work_scales_by_full_periods() -> eyre::Result<()> {
-        // Two spine checkpoints, each an easy-target header with per-block work
-        // `w`. The spine must report cumulative work as if every one of the
+    fn checkpoint_table_work_scales_by_full_periods() -> eyre::Result<()> {
+        // Two trusted checkpoints, each an easy-target header with per-block
+        // work `w`. The checkpoint table must report cumulative work as if every
+        // one of the
         // 2016 blocks in the intervening period were stored:
         //   work_at(0)     = w                    (just the boundary block)
         //   work_at(2016)  = w + 2015*w + w = 2017*w
         let g0 = mine_genesis(0);
         let g2016 = mine_genesis(1);
         let w = header_work(&g0);
-        let chain = anchored(Network::Regtest, &[(0, g0), (DIFFICULTY_PERIOD, g2016)]);
+        let chain = initialized_with(Network::Regtest, &[(0, g0), (DIFFICULTY_PERIOD, g2016)]);
 
         assert_eq!(chain.store.read()?.work_at(0, 0).unwrap(), Some(w));
         let expected = {
@@ -2021,7 +1979,7 @@ mod tests {
         genesis
             .validate_pow(genesis.target())
             .expect("real genesis PoW");
-        let chain = anchored_unchecked(Network::Regtest, &[(0, genesis)]);
+        let chain = initialized_with_unchecked(Network::Regtest, &[(0, genesis)]);
         assert_eq!(
             chain.header_at(0)?.unwrap().block_hash(),
             genesis.block_hash()
@@ -2040,7 +1998,7 @@ mod tests {
         // On a non-mainnet network the requirement is the tip's own work, so the
         // mark is the tip minus the coinbase-maturity window as soon as the tip
         // is deeper than that window.
-        let chain = seeded();
+        let chain = initialized();
         let checkpoint = DIFFICULTY_PERIOD as usize;
 
         let run1 = easy_chain(&canonical(&chain, 0), checkpoint, 1);
@@ -2077,7 +2035,7 @@ mod tests {
             crate::Config::in_memory(Network::Bitcoin)
                 .with_params(params)
                 .without_partition_safety()
-                .with_anchor(&[(0, genesis)]),
+                .with_checkpoints(&[(0, genesis)]),
         )?;
         let run = easy_chain(&genesis, 110, 1);
         let out = chain.submit_bitcoin_headers(&run, NOW)?;
@@ -2095,7 +2053,7 @@ mod tests {
     /// nothing advances, above it the mark moves to `tip - COINBASE_MATURITY`.
     #[test]
     fn the_depth_gates_the_mark() -> eyre::Result<()> {
-        let chain = seeded();
+        let chain = initialized();
         let genesis = canonical(&chain, 0);
         let w = crate::btc::header_work(&genesis);
 
@@ -2126,7 +2084,7 @@ mod tests {
     /// requirement is the tip block's work, not a time-based window.
     #[test]
     fn a_non_mainnet_anchor_asks_for_the_tip_work() -> eyre::Result<()> {
-        let chain = seeded();
+        let chain = initialized();
         let genesis = canonical(&chain, 0);
         let w = crate::btc::header_work(&genesis);
 
@@ -2147,7 +2105,7 @@ mod tests {
     /// succeeds and the stored clock is not lowered.
     #[test]
     fn a_wound_back_clock_is_floored() -> eyre::Result<()> {
-        let chain = seeded();
+        let chain = initialized();
         let genesis = canonical(&chain, 0);
         let anchor_time = genesis.time as u64;
 
@@ -2168,7 +2126,7 @@ mod tests {
     /// header that the chain itself would allow.
     #[test]
     fn a_stale_clock_fails_the_future_time_check() -> eyre::Result<()> {
-        let chain = seeded();
+        let chain = initialized();
         let genesis = canonical(&chain, 0);
         let anchor_time = genesis.time as u64;
 
@@ -2186,7 +2144,7 @@ mod tests {
     /// clock there is no frame of reference for the future-time check.
     #[test]
     fn a_clockless_connect_runs_on_the_chain_time() -> eyre::Result<()> {
-        let chain = seeded();
+        let chain = initialized();
         let genesis = canonical(&chain, 0);
         let anchor_time = genesis.time as u64;
 
@@ -2210,7 +2168,7 @@ mod tests {
     /// own time: one miner's timestamp cannot move it.
     #[test]
     fn the_chain_clock_is_the_median_time_past() -> eyre::Result<()> {
-        let chain = seeded();
+        let chain = initialized();
         let genesis = canonical(&chain, 0);
         let anchor_time = genesis.time as u64;
 
@@ -2233,10 +2191,10 @@ mod tests {
     }
 
     /// Finalization may not happen on a fork: the mark is only ever moved on the
-    /// spine's own chain.
+    /// root fork's chain.
     #[test]
     fn a_heavier_fork_cannot_move_the_mark() -> eyre::Result<()> {
-        let chain = seeded();
+        let chain = initialized();
         let main = easy_chain(&canonical(&chain, 0), 5, 1);
         chain.submit_bitcoin_headers(&main, NOW)?;
 
@@ -2253,14 +2211,15 @@ mod tests {
         Ok(())
     }
 
-    /// Mainnet network-partition safety through the store: seed the real spine
+    /// Mainnet network-partition safety through the store: initialize with the
+    /// real trusted checkpoints
     /// tip, ask a month later, and check the requirement is a few thousand
     /// blocks — the price law's value.
     #[test]
     fn the_mainnet_requirement_is_used_by_the_store() -> eyre::Result<()> {
-        let spine = crate::btc::checkpoints::parse()?;
-        let (height, header) = *spine.last().expect("non-empty spine");
-        let chain = anchored(Network::Bitcoin, &[(height, header)]);
+        let checkpoints = crate::btc::checkpoints::parse()?;
+        let (height, header) = *checkpoints.last().expect("non-empty checkpoints");
+        let chain = initialized_with(Network::Bitcoin, &[(height, header)]);
 
         let now = header.time as u64 + 31 * 86_400;
         let status = chain
@@ -2277,67 +2236,12 @@ mod tests {
         Ok(())
     }
 
-    /// On resume a store adopts the newest shipped checkpoint it can prove it
-    /// holds, so a binary with a newer spine moves an old mark forward instead
-    /// of leaving the store stuck on the mark it was seeded with.
-    #[test]
-    fn a_resumed_store_adopts_the_newest_shipped_checkpoint_it_holds() -> eyre::Result<()> {
-        let chain = seeded();
-        let run = easy_chain(&canonical(&chain, 0), 4_032, 1);
-        chain.submit_bitcoin_headers(&run, NOW)?;
-        // The mark is at the reorg depth, not quantized to a boundary.
-        let mark = 4_032 - finality::COINBASE_MATURITY;
-        assert_eq!(chain.finalized_height()?, Some(mark));
-
-        // A newer spine whose tip the store holds: adopt it.
-        let trusted = vec![
-            (0, canonical(&chain, 0)),
-            (DIFFICULTY_PERIOD, canonical(&chain, DIFFICULTY_PERIOD)),
-            (
-                2 * DIFFICULTY_PERIOD,
-                canonical(&chain, 2 * DIFFICULTY_PERIOD),
-            ),
-        ];
-        let Core { store, config } = chain;
-        let chain = Core {
-            store,
-            config: config.with_anchor(&trusted),
-        };
-        chain.ensure_anchor()?;
-        assert_eq!(
-            chain.reanchor_shipped()?,
-            Some((mark, 2 * DIFFICULTY_PERIOD))
-        );
-        assert_eq!(chain.finalized_height()?, Some(2 * DIFFICULTY_PERIOD));
-
-        // A newer spine than that, but a header the store does not hold: the
-        // mark must not move on an unverifiable claim.
-        let Core { store, config } = chain;
-        let chain = Core {
-            store,
-            config: config.with_anchor(&[(4 * DIFFICULTY_PERIOD, mine_genesis(7))]),
-        };
-        chain.ensure_anchor()?;
-        assert_eq!(chain.reanchor_shipped()?, None);
-        assert_eq!(chain.finalized_height()?, Some(2 * DIFFICULTY_PERIOD));
-
-        // Never backwards.
-        let Core { store, config } = chain;
-        let chain = Core {
-            store,
-            config: config.with_anchor(&trusted),
-        };
-        chain.ensure_anchor()?;
-        assert_eq!(chain.reanchor_shipped()?, None);
-        Ok(())
-    }
-
     /// A fork that was created above the mark can outlive it. Once the mark has
     /// passed its forkpoint, the fork must never become the best chain, or it
     /// would reorg finalized history (and the export would read its blocks).
     #[test]
     fn a_fork_the_mark_overtook_cannot_become_best() -> eyre::Result<()> {
-        let chain = seeded();
+        let chain = initialized();
         let genesis = canonical(&chain, 0);
 
         // Build the main chain to 2,100: the mark is 2,000, so a fork at 2,001
@@ -2381,7 +2285,7 @@ mod tests {
         let chain = Core::new(
             crate::Config::in_memory(Network::Bitcoin)
                 .with_params(params)
-                .with_anchor(&[(0, genesis)]),
+                .with_checkpoints(&[(0, genesis)]),
         )?;
         let high = genesis.time as u64 + 4_000 * finality::TARGET_BLOCK_SECONDS;
 
@@ -2406,9 +2310,10 @@ mod tests {
     fn the_anchor_follows_the_mark() -> eyre::Result<()> {
         let g0 = mine_genesis(0);
         let g2016 = mine_child(&g0, EASY_BITS, 1);
-        let chain = anchored(Network::Regtest, &[(0, g0), (DIFFICULTY_PERIOD, g2016)]);
+        let chain = initialized_with(Network::Regtest, &[(0, g0), (DIFFICULTY_PERIOD, g2016)]);
 
-        // A clock 4,000 blocks past the seeded tip's time, and a run of 4,100
+        // A clock 4,000 blocks past the initialized tip's time, and a run of
+        // 4,100
         // blocks: the mark advances to the tip minus the depth, 2016 + 4,100 -
         // 100.
         let now = g2016.time as u64 + 4_000 * finality::TARGET_BLOCK_SECONDS;
@@ -2421,7 +2326,7 @@ mod tests {
         assert_eq!(out.finalized, Some(6_016));
 
         // More headers, a later clock: the anchor is now the new mark, not the
-        // seeded tip.
+        // initialized tip.
         let tip = chain.tip_height()?.expect("a tip");
         let more = easy_chain(&canonical(&chain, tip), 10, 1);
         let out = chain.submit_bitcoin_headers(&more, now + 6_000)?;
@@ -2435,7 +2340,7 @@ mod tests {
 
     #[test]
     fn rejects_timestamp_at_or_below_median_time_past() -> eyre::Result<()> {
-        let chain = seeded();
+        let chain = initialized();
         // 11 headers so a 12th has a full median-time-past window.
         let run = easy_chain(&canonical(&chain, 0), 11, 1);
         chain.submit_bitcoin_headers(&run, NOW)?;
@@ -2467,7 +2372,7 @@ mod tests {
         let chain = Core::new(
             crate::Config::in_memory(Network::Regtest)
                 .with_params(params.clone())
-                .with_anchor(&[(0, genesis)]),
+                .with_checkpoints(&[(0, genesis)]),
         )?;
 
         // 2,015 blocks at 150 s each: a quarter of the two-week timespan.
@@ -2530,7 +2435,7 @@ mod tests {
 
     #[test]
     fn connecting_with_the_wrong_network_is_refused() -> eyre::Result<()> {
-        let chain = anchored(Network::Regtest, &[(0, mine_genesis(0))]);
+        let chain = initialized_with(Network::Regtest, &[(0, mine_genesis(0))]);
         assert_eq!(chain.store.read()?.network()?, Some(Network::Regtest));
 
         // Re-open the same store believing it is mainnet: the recorded network
@@ -2541,7 +2446,7 @@ mod tests {
             config: config.with_params(bitcoin::consensus::Params::new(Network::Bitcoin)),
         };
         assert!(matches!(
-            chain.ensure_anchor(),
+            chain.initialize_with_checkpoints(),
             Err(Error::NetworkMismatch { .. })
         ));
         let header = mine_child(&canonical(&chain, 0), EASY_BITS, 1);
@@ -2550,7 +2455,7 @@ mod tests {
             matches!(
                 err,
                 Error::NetworkMismatch {
-                    seeded: Network::Regtest,
+                    stored: Network::Regtest,
                     opened: Network::Bitcoin,
                 }
             ),
@@ -2565,7 +2470,7 @@ mod tests {
     /// the target inside a period is refused.
     #[test]
     fn regtest_rejects_a_difficulty_change() -> eyre::Result<()> {
-        let chain = seeded();
+        let chain = initialized();
         let mut bad = easy_chain(&canonical(&chain, 0), 1, 1);
         bad[0].bits = CompactTarget::from_consensus(0x1d00_ffff);
         let err = chain.submit_bitcoin_headers(&bad, NOW).unwrap_err();
@@ -2583,15 +2488,19 @@ mod tests {
         let mut params = Params::new(Network::Testnet);
         params.max_attainable_target =
             bitcoin::pow::Target::from_compact(CompactTarget::from_consensus(EASY_BITS));
-        let seed = mine_at(BlockHash::all_zeros(), BASE_TIME, 0x207f_fffe);
+        let checkpoint = mine_at(BlockHash::all_zeros(), BASE_TIME, 0x207f_fffe);
         let chain = Core::new(
             crate::Config::in_memory(Network::Testnet)
                 .with_params(params)
-                .with_anchor(&[(DIFFICULTY_PERIOD, seed)]),
+                .with_checkpoints(&[(DIFFICULTY_PERIOD, checkpoint)]),
         )?;
 
         // A gap lets a minimum-difficulty block through.
-        let min = mine_at(seed.block_hash(), seed.time + 2 * 600 + 1, EASY_BITS);
+        let min = mine_at(
+            checkpoint.block_hash(),
+            checkpoint.time + 2 * 600 + 1,
+            EASY_BITS,
+        );
         assert_eq!(chain.submit_bitcoin_headers(&[min], NOW)?.accepted, 1);
 
         // Without a gap, the next header carries the last normal bits.
@@ -2600,11 +2509,11 @@ mod tests {
         Ok(())
     }
 
-    /// The work is computed on the fly for the given tail start; not seeded,
-    /// there is nothing to compute.
+    /// The work is computed on the fly for the given tail start; without
+    /// checkpoints, there is nothing to compute.
     #[test]
-    fn btc_tail_work_none_without_seed() -> eyre::Result<()> {
-        let chain = Core::new(crate::Config::in_memory(Network::Regtest).with_anchor(&[]))?;
+    fn btc_tail_work_none_without_checkpoints() -> eyre::Result<()> {
+        let chain = Core::new(crate::Config::in_memory(Network::Regtest).with_checkpoints(&[]))?;
         assert_eq!(chain.finalized_height()?, None);
         assert_eq!(chain.btc_tail_work(0)?, None);
         Ok(())
@@ -2614,7 +2523,7 @@ mod tests {
     /// measure.
     #[test]
     fn btc_tail_work_none_before_a_full_period() -> eyre::Result<()> {
-        let chain = seeded();
+        let chain = initialized();
         assert_eq!(chain.finalized_height()?.unwrap(), 0);
 
         // 100 blocks is less than a period: work[0 .. 2016) is not stored.
@@ -2629,7 +2538,7 @@ mod tests {
     /// the first period after it, [2016 .. 4032).
     #[test]
     fn btc_tail_work_is_the_first_tail_period() -> eyre::Result<()> {
-        let chain = seeded();
+        let chain = initialized();
         let parent = canonical(&chain, 0);
         let n = 2 * DIFFICULTY_PERIOD as usize + 100;
         let run = mine_chain_from(&parent, n, EASY_BITS, 1);
@@ -2648,7 +2557,7 @@ mod tests {
     /// after the boundary, it is 2016 * 20, below the preceding ~2015 * 22.
     #[test]
     fn btc_tail_work_uses_the_period_after_the_start() -> eyre::Result<()> {
-        let chain = anchored_unchecked(Network::Regtest, &[(0, mine_genesis(0))]);
+        let chain = initialized_with_unchecked(Network::Regtest, &[(0, mine_genesis(0))]);
         let period = DIFFICULTY_PERIOD as usize;
 
         // Genesis has easy-target work. Period 0 blocks use work 22.
@@ -2696,7 +2605,7 @@ mod tests {
     #[test]
     fn stores_and_reads_a_canonical_coinbase() -> eyre::Result<()> {
         let (header, coinbase, proof) = coinbase_fixture(BlockHash::all_zeros(), BASE_TIME);
-        let chain = anchored(Network::Regtest, &[(0, header)]);
+        let chain = initialized_with(Network::Regtest, &[(0, header)]);
         chain.store_coinbase(0, header.block_hash(), &coinbase, &proof)?;
 
         let got = chain.coinbase_at(0)?.expect("stored coinbase");
@@ -2712,7 +2621,7 @@ mod tests {
     fn rejects_a_proof_for_another_block() -> eyre::Result<()> {
         let (header, coinbase, _) = coinbase_fixture(BlockHash::all_zeros(), BASE_TIME);
         let (other, _, other_proof) = coinbase_fixture(BlockHash::all_zeros(), BASE_TIME + 1);
-        let chain = anchored(Network::Regtest, &[(0, header)]);
+        let chain = initialized_with(Network::Regtest, &[(0, header)]);
         let err = chain
             .store_coinbase(0, header.block_hash(), &coinbase, &other_proof)
             .unwrap_err();
@@ -2726,7 +2635,7 @@ mod tests {
     #[test]
     fn advancing_the_mark_prunes_superseded_coinbases() -> eyre::Result<()> {
         let (genesis, coinbase, proof) = coinbase_fixture(BlockHash::all_zeros(), BASE_TIME);
-        let chain = anchored(Network::Regtest, &[(0, genesis)]);
+        let chain = initialized_with(Network::Regtest, &[(0, genesis)]);
         chain.store_coinbase(0, genesis.block_hash(), &coinbase, &proof)?;
         assert!(chain.coinbase_at(0)?.is_some());
 
@@ -2751,7 +2660,7 @@ mod tests {
         let next = mine_child(&header, EASY_BITS, 1);
         // Two period boundaries: the mark is the second, so height 0 is a
         // superseded full difficulty period.
-        let chain = anchored(Network::Regtest, &[(0, header), (DIFFICULTY_PERIOD, next)]);
+        let chain = initialized_with(Network::Regtest, &[(0, header), (DIFFICULTY_PERIOD, next)]);
         chain.store_coinbase(0, header.block_hash(), &coinbase, &proof)?;
         assert!(chain.coinbase_at(0)?.is_some());
         assert_eq!(chain.prune_coinbases()?, 1);

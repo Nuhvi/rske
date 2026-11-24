@@ -1,9 +1,10 @@
 # Bitcoin header ingestion
 
-Status: draft
-Executable form: [`crates/core/specs/bitcoin_headers.rs`](../crates/core/specs/bitcoin_headers.rs)
+Status: draft Executable form:
+[`crates/core/specs/bitcoin_headers.rs`](../crates/core/specs/bitcoin_headers.rs)
 
-This document describes the Bitcoin header state machine seeded at open and
+This document describes the Bitcoin header state machine initialized at open
+with the trusted checkpoints and
 exposed by `Core::apply(Action::ConnectHeaders { headers, now })`. The Rust
 comments use the same clause IDs.
 
@@ -36,8 +37,9 @@ The machine is configured once, at open, with:
 - **Network.** The Bitcoin consensus parameters.
 - **Partition safety.** Whether the mainnet network-partition safety rule runs.
   The default is on; a test disables it (E6).
-- **Seed.** Trusted headers at difficulty-period boundaries. The crate fixes it:
-  the embedded spine on mainnet, genesis elsewhere, replaced in tests (O1).
+- **Trusted checkpoints.** One header per difficulty-period boundary. The crate
+  fixes them: the embedded trusted checkpoints on mainnet, genesis elsewhere,
+  replaced in tests (O1).
 
 ## 2. State
 
@@ -45,7 +47,7 @@ The state machine tracks:
 
 - **S1 — stored headers.** Every stored Bitcoin header, keyed by fork and
   height.
-- **S2 — forks.** Fork `0` is the seed chain. Every other fork has a
+- **S2 — forks.** Fork `0` is the root fork. Every other fork has a
   `forkpoint`, the height of its first header, and a contiguous run of headers
   from that height. A fork's cumulative work is the work stored on its chain.
 - **S3 — best fork.** The fork that E5 selects. Its chain is the canonical
@@ -65,10 +67,11 @@ The state machine tracks:
 
 ### Opening
 
-**O1 — store identity.** Opening an empty store plants the configured seed,
-records the network, and sets the mark to the newest seed height. Opening an
-existing store must agree with the configuration on the network and on every
-checkpoint both hold, or the open fails. It adds no checkpoint.
+**O1 — store identity.** Opening an empty store initializes it with the
+configured trusted checkpoints, records the network, and sets the mark to the
+newest trusted checkpoint height. Opening an existing store must agree with the
+configuration on the network and on every trusted checkpoint both hold, or the
+open fails. It adds no trusted checkpoint.
 
 ### Validation
 
@@ -84,8 +87,8 @@ previous headers, so `bad-prevblk` cannot arise.
 median of the previous **up to** 11 block times. Failure gives `BadTimestamp`
 (Bitcoin Core `time-too-old`).
 
-**Local:** the check applies only when all 11 previous headers are stored. If one
-is missing, or the header is in the first 11 heights, the check is skipped.
+**Local:** the check applies only when all 11 previous headers are stored. If
+one is missing, or the header is in the first 11 heights, the check is skipped.
 
 **V4 — expected difficulty.** The header bits must equal the expected target.
 Inside a period they are the parent's. At a period boundary the retarget
@@ -117,7 +120,7 @@ Known Bitcoin header checks that are not performed:
 | Check | Reason |
 |---|---|
 | Version rules | Height-activated and no SPV value. |
-| Bitcoin Core checkpoint mismatch | Trust comes from the seeded spine. The name refers to older Bitcoin Core. |
+| Bitcoin Core checkpoint mismatch | Trust comes from the embedded trusted checkpoints. The name refers to older Bitcoin Core. |
 | Block-body checks | Not header fields. |
 | MTP when fewer than 11 headers are stored | Local skip. See V3. |
 
@@ -145,7 +148,7 @@ among the forks that carry the mark's block. A batch changes it only to a
 strictly heavier fork; equal work keeps the incumbent.
 
 **E6 — finality mark.** The mark never regresses and never exceeds `tip - 100`.
-With the seed chain best, it moves to `tip - 100` when that is greater and the
+With the root fork best, it moves to `tip - 100` when that is greater and the
 work above the mark clears the requirement. Mainnet takes the requirement from
 the estimated work since the mark, floored at a coinbase-maturity window; every
 other network takes it from the work of the tip block, so depth alone gates

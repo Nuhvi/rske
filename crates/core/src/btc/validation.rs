@@ -69,7 +69,8 @@ pub const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
 /// retarget runs from the parent's bits; regtest keeps the parent's.
 ///
 /// Returns `None` at a boundary without a period-start header. The connect path
-/// treats that as an internal error: a seed at a period boundary makes it
+/// treats that as an internal error: a trusted checkpoint at a period
+/// boundary makes it
 /// unreachable.
 pub fn expected_bits(
     height: u64,

@@ -5,7 +5,7 @@
 //!
 //! This crate is deliberately **chain-agnostic protocol mechanics**: it never
 //! interprets a header, never stores anything, and has no notion of the chain
-//! state. Chain knowledge (the checkpoint spine, what to sync) lives with the
+//! state. Chain knowledge (the checkpoint table, what to sync) lives with the
 //! caller — `rsk-core` and above — which hands this crate a locator and gets
 //! headers back.
 //!

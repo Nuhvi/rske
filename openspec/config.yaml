@@ -1,5 +1,10 @@
 schema: spec-driven
 
+context: |
+  Wrap Markdown prose at 80 columns so the files stay readable in a terminal.
+  Leave tables, fenced code blocks and long links unwrapped; they cannot be
+  split without breaking their syntax.
+
 # Project context (optional)
 # Add only constraints that should guide OpenSpec artifacts and workflows.
 # Include constraints an agent cannot infer by reading the code.

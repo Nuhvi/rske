@@ -82,15 +82,15 @@ not exercised by the chain suite.
 ### D2. Nine requirements, named after their property
 
 Legacy O1 splits into BTC-00 and BTC-01. The 500-character requirement limit
-forces one behavior per requirement, and the split is natural: one rule plants a
-fresh store, the other compares an existing store.
+forces one behavior per requirement, and the split is natural: one rule
+initializes a fresh store, the other compares an existing store.
 
 Legacy E2 splits into BTC-03 and BTC-04. The stored prefix and the no-op are one
 property. The link rule has its own error and does not depend on the prefix.
 
 | Legacy | ID | Name |
 |---|---|---|
-| O1 plant | BTC-00 | Trusted checkpoints |
+| O1 initialize | BTC-00 | Trusted checkpoints |
 | O1 compare | BTC-01 | Store identity |
 | E1 | BTC-02 | Atomicity |
 | E2 skip/no-op | BTC-03 | Idempotency |
@@ -115,9 +115,9 @@ The spec uses these terms:
 
 | Term | Meaning | Code |
 |---|---|---|
-| trusted checkpoint | a configured header that the crate assumes correct, one per Bitcoin period boundary | `Config::anchor`, `btc::checkpoints`, `seed_checkpoints` |
+| trusted checkpoint | a configured header that the crate assumes correct, one per Bitcoin period boundary | `Config::checkpoints`, `btc::checkpoints`, `put_checkpoints` |
 | checkpoint height | the height of a trusted checkpoint | `btc_checkpoints` |
-| highest checkpoint | the last trusted checkpoint; its height is the initial finality mark | the last anchor entry |
+| highest checkpoint | the last trusted checkpoint; its height is the initial finality mark | the last trusted checkpoint |
 | root fork | the fork that starts at the first checkpoint height | fork 0 |
 | fork | one chain in the tree, starting at a forkpoint | `ForkMeta` |
 | forkpoint | the height of a fork's first header | `ForkMeta::forkpoint` |
@@ -130,19 +130,19 @@ Rules:
 - `trusted checkpoint` always stays qualified. `finalized checkpoint` is the
   finality side's term: a Bitcoin period boundary at or below the mark.
   Trusted means assumed; finalized means derived.
-- The verb for the open action is **plant**. The code already uses it
-  ("Plant the trust anchor").
-- `seed` and `anchor` do not appear as nouns in the spec. `seed` is a
-  fixture word. `anchor` also names the finality mark ("The anchor is the
-  mark") and the RSK merge-mining anchor.
+- The verb for the open action is **initialize**. The code initializes a
+  fresh store with the configured trusted checkpoints.
+- `seed`, `anchor` and `spine` do not name the trusted checkpoints. `seed`
+  stays for DNS peer seeds. `anchor` stays for the finality mark and the RSK
+  merge-mining anchor. `checkpoint_at` keeps its name.
 - `checkpoint` never appears bare. The existing repository rule still applies.
 
-Follow-up: `docs/terminology.md` is read-only here. It needs the
-`trusted checkpoint` and `finalized checkpoint` rows, and its
-`Bitcoin spine` row needs a replacement.
+`docs/terminology.md` now carries the `trusted checkpoint` and
+`checkpoint table` rows. The finality capability adds the
+`finalized checkpoint` row.
 
-HDR-00 still says "before it creates or seeds a store". That sentence names
-the same act. Do not change it.
+HDR-00 now says "before it creates a store or initializes one with the
+configured trusted checkpoints".
 
 ### D4. Prefix skip: the stored set is global
 
@@ -176,7 +176,7 @@ The root fork is exempt from admittance and can become best again. A fork that
 crosses the mark stays stored and never becomes best.
 
 The invariant depends on the mark's movement. The shipped reanchor is the only
-path that can move the mark past a non-seed best fork. D8 removes it.
+path that can move the mark past a non-root best fork. D8 removes it.
 
 ### D7. Outcome: four chain fields, two finality fields
 
@@ -217,7 +217,7 @@ the mark stays below `tip - 100` of the best chain. The automatic rule requires
 
 Remove the action, the outcome variant, the public method, the implementation
 and the test. Remove `resume_from` and inline `tip + 1`. The `btc_checkpoints`
-table stays: `ensure_anchor` uses it for the checkpoint comparison.
+table stays: `initialize_with_checkpoints` uses it for the comparison.
 
 Alternative: keep the reanchor and add the `best_fork == 0` guard. It preserves
 a narrow shortcut and adds a finality requirement. Reject it. The shortcut has
@@ -235,23 +235,24 @@ invariant it restores.
 ```text
 crates/core/specs/
   bitcoin_header_chain.rs   O1/BTC-00..BTC-08 scenarios and the delivery machine
-  bitcoin_header_validation.rs   unchanged, except the header_universe import
+  bitcoin_header_validation.rs   unchanged
   bitcoin_headers.rs        HDR-04 machine, HDR-08 machine, finality machine
-  support.rs                shared submit helpers and fixtures
+  support.rs                shared fixtures, the delivery universe and the submit helpers
   mod.rs                    one file per capability
 ```
 
-- Move `HeaderUniverse`, `header_universe`, `predict`, `HeaderMachine`,
-  `HeaderSut` and the `bitcoin_headers_match_the_spec` test to the chain file.
-  Rename the test to `bitcoin_header_chain_matches_the_spec`.
+- Move `predict`, `HeaderMachine`, `HeaderSut` and the
+  `bitcoin_headers_match_the_spec` test to the chain file. Rename the test to
+  `bitcoin_header_chain_matches_the_spec`.
+- Move `HeaderUniverse`, `HeaderKind` and `header_universe` to `support.rs`, so
+  the chain machine and the HDR-07 scenario share one fixture without one
+  capability file importing another.
 - Move `store_identity_matches_the_spec` to the chain file and rewrite it as
   the BTC-00 and BTC-01 scenarios.
 - Move `submit`, `expect_err` and `expect_accepted` from
   `bitcoin_header_validation.rs` to `support.rs`, so both files share them.
 - Keep the HDR-04, HDR-08 and finality machines in `bitcoin_headers.rs` until
   their capabilities exist. Update the module docs.
-- The `header_universe` import in `bitcoin_header_validation.rs` moves to the
-  chain module.
 
 Fixtures:
 
@@ -320,7 +321,8 @@ directory and stays.
 
 ## Migration Plan
 
-No store schema change and no data migration. A store seeded before the change
+No store schema change and no data migration. A store initialized before the
+change
 opens the same way. The `btc_checkpoints` table stays.
 
 The reanchor removal is a code change. Rollback is a revert of the change; a

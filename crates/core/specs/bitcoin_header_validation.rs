@@ -14,40 +14,18 @@
 
 use alloy_primitives::U256;
 use bitcoin::Network;
-use bitcoin::block::{BlockHash, Header as BitcoinHeader};
+use bitcoin::block::BlockHash;
 use bitcoin::consensus::Params;
 use bitcoin::hashes::Hash as _;
 use bitcoin::pow::{CompactTarget, Target};
 
-use super::bitcoin_headers::header_universe;
 use super::support::{
-    EASY_BITS, NOW, SEED_HEIGHT, SEED_TIME, delivery_core, header_with, mainnet_core, mine,
-    mine_bad, mine_with_bits, synthetic_mainnet_core, testnet_params,
+    CHECKPOINT_HEIGHT, CHECKPOINT_TIME, EASY_BITS, NOW, delivery_core, expect_accepted, expect_err,
+    header_universe, header_with, mainnet_core, mine, mine_bad, mine_with_bits,
+    synthetic_mainnet_core, testnet_params,
 };
 use crate::btc::validation::MAX_FUTURE_BLOCK_TIME;
-use crate::{Action, Config, Core, Error, Outcome};
-
-/// Submit `headers` and return the outcome, or panic.
-fn submit(core: &Core, headers: &[BitcoinHeader], now: Option<u64>) -> Outcome {
-    core.apply(Action::SubmitBitcoinHeaders { headers, now })
-        .unwrap_or_else(|err| panic!("unexpected refusal: {err:?}"))
-}
-
-/// Submit `headers` and return the error, or panic.
-fn expect_err(core: &Core, headers: &[BitcoinHeader], now: Option<u64>) -> Error {
-    match core.apply(Action::SubmitBitcoinHeaders { headers, now }) {
-        Ok(_) => panic!("expected a refusal"),
-        Err(err) => err,
-    }
-}
-
-/// Submit `headers` and return the accepted count, or panic.
-fn expect_accepted(core: &Core, headers: &[BitcoinHeader], now: Option<u64>) -> usize {
-    match submit(core, headers, now) {
-        Outcome::BitcoinSubmitted(result) => result.accepted,
-        other => panic!("expected a submitted outcome, got {other:?}"),
-    }
-}
+use crate::{Config, Core, Error};
 
 /// HDR-00: only mainnet, testnet3 and regtest open.
 #[test]
@@ -78,26 +56,26 @@ fn hdr_00_supported_networks() {
 /// HDR-01: the first new header must name a stored parent.
 #[test]
 fn hdr_01_parent_of_the_first_new_header_is_known() {
-    let genesis = mine(BlockHash::all_zeros(), SEED_TIME, 0);
-    let core = mainnet_core(&[(SEED_HEIGHT, genesis)]);
+    let genesis = mine(BlockHash::all_zeros(), CHECKPOINT_TIME, 0);
+    let core = mainnet_core(&[(CHECKPOINT_HEIGHT, genesis)]);
 
     let unknown = BlockHash::from_byte_array([0x11; 32]);
-    let orphan = mine(unknown, SEED_TIME + 1, 0);
+    let orphan = mine(unknown, CHECKPOINT_TIME + 1, 0);
     let err = expect_err(&core, &[orphan], None);
     assert!(
         matches!(err, Error::UnknownAncestor(hash) if hash == unknown),
         "got {err:?}"
     );
 
-    let child = mine(genesis.block_hash(), SEED_TIME + 1, 0);
+    let child = mine(genesis.block_hash(), CHECKPOINT_TIME + 1, 0);
     assert_eq!(expect_accepted(&core, &[child], None), 1);
 }
 
 /// HDR-02: the compact target must be in range.
 #[test]
 fn hdr_02_target_range() {
-    let genesis = mine(BlockHash::all_zeros(), SEED_TIME, 0);
-    let core = delivery_core(&[(SEED_HEIGHT, genesis)]);
+    let genesis = mine(BlockHash::all_zeros(), CHECKPOINT_TIME, 0);
+    let core = delivery_core(&[(CHECKPOINT_HEIGHT, genesis)]);
     let parent = genesis.block_hash();
 
     for (label, bits) in [
@@ -106,7 +84,7 @@ fn hdr_02_target_range() {
         ("overflow", 0x2300_0001),
         ("above the limit", 0x2100_ffff),
     ] {
-        let header = header_with(parent, SEED_TIME + 1, bits);
+        let header = header_with(parent, CHECKPOINT_TIME + 1, bits);
         let err = expect_err(&core, &[header], None);
         assert!(
             matches!(&err, Error::BadPow { detail, .. } if detail == "target out of range"),
@@ -116,7 +94,7 @@ fn hdr_02_target_range() {
 
     // The range check runs before proof of work: the hash misses its own
     // target too, but the reported detail is the range one.
-    let y2 = mine_bad(parent, SEED_TIME + 2, 0x2100_ffff);
+    let y2 = mine_bad(parent, CHECKPOINT_TIME + 2, 0x2100_ffff);
     let err = expect_err(&core, &[y2], None);
     assert!(
         matches!(&err, Error::BadPow { detail, .. } if detail == "target out of range"),
@@ -127,32 +105,32 @@ fn hdr_02_target_range() {
 /// HDR-03: the hash must meet its target.
 #[test]
 fn hdr_03_proof_of_work() {
-    let genesis = mine(BlockHash::all_zeros(), SEED_TIME, 0);
-    let core = mainnet_core(&[(SEED_HEIGHT, genesis)]);
+    let genesis = mine(BlockHash::all_zeros(), CHECKPOINT_TIME, 0);
+    let core = mainnet_core(&[(CHECKPOINT_HEIGHT, genesis)]);
     let parent = genesis.block_hash();
 
-    let bad = mine_bad(parent, SEED_TIME + 1, EASY_BITS);
+    let bad = mine_bad(parent, CHECKPOINT_TIME + 1, EASY_BITS);
     let err = expect_err(&core, &[bad], None);
     assert!(
         matches!(&err, Error::BadPow { detail, .. } if detail != "target out of range"),
         "got {err:?}"
     );
 
-    let good = mine(parent, SEED_TIME + 2, 0);
+    let good = mine(parent, CHECKPOINT_TIME + 2, 0);
     assert_eq!(expect_accepted(&core, &[good], None), 1);
 }
 
 /// HDR-04: on mainnet, inside a period, the child carries the parent's bits.
 #[test]
 fn hdr_04_expected_bits_inside_a_period() {
-    let genesis = mine(BlockHash::all_zeros(), SEED_TIME, 0);
-    let core = mainnet_core(&[(SEED_HEIGHT, genesis)]);
+    let genesis = mine(BlockHash::all_zeros(), CHECKPOINT_TIME, 0);
+    let core = mainnet_core(&[(CHECKPOINT_HEIGHT, genesis)]);
     let parent = genesis.block_hash();
 
-    let good = mine(parent, SEED_TIME + 1, 0);
+    let good = mine(parent, CHECKPOINT_TIME + 1, 0);
     assert_eq!(expect_accepted(&core, &[good], None), 1);
 
-    let wrong = mine_with_bits(parent, SEED_TIME + 2, 1, EASY_BITS - 1);
+    let wrong = mine_with_bits(parent, CHECKPOINT_TIME + 2, 1, EASY_BITS - 1);
     let err = expect_err(&core, &[wrong], None);
     assert!(
         matches!(err, Error::BadDifficulty { expected, got, .. }
@@ -165,11 +143,11 @@ fn hdr_04_expected_bits_inside_a_period() {
 #[test]
 fn hdr_05_minimum_difficulty_networks() {
     let normal = EASY_BITS - 1;
-    let genesis = mine_with_bits(BlockHash::all_zeros(), SEED_TIME, 0, normal);
+    let genesis = mine_with_bits(BlockHash::all_zeros(), CHECKPOINT_TIME, 0, normal);
     let core = synthetic_mainnet_core(testnet_params(), &[(0, genesis)], true);
     let parent = genesis.block_hash();
 
-    let t1 = SEED_TIME + 600;
+    let t1 = CHECKPOINT_TIME + 600;
     let block1 = mine_with_bits(parent, t1, 0, normal);
     assert_eq!(expect_accepted(&core, &[block1], None), 1);
 
@@ -224,13 +202,13 @@ fn hdr_06_mainnet_and_regtest_boundaries() {
     params.allow_min_difficulty_blocks = false;
     params.no_pow_retargeting = false;
 
-    let genesis = mine(BlockHash::all_zeros(), SEED_TIME, 0);
+    let genesis = mine(BlockHash::all_zeros(), CHECKPOINT_TIME, 0);
     let core = synthetic_mainnet_core(params.clone(), &[(0, genesis)], true);
 
     let mut parent = genesis;
     let mut run = Vec::with_capacity(2015);
     for i in 1..=2015u32 {
-        let header = mine_with_bits(parent.block_hash(), SEED_TIME + i * 150, 0, EASY_BITS);
+        let header = mine_with_bits(parent.block_hash(), CHECKPOINT_TIME + i * 150, 0, EASY_BITS);
         run.push(header);
         parent = header;
     }
@@ -271,8 +249,8 @@ fn hdr_06_mainnet_and_regtest_boundaries() {
         "got {err:?}"
     );
 
-    // Regtest keeps the parent's bits at a boundary. The seed must start at a
-    // period boundary, so reuse the stored 2015-block chain and change only the
+    // Regtest keeps the parent's bits at a boundary. The trusted checkpoints
+    // must start at a period boundary, so reuse the stored 2015-block chain and change only the
     // params: the network stays Regtest, and the retarget turns off.
     let Core { store, config } = core;
     let core = Core {
@@ -294,37 +272,38 @@ fn hdr_06_mainnet_and_regtest_boundaries() {
 #[test]
 fn hdr_07_median_time_past() {
     let universe = header_universe();
-    let core = mainnet_core(&[(SEED_HEIGHT, universe.genesis)]);
+    let core = mainnet_core(&[(CHECKPOINT_HEIGHT, universe.genesis)]);
     let trunk = &universe.headers[..11];
     assert_eq!(expect_accepted(&core, trunk, None), 11);
 
-    // A1..A11 carry SEED_TIME + 1..=11, so their median is SEED_TIME + 6.
-    let equal = mine(trunk[10].block_hash(), SEED_TIME + 6, 1);
+    // A1..A11 carry CHECKPOINT_TIME + 1..=11, so their median is CHECKPOINT_TIME + 6.
+    let equal = mine(trunk[10].block_hash(), CHECKPOINT_TIME + 6, 1);
     let err = expect_err(&core, &[equal], None);
     assert!(
         matches!(err, Error::BadTimestamp { median, got, .. }
-            if median == SEED_TIME + 6 && got == SEED_TIME + 6),
+            if median == CHECKPOINT_TIME + 6 && got == CHECKPOINT_TIME + 6),
         "got {err:?}"
     );
 
     // One second above the previous-11 median. A window that wrongly includes
-    // this header has median SEED_TIME + 7 and would reject it.
-    let above = mine(trunk[10].block_hash(), SEED_TIME + 7, 2);
+    // this header has median CHECKPOINT_TIME + 7 and would reject it.
+    let above = mine(trunk[10].block_hash(), CHECKPOINT_TIME + 7, 2);
     assert_eq!(expect_accepted(&core, &[above], None), 1);
 
-    // A fresh store has only the seed, so the window is sparse and the check
+    // A fresh store has only the initial checkpoint, so the window is sparse and
+    // the check
     // does not apply, even for an old timestamp.
-    let seed = mine(BlockHash::all_zeros(), SEED_TIME, 0);
-    let sparse = mainnet_core(&[(SEED_HEIGHT, seed)]);
-    let old = mine(seed.block_hash(), SEED_TIME - 1_000, 3);
+    let checkpoint = mine(BlockHash::all_zeros(), CHECKPOINT_TIME, 0);
+    let sparse = mainnet_core(&[(CHECKPOINT_HEIGHT, checkpoint)]);
+    let old = mine(checkpoint.block_hash(), CHECKPOINT_TIME - 1_000, 3);
     assert_eq!(expect_accepted(&sparse, &[old], None), 1);
 }
 
 /// HDR-08: the two-hour future-time window is inclusive, and optional.
 #[test]
 fn hdr_08_future_time() {
-    let genesis = mine(BlockHash::all_zeros(), SEED_TIME, 0);
-    let core = mainnet_core(&[(SEED_HEIGHT, genesis)]);
+    let genesis = mine(BlockHash::all_zeros(), CHECKPOINT_TIME, 0);
+    let core = mainnet_core(&[(CHECKPOINT_HEIGHT, genesis)]);
     let parent = genesis.block_hash();
 
     let at_limit = mine(parent, (NOW + MAX_FUTURE_BLOCK_TIME) as u32, 0);

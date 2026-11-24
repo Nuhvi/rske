@@ -155,7 +155,7 @@ impl Core {
     /// refused, so a tree is only ever rooted at a block tied to Bitcoin.
     pub(crate) fn propose_checkpoint_impl(&self, entry: &RskEntry) -> Result<B256, Error> {
         let Some(btc_mark) = self.finalized_height()? else {
-            return Err(Error::Unseeded);
+            return Err(Error::NoChain);
         };
         let btc_tail_start = self.finalized_checkpoint()?.unwrap_or(0);
         let anchor = checkpoint::anchor_height(self, &entry.header)?.ok_or_else(|| {
@@ -600,13 +600,14 @@ mod tests {
         }
     }
 
-    /// A regtest chain with a usable Bitcoin tail: the spine at 0 and 2016, then
+    /// A regtest chain with a usable Bitcoin tail: the trusted checkpoints at
+    /// 0 and 2016, then
     /// easy headers up to 4032, so `btc_tail_work(2016) = work[2016..4032)`.
     fn btc_with_tail() -> Core {
         let g0 = mine(BlockHash::all_zeros(), 1_600_000_000);
         let g2016 = mine(g0.block_hash(), 1_600_000_001);
         let core = Core::new(
-            crate::Config::in_memory(Network::Regtest).with_anchor(&[(0, g0), (2016, g2016)]),
+            crate::Config::in_memory(Network::Regtest).with_checkpoints(&[(0, g0), (2016, g2016)]),
         )
         .unwrap();
 

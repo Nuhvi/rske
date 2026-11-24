@@ -28,8 +28,8 @@ pub struct Node {
 impl Node {
     /// Open (creating the data directory and store if needed) the node.
     ///
-    /// The core anchors the store before the handle exists: the embedded
-    /// checkpoint spine on mainnet, genesis on every other network. An
+    /// The core initializes the store before the handle exists: the embedded
+    /// trusted checkpoints on mainnet, genesis on every other network. An
     /// existing store whose checkpoints or network disagree is refused there.
     pub fn open(config: Config) -> Result<Self> {
         std::fs::create_dir_all(&config.data_dir)
@@ -45,16 +45,19 @@ impl Node {
 
         let core = Core::open(&store_path, config.network)?;
         if fresh {
-            let tip = core.tip_height()?.context("the store was just anchored")?;
+            let tip = core
+                .tip_height()?
+                .context("the store was just initialized")?;
             if config.network == Network::Bitcoin {
                 info!(
-                    "anchor: embedded checkpoint spine trusted up to height {tip}; syncing the tail above it"
+                    "checkpoints: embedded trusted checkpoints up to height {tip}; syncing the \
+                     tail above it"
                 );
             } else {
-                info!("anchor: genesis; validating the whole chain from block 1");
+                info!("checkpoints: genesis; validating the whole chain from block 1");
             }
         } else if let Some(tip) = core.tip_height()? {
-            info!("resume: store already anchored at tip {tip}; continuing above it");
+            info!("resume: store already initialized at tip {tip}; continuing above it");
         }
         let peer_cache = PeerCache::load(&data_dir);
         Ok(Self {
@@ -74,13 +77,16 @@ impl Node {
         &self.config
     }
 
-    /// Adopt the newest embedded checkpoint the store holds, sync the Bitcoin
-    /// tail, then run the pipelined IBD pass: connect an RSK peer, scan
-    /// coinbases backwards, fetch and score the headers each tag names as it
-    /// arrives, and stop at the first final root. Header sync overlaps
-    /// validation across the configured peers.
+    /// Sync the Bitcoin tail, then run the pipelined IBD pass: connect an RSK
+    /// peer, scan coinbases backwards, fetch and score the headers each tag
+    /// names as it arrives, and stop at the first final root. Header sync
+    /// overlaps validation across the configured peers.
     pub fn sync(&self) -> Result<SyncReport> {
-        let from = resume_from(&self.core)?;
+        let from = self
+            .core
+            .tip_height()?
+            .context("the store has no trusted checkpoints")?
+            + 1;
         info!("syncing from height {from} …");
 
         let mut addrs = self.peer_cache.btc();
@@ -145,7 +151,7 @@ impl Node {
         let finalized = self
             .core
             .finalized_height()?
-            .context("store is not seeded")?;
+            .context("store has no trusted checkpoints")?;
         let checkpoints: Vec<_> = self
             .core
             .finalized_checkpoints()?
@@ -167,40 +173,22 @@ impl Node {
     }
 }
 
-/// Adopt the newest embedded checkpoint the store can prove it holds, and
-/// return the first height to download. A store anchored by an older, shorter
-/// spine benefits from a newer one instead of staying stuck on its old mark.
-fn resume_from(core: &Core) -> Result<u64> {
-    let tip = core.tip_height()?.context("the store is not anchored")?;
-    if let Some((from, to)) = core.reanchor_shipped()? {
-        info!(
-            "finality: adopted shipped checkpoint #{to} (was #{from}); \
-             the next bar is measured from it"
-        );
-    }
-    Ok(tip + 1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn opening_a_fresh_mainnet_store_trusts_the_whole_spine() {
+    fn opening_a_fresh_mainnet_store_trusts_the_embedded_checkpoints() {
         let dir = tempfile::tempdir().unwrap();
         let node = Node::open(Config {
             data_dir: dir.path().to_path_buf(),
             ..Config::default()
         })
         .unwrap();
-        let spine = rsk_core::btc::checkpoints::parse().unwrap();
+        let checkpoints = rsk_core::btc::checkpoints::parse().unwrap();
         assert_eq!(
             node.core().tip_height().unwrap(),
-            Some(spine.last().unwrap().0)
-        );
-        assert_eq!(
-            resume_from(node.core()).unwrap(),
-            spine.last().unwrap().0 + 1
+            Some(checkpoints.last().unwrap().0)
         );
     }
 
@@ -214,11 +202,10 @@ mod tests {
         })
         .unwrap();
         assert_eq!(node.core().tip_height().unwrap(), Some(0));
-        assert_eq!(resume_from(node.core()).unwrap(), 1);
     }
 
     #[test]
-    fn reopening_an_anchored_store_resumes_above_its_tip() {
+    fn reopening_an_initialized_store_keeps_its_tip() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
             data_dir: dir.path().to_path_buf(),
@@ -229,6 +216,6 @@ mod tests {
             node.core().tip_height().unwrap().unwrap()
         };
         let node = Node::open(config).unwrap();
-        assert_eq!(resume_from(node.core()).unwrap(), tip + 1);
+        assert_eq!(node.core().tip_height().unwrap(), Some(tip));
     }
 }

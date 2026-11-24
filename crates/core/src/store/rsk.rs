@@ -301,7 +301,7 @@ impl ReadTxn {
 
 impl super::Store {
     /// Drop every Rootstock table, so a replayed action sequence starts from an
-    /// empty forest while the Bitcoin side stays seeded.
+    /// empty forest while the Bitcoin side stays initialized.
     pub(crate) fn reset_rsk(&self) -> Result<(), Error> {
         let txn = self.write()?;
         txn.txn.delete_table(RSK_HEADERS)?;

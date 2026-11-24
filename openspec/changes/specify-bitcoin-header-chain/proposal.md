@@ -23,10 +23,11 @@ stored header. Remove it.
   `BTC-00` to `BTC-08`. Each requirement has scenario tests that drive
   `Core::apply`.
 - Define the **trusted checkpoints**: the configured headers that the crate
-  assumes correct. The crate plants them at open. Each trusted checkpoint lies
-  at a Bitcoin period boundary, and the heights are one period apart.
+  assumes correct. The crate initializes the store with them at open. Each
+  trusted checkpoint lies at a Bitcoin period boundary, and the heights are one
+  period apart.
 - Keep the open rule (legacy O1) in this capability as two requirements.
-  `BTC-00 Trusted checkpoints` plants the checkpoints on an empty store.
+  `BTC-00 Trusted checkpoints` initializes the store with the checkpoints.
   `BTC-01 Store identity` compares an existing store with the configuration.
 - Name the batch rules after their property: `BTC-02 Atomicity`,
   `BTC-03 Idempotency` (the stored prefix and the no-op) and `BTC-04

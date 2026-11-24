@@ -1,11 +1,11 @@
-//! The embedded Bitcoin checkpoint spine.
+//! The embedded trusted checkpoints.
 //!
 //! One trusted header per difficulty period — heights `0, 2016, 4032, …` — one
 //! lowercase-hex 80-byte header per line, line `i` at height
-//! `i * DIFFICULTY_PERIOD`. It is the trust anchor for a fast sync: seeding
-//! these lets a node skip the whole-history download (the Electrum model) while
-//! still PoW-, continuity-, difficulty- and timestamp-validating every header
-//! above the spine.
+//! `i * DIFFICULTY_PERIOD`. Writing these to an empty store lets a node skip
+//! the whole-history download (the Electrum model) while still PoW-,
+//! continuity-, difficulty- and timestamp-validating every header above the
+//! first trusted checkpoint.
 //!
 //! The file holds only **finalized** checkpoints — each one met the finality
 //! rule in force when the file was generated (see [`crate::btc::finality`]), so
@@ -21,15 +21,16 @@ use bitcoin::consensus::Decodable;
 use crate::error::Error;
 use crate::store::DIFFICULTY_PERIOD;
 
-/// The embedded checkpoint spine, one hex header per line in height order.
+/// The embedded trusted checkpoints, one hex header per line in height order.
 const CHECKPOINTS: &str = include_str!("../../data/checkpoints.txt");
 
-/// The raw spine file contents (one hex header per line).
+/// The raw checkpoint file contents (one hex header per line).
 pub fn text() -> &'static str {
     CHECKPOINTS
 }
 
-/// The spine as `(height, header)`, line `i` at height `i * DIFFICULTY_PERIOD`.
+/// The trusted checkpoints as `(height, header)`, line `i` at height
+/// `i * DIFFICULTY_PERIOD`.
 pub fn parse() -> Result<Vec<(u64, BitcoinHeader)>, Error> {
     let mut out = Vec::new();
     for (i, line) in CHECKPOINTS
@@ -63,24 +64,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn embedded_spine_parses_contiguously_from_genesis() {
-        let spine = parse().expect("embedded checkpoints parse");
+    fn embedded_checkpoints_parse_contiguously_from_genesis() {
+        let checkpoints = parse().expect("embedded checkpoints parse");
         // The file may be trimmed for experiments, so only the shape
         // is asserted: contiguous whole periods from the real genesis. The age
         // of the tip is visible at runtime (`finality: mark #… (age …)`).
         assert!(
-            spine.len() >= 2,
-            "the spine needs at least two checkpoints, got {}",
-            spine.len()
+            checkpoints.len() >= 2,
+            "the embedded file needs at least two checkpoints, got {}",
+            checkpoints.len()
         );
-        assert_eq!(spine[0].0, 0);
+        assert_eq!(checkpoints[0].0, 0);
         // Line i is at height i * 2016, contiguous.
-        for window in spine.windows(2) {
+        for window in checkpoints.windows(2) {
             assert_eq!(window[1].0, window[0].0 + DIFFICULTY_PERIOD);
         }
         // Line 0 is the real mainnet genesis.
         assert_eq!(
-            spine[0].1.block_hash().to_string(),
+            checkpoints[0].1.block_hash().to_string(),
             "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
         );
     }

@@ -69,18 +69,18 @@ pub struct Config {
     pub(crate) difficulty_check: bool,
     /// The trusted checkpoints this store starts from.
     ///
-    /// The crate chooses it, so nothing outside `rsk-core` can change the
-    /// anchor: the embedded spine on mainnet, genesis on every other network,
-    /// and an explicit list in tests. A store that already holds a checkpoint
-    /// at a configured height must agree with it.
-    anchor: AnchorSource,
+    /// The crate chooses them, so nothing outside `rsk-core` can change them:
+    /// the embedded trusted checkpoints on mainnet, genesis on every other
+    /// network, and an explicit list in tests. A store that already holds a
+    /// checkpoint at a configured height must agree with it.
+    checkpoints: CheckpointSource,
 }
 
 /// Where the trusted checkpoints come from.
 #[derive(Debug, Clone)]
-pub(crate) enum AnchorSource {
-    /// The anchor compiled into the crate: the embedded spine on mainnet,
-    /// genesis on every other network.
+pub(crate) enum CheckpointSource {
+    /// The trusted checkpoints compiled into the crate: the embedded set on
+    /// mainnet, genesis on every other network.
     Embedded,
     /// An explicit list. Tests set it; production code cannot.
     #[cfg(test)]
@@ -96,7 +96,7 @@ impl Config {
             rsk_chain: rsk::chain_config(network),
             partition_safety: true,
             difficulty_check: true,
-            anchor: AnchorSource::Embedded,
+            checkpoints: CheckpointSource::Embedded,
         }
     }
 
@@ -108,16 +108,16 @@ impl Config {
             rsk_chain: rsk::chain_config(network),
             partition_safety: true,
             difficulty_check: true,
-            anchor: AnchorSource::Embedded,
+            checkpoints: CheckpointSource::Embedded,
         }
     }
 
-    /// The anchor for this configuration, resolved for its network.
-    pub(crate) fn resolve_anchor(&self) -> Result<Vec<(u64, BitcoinHeader)>, Error> {
-        match &self.anchor {
+    /// The trusted checkpoints for this configuration, resolved for its network.
+    pub(crate) fn resolve_checkpoints(&self) -> Result<Vec<(u64, BitcoinHeader)>, Error> {
+        match &self.checkpoints {
             #[cfg(test)]
-            AnchorSource::Explicit(entries) => Ok(entries.clone()),
-            AnchorSource::Embedded => match self.params.network {
+            CheckpointSource::Explicit(entries) => Ok(entries.clone()),
+            CheckpointSource::Embedded => match self.params.network {
                 Network::Bitcoin => crate::btc::checkpoints::parse(),
                 network => Ok(vec![(0, genesis_block(network).header)]),
             },
@@ -134,12 +134,12 @@ impl Config {
         self
     }
 
-    /// Replace the embedded anchor with an explicit list.
+    /// Replace the embedded trusted checkpoints with an explicit list.
     ///
-    /// Test-only: the anchor is a crate decision, not a runtime option.
+    /// Test-only: the checkpoints are a crate decision, not a runtime option.
     #[cfg(test)]
-    pub(crate) fn with_anchor(mut self, entries: &[(u64, BitcoinHeader)]) -> Self {
-        self.anchor = AnchorSource::Explicit(entries.to_vec());
+    pub(crate) fn with_checkpoints(mut self, entries: &[(u64, BitcoinHeader)]) -> Self {
+        self.checkpoints = CheckpointSource::Explicit(entries.to_vec());
         self
     }
 
@@ -175,8 +175,9 @@ pub struct Core {
 impl Core {
     /// Open a core with the given configuration.
     ///
-    /// The store is anchored before the handle is returned: a fresh store gets
-    /// the configured checkpoints, and an existing store must agree with them.
+    /// The store is initialized before the handle is returned: a fresh store
+    /// gets the configured trusted checkpoints, and an existing store must
+    /// agree with them.
     pub fn new(config: Config) -> Result<Self, Error> {
         if matches!(config.params.network, Network::Testnet4 | Network::Signet) {
             return Err(Error::UnsupportedNetwork(config.params.network));
@@ -186,7 +187,7 @@ impl Core {
             StoreConfig::Memory => Store::in_memory()?,
         };
         let core = Self { store, config };
-        core.ensure_anchor()?;
+        core.initialize_with_checkpoints()?;
         Ok(core)
     }
 
@@ -210,11 +211,11 @@ impl Core {
         Self::new(Config::in_memory(params.network).with_params(params))
     }
 
-    /// Drop every Bitcoin table and re-anchor from the configuration
-    /// (destructive: replay from a clean seed).
+    /// Drop every Bitcoin table and initialize again from the configuration
+    /// (destructive: replay from an empty store).
     pub fn reset(&self) -> Result<(), Error> {
         self.store.reset_btc()?;
-        self.ensure_anchor()
+        self.initialize_with_checkpoints()
     }
 
     /// Drop every Rootstock table, keeping the Bitcoin side intact.
@@ -229,7 +230,6 @@ impl Core {
     /// Every action runs in its own transaction, so it is all-or-nothing.
     pub fn apply(&self, action: Action<'_>) -> Result<Outcome, Error> {
         Ok(match action {
-            Action::ReanchorShipped => Outcome::Reanchored(self.reanchor_shipped_impl()?),
             Action::SubmitBitcoinHeaders { headers, now } => {
                 Outcome::BitcoinSubmitted(self.submit_bitcoin_headers_impl(headers, now)?)
             }
@@ -328,9 +328,10 @@ impl Core {
 
     /// The canonical chain, oldest first, streamed from one read snapshot.
     ///
-    /// The first row is the root seed, which may be above height 0. Yields an
-    /// [`Error::Internal`] once if a canonical height has no stored row. A
-    /// sparse seed has such gaps; a full chain does not.
+    /// The first row is the first trusted checkpoint of the root fork, which
+    /// may be above height 0. Yields an [`Error::Internal`] once if a canonical
+    /// height has no stored row. A sparse checkpoint set has such gaps; a full
+    /// chain does not.
     pub fn canonical_headers(&self) -> Result<CanonicalHeaders, Error> {
         let txn = self.store.read()?;
         let Some(best) = txn.best_fork()? else {
@@ -339,9 +340,9 @@ impl Core {
         let Some((tip, _)) = txn.fork_tip(best)? else {
             return Ok(CanonicalHeaders::empty());
         };
-        // A seed may start above height 0 (the shipped spine or a test seed).
-        // The canonical read starts at the root seed, not at the virtual block
-        // below it.
+        // The root fork may start above height 0 (the embedded checkpoints or
+        // a test checkpoint). The canonical read starts at the first trusted
+        // checkpoint, not at the virtual block below it.
         let start = txn.fork_meta(0)?.map_or(0, |meta| meta.forkpoint);
         Ok(CanonicalHeaders {
             txn: Some(txn),
@@ -360,8 +361,6 @@ impl Core {
 /// Every state-changing operation the node can ask the core to perform.
 #[derive(Debug)]
 pub enum Action<'a> {
-    /// Adopt the newest configured Bitcoin period boundary the store holds.
-    ReanchorShipped,
     /// Submit a run of Bitcoin headers at the caller's clock.
     SubmitBitcoinHeaders {
         headers: &'a [BitcoinHeader],
@@ -394,7 +393,6 @@ pub enum Action<'a> {
 /// What [`Core::apply`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    Reanchored(Option<(u64, u64)>),
     BitcoinSubmitted(SubmitBitcoinOutcome),
     CoinbaseStored,
     CoinbaseTagUpdated(bool),
@@ -468,7 +466,8 @@ impl Iterator for StoredHeaders {
     }
 }
 
-/// Streams the canonical Bitcoin chain, oldest first, starting at the seed.
+/// Streams the canonical Bitcoin chain, oldest first, starting at the first
+/// trusted checkpoint.
 ///
 /// Created by [`Core::canonical_headers`]. Holds one read snapshot while it
 /// yields rows.
