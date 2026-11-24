@@ -59,7 +59,7 @@ The state machine tracks:
 
 - **Headers.** A run that the caller claims is contiguous.
 - **`now`.** The caller's clock, or none. It lets the machine judge header
-  timestamps and measure finality without an internal clock (V7, E7).
+  timestamps and measure finality without an internal clock (V6, E7).
 
 ## 4. Requirements
 
@@ -72,25 +72,22 @@ checkpoint both hold, or the open fails. It adds no checkpoint.
 
 ### Validation
 
-**V1 — parent.** After the skipped prefix (E2), the first new header must name
-a stored parent. If its parent is not stored, the action fails with
-`UnknownAncestor`. Bitcoin Core calls this `prev-blk-not-found`. Bitcoin Core
-does not keep invalid previous headers, so `bad-prevblk` cannot arise.
+**V1 — parent.** A header must name a known parent: a stored header, or one
+earlier in the batch. An unknown parent fails with `UnknownAncestor`. Bitcoin
+Core calls this `prev-blk-not-found`. Bitcoin Core does not keep invalid
+previous headers, so `bad-prevblk` cannot arise.
 
-**V2 — linkage.** From the first new header, each header must name the previous
-header as its parent. A mismatch fails with `LinkBreak`.
-
-**V3 — proof of work.** Each new header must meet its own target. Failure gives
+**V2 — proof of work.** Each header must meet its own target. Failure gives
 `BadPow`. Bitcoin Core calls this `high-hash`.
 
-**V4 — median-time-past.** Bitcoin requires the timestamp to be greater than the
+**V3 — median-time-past.** Bitcoin requires the timestamp to be greater than the
 median of the previous **up to** 11 block times. Failure gives `BadTimestamp`
 (Bitcoin Core `time-too-old`).
 
 **Local:** the check applies only when all 11 previous headers are stored. If one
 is missing, or the header is in the first 11 heights, the check is skipped.
 
-**V5 — expected difficulty.** The header bits must equal the expected target.
+**V4 — expected difficulty.** The header bits must equal the expected target.
 Inside a period they are the parent's. At a period boundary the retarget
 recomputes them; testnet4 starts from the period-start bits (BIP94), every other
 network from the parent's, and regtest keeps the parent's. On a network that
@@ -99,11 +96,11 @@ after its parent must carry the proof-of-work limit; any other header there
 expects the last non-minimum-difficulty bits of the period. Failure gives
 `BadDifficulty` (Bitcoin Core `bad-diffbits`).
 
-**V6 — target range.** Bitcoin rejects a target that is negative, overflowing,
+**V5 — target range.** Bitcoin rejects a target that is negative, overflowing,
 zero or above the network proof-of-work limit. The same range check runs before
 proof of work. A failure gives `BadPow` with `target out of range`.
 
-**V7 — future time.** Bitcoin rejects a header whose timestamp is more than two
+**V6 — future time.** Bitcoin rejects a header whose timestamp is more than two
 hours after the current time. The failure is `TimestampTooNew` (Bitcoin Core
 `time-too-new`).
 
@@ -111,8 +108,9 @@ hours after the current time. The failure is `TimestampTooNew` (Bitcoin Core
 there is no frame of reference for it, so it is skipped.
 
 When more than one check would fail, the reported order is: link, expected
-difficulty (when enforced), median-time-past, future time, then proof of work.
-This is not Bitcoin Core's order; Bitcoin Core checks proof of work first.
+difficulty (when enforced), median-time-past, future time, target range, then
+proof of work. This is not Bitcoin Core's order; Bitcoin Core checks proof of
+work first.
 
 Known Bitcoin header checks that are not performed:
 
@@ -121,15 +119,17 @@ Known Bitcoin header checks that are not performed:
 | Version rules | Height-activated and no SPV value. |
 | Bitcoin Core checkpoint mismatch | Trust comes from the seeded spine. The name refers to older Bitcoin Core. |
 | Block-body checks | Not header fields. |
-| MTP when fewer than 11 headers are stored | Local skip. See V4. |
+| MTP when fewer than 11 headers are stored | Local skip. See V3. |
 
 ### State transition
 
 **E1 — rejected action.** If the action fails, the state does not change.
 
 **E2 — repeated prefix.** The action skips a leading run of stored headers and
-starts at the first header not yet stored. If every header is stored, the action
-succeeds, reports no connected header, and changes nothing.
+starts at the first header not yet stored. The rest is one contiguous run: each
+header names the one before it, and the first names the last skipped header when
+there is a skip. A break fails with `LinkBreak`. If every header is stored, the
+action succeeds, reports no connected header, and changes nothing.
 
 **E3 — forks.** The target fork is the fork that holds the first new header's
 parent. The action extends it when the parent is its tip, and otherwise starts a
@@ -155,6 +155,6 @@ rule. This switch is test-only.
 **E7 — clock.** The requirement's clock is the greatest of the supplied `now`
 (if any), the stored high-water mark, and the chain time at the best tip: the
 median of the last 11 header times, or the tip's own time when that window is
-not stored. V7 uses only the supplied value. A batch that stores a new header
+not stored. V6 uses only the supplied value. A batch that stores a new header
 raises the high-water mark to this clock when greater; a batch that stores none
 leaves it unchanged.
