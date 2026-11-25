@@ -1,0 +1,46 @@
+# cargo-mutants configuration for the Rske workspace.
+#
+# Run a scoped audit from the workspace root. Do not mutate the whole tree:
+#
+#   cargo mutants -p rsk-core -f crates/core/src/btc/validation.rs -- --lib
+#
+# Add a narrower test filter to iterate faster:
+#
+#   cargo mutants -p rsk-core -f crates/core/src/btc/validation.rs \
+#     -- --lib specs::bitcoin_header_validation
+#
+# Read `docs/core-verification.md` before you triage a missed mutant.
+
+# Vendored upstream code and the thin CLI stay out of scope. They carry their
+# own suites, and a mutant there does not change a Rust implementation we own.
+exclude_globs = [
+  "crates/rsk-consensus/**",
+  "crates/rsk-p2p/**",
+  "crates/cli/**",
+]
+
+# These functions read the wall clock, resolve DNS, open a socket, or format
+# log text. A deterministic test cannot kill a mutant in them. Exclude them
+# here instead of writing a test that pins a log string.
+exclude_re = [
+  '^crates/rsk/src/sync\.rs:\d+:\d+: .*(unix_now|fmt_age|fmt_safety|log_finality_start|partition_note)',
+  '^crates/rsk/src/node\.rs:\d+:\d+: .*Node::config',
+  '^crates/rsk/src/peers\.rs:\d+:\d+: .*(resolve|candidates)',
+  '^crates/rsk/src/rootstock\.rs:\d+:\d+: .*hex8',
+  '^crates/btc-p2p/src/seeds\.rs:\d+:\d+: .*resolve',
+  '^crates/btc-p2p/src/session\.rs:\d+:\d+: .*(set_read_timeout|now_unix|nonce)',
+]
+
+# Do not mutate allocation-only calls such as `Vec::with_capacity`. A mutant
+# there does not change behaviour, so no test can kill it.
+skip_calls_defaults = true
+
+# Reuse the build cache in each scratch tree. `target/` is 2.2 GB, and a cold
+# rebuild for every mutant costs more than the copy.
+copy_target = true
+
+# Timing. The 2015-block boundary fixture in `hdr_06` takes about 16 s alone,
+# and a 64-case state machine mines thousands of headers.
+minimum_test_timeout = 180.0
+timeout_multiplier = 3.0
+build_timeout_multiplier = 2.0

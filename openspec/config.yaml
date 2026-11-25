@@ -6,6 +6,17 @@ context: |
   lines unwrapped on one line. When a `**Source**:` line wraps, the OpenSpec
   parser reads the next lines as requirement text.
 
+  Read `docs/core-verification.md` before writing a test. It states the five
+  verification layers, the boundary rule and the mutation triage rule.
+
+  `rsk-core` is a deterministic state machine. Every state change goes through
+  `Core::apply(Action)` in one `redb` transaction. The logic has no clock, no
+  network and no I/O. `Core::state()` returns the whole stored state for tests.
+
+  Requirement IDs are append-only and they appear in the requirement heading.
+  The executable form of a requirement lives in `crates/core/specs/`, and the
+  test name carries the requirement ID.
+
 rules:
   specs:
     - Each requirement ID (`[HDR-xx]`, `[BTC-xx]`, `[FIN-xx]`, `[RSK-xx]`) is
@@ -19,6 +30,7 @@ rules:
       deviation table.
     - State-machine reference models must predict the full relevant `CoreState`
       and `Outcome` fields, not only a hash set.
+    - An excluded mutation target must name its reason and its location.
   tasks:
     - Capability scenario tests must call `Core::apply` with production
       validation flags enabled. Do not disable difficulty checks in capability
@@ -28,5 +40,11 @@ rules:
       reference model.
     - Run `openspec validate --all --strict` and
       `cargo test -p rsk-core --lib specs::` in the integration gate.
-    - Run `cargo mutants -p rsk-core -- --lib specs::` when you audit test
-      completeness against a capability spec.
+    - Audit test completeness with a scoped mutation run, one file at a time.
+      Use `cargo mutants -p rsk-core -f PATH -- --lib`. Do not mutate the
+      whole workspace. A narrower `specs::` filter is a fast loop only; confirm
+      a survivor with `--lib`.
+    - Triage every missed mutant before you write a test. A spec violation
+      gets the test. Unspecified behaviour gets a specification change first.
+      An equivalent mutant gets the redundant branch deleted, or a config
+      exclusion with a reason.

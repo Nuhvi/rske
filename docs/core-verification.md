@@ -1,147 +1,295 @@
-# Core verification
+# Verification guide
 
-The reviewable specification of `rsk-core` lives in two paired directories:
+This document is the verification playbook for the workspace. It states what to
+test, how to test it, and how to read the result. Follow it for every change.
 
-- `specs/` — human-readable requirements, written as short Markdown documents;
-- `crates/core/specs/` — the executable state-machine tests for those
-  requirements.
+The capability specifications in `openspec/specs/` are the source. The
+repository-root `specs/` directory holds legacy documents. Do not edit them.
 
-| Human spec | Executable form |
+## The gate
+
+Run these commands before you finish a change.
+
+| Command | Scope |
 |---|---|
-| [`specs/bitcoin-headers.md`](../specs/bitcoin-headers.md) | [`crates/core/specs/bitcoin_headers.rs`](../crates/core/specs/bitcoin_headers.rs) |
-| [`specs/rootstock-checkpoints.md`](../specs/rootstock-checkpoints.md) | [`crates/core/specs/rootstock_checkpoints.rs`](../crates/core/specs/rootstock_checkpoints.rs) |
+| `cargo test -p rsk-core --lib specs::` | every capability scenario and every state machine |
+| `cargo test -p rsk-core` | the `rsk-core` unit tests too |
+| `cargo test -p rsk` | the node driver |
+| `cargo check --workspace` | the whole workspace |
+| `openspec validate --all --strict` | the specification structure |
+| `cargo mutants -p rsk-core -f FILE -- --lib` | one source file, on demand |
 
-The Markdown is the source. Clause IDs (`O1`, `V1`, `E1`, …) are referenced by
-comments in the Rust file, so a reviewer can follow a statement from the
-document to the exact check that enforces it.
+Add `PROPTEST_VERBOSE=1` to a state machine command to see the generated
+sequences. Run one capability alone:
 
 ```bash
-cargo test -p rsk-core --lib specs::
-PROPTEST_VERBOSE=1 cargo test -p rsk-core --lib specs::
+cargo test -p rsk-core --lib specs::bitcoin_header_validation
+cargo test -p rsk-core --lib specs::bitcoin_header_chain
 ```
 
-## What the specs cover
+## The five layers
 
-### Bitcoin headers (`bitcoin-headers.md`)
+Use the lowest layer that can prove the property. A change adds tests at the
+layer of the rule it touches, not above it.
 
-All four machines run on mainnet parameters. The synthetic chain starts at a
-recent mainnet difficulty-period start, relaxes the proof-of-work limit so
-mining is cheap, and disables the mainnet estimated-work finality requirement,
-which a synthetic chain cannot clear. This keeps the mainnet network,
-difficulty and finality code paths while the headers stay cheap to mine.
+| Layer | Tool | Proves |
+|---|---|---|
+| 1. Scenario | `#[test]` and `Core::apply` | one requirement, at its boundaries |
+| 2. State machine | `proptest-state-machine` | sequences, against a reference model |
+| 3. Exhaustive search | a breadth-first driver | every reachable state in a small space |
+| 4. Mutation | `cargo-mutants` | that the tests constrain the code |
+| 5. Symbolic | Kani, fuzzing | all inputs, or untrusted bytes |
 
-`bitcoin_headers_match_the_spec` checks header and batch delivery over a fixed
-universe containing a 12-block trunk, a competing fork, a fork of a fork, a
-bad-PoW header, a stale-timestamp header, an out-of-range target header,
-duplicate batches and an empty batch:
+## Layer 1: capability scenarios
 
-- E1–E2: atomicity and idempotence. A rejected action leaves the store
-  unchanged.
-- V1–V3: parent, proof of work and median-time-past. The errors are
-  `UnknownAncestor`, `BadPow` and `BadTimestamp`; E2 covers `LinkBreak`.
-- V6: a header more than two hours after `now` gives `TimestampTooNew`.
-- E3–E5: fork creation, the exact stored header set and fork choice. The
-  canonical chain is the best fork's chain (S3).
+One `#[test]` per requirement. The test name carries the requirement ID, so a
+rename is a visible break. Examples: `btc_07_best_fork` and
+`hdr_05_minimum_difficulty_networks`.
 
-This machine turns V4 off with a test-only switch, because the expected-bits
-rule would reject an out-of-range target before V5 can see it. V4 has its own
-machine.
+Every scenario calls `Core::apply(Action)`. Do not call a private helper, and
+do not disable a production validation flag. The only permitted test switches
+are `Config::with_checkpoints`, `Config::without_partition_safety` and a
+relaxed proof-of-work limit.
 
-`finality_and_fork_gate_matches_the_spec` checks the finality mark and the fork
-gate on a 240-block trunk with the production depth, delivered in short runs:
+Rules:
 
-- E3 and E6: forks at or below the mark are refused, the mark never regresses
-  or passes the tip, and `finalized` reports each move.
+1. **Test both sides of every boundary.** For every `<`, `<=`, `>`, `>=`,
+   window size `N`, clamp factor and ratio, write one case at the boundary and
+   one case one step past it. The `openspec/config.yaml` rule states the same.
+2. **Change one field from a valid baseline.** Start from a header the core
+   accepts. Change one field. Re-mine when the change alters the hash.
+3. **Assert the exact `Error` variant and its fields.** Do not assert that "an
+   error happened" when the spec names the error.
+4. **Assert atomicity.** Read `Core::state()` before and after a refusal, and
+   compare them. A refused action must change nothing.
+5. **Do not shadow a rule.** If an earlier rule necessarily fails first, repair
+   the fixture. Do not assert a later rule through a fixture the earlier rule
+   already rejected.
+6. **Do not pin log text.** A log line is not behaviour. If a function only
+   formats output, exclude it from mutation testing instead of testing it.
 
-A plain test, `the_finality_requirement_gates_the_mark`, holds the same trunk
-under mainnet's estimated-work requirement and checks that the mark does not
-advance.
+## Layer 2: state machine tests
 
-`difficulty_matches_the_spec` checks V4 through `Core` with mainnet parameters
-and a relaxed proof-of-work limit: a child with the parent's bits is accepted, a
-sibling with different bits is `BadDifficulty`. V5, the target-range and
-pow-limit check, is covered by the delivery machine and by unit tests that pin
-the mainnet pow limit. `the_boundary_retarget_is_enforced` covers the
-period-boundary retarget through `Core`, which the machine does not reach.
-Testnet's minimum-difficulty gap and walk-back, testnet4's BIP94 retarget and
-regtest's no-retarget rule are unit tests in `btc::validation` and `btc`.
+`crates/core/specs/` holds one file per capability. Each file owns its model,
+its transitions and its invariants. `support.rs` holds the shared fixtures.
 
-`future_time_matches_the_spec` checks V6 against the caller clock. Plain tests
-pin the clause boundaries the machines do not reach:
-`median_time_past_excludes_the_header_itself` (V3),
-`the_target_range_check_runs_before_proof_of_work` (V5) and
-`a_header_exactly_two_hours_ahead_is_accepted` (V6).
+The model rules:
 
-`btc_01_store_identity` covers store identity without a machine: an open with a
-stored chain refuses another network or another trusted checkpoint.
+- Derive the model from the capability specification and the public `Core`
+  types. Do not copy an implementation branch into the model. A model that
+  mirrors the code proves only that the code equals itself.
+- Predict the full `CoreState`, the `StoredHeader` rows and the owned
+  `Outcome` or `Error` fields. A hash set of headers is not enough.
+- Compare the store after every step, not only at the end.
+- Shrink on failure. `proptest-state-machine` re-runs a minimal sequence from a
+  fresh system under test.
 
-Not yet checked by any machine:
+Check the transition topology. The current machines use a fixed fixture, so
+the generated sequence varies the order and the batch cut, not the graph.
+Extend the fixture when a rule needs it. Cover:
 
-- the clock floor and clockless connects (E7), including the
-  median-time-past chain clock and its sparse-window fallback, which only unit
-  tests cover;
-- a heavier fork that crosses the mark (the mark-crossing half of E5, and the
-  election path it exercises);
-- median-time-past with fewer than 11 stored headers, and at a height where an
-  ancestor header is missing;
-- coinbase and Rootstock actions;
-- fork trees deeper than the fixed delivery universe.
+- forks with different per-block work, so a shorter but heavier fork exists;
+- forks above and below the moving finality mark, so the admittance rule runs;
+- caller clock steps (`now: Some` and `now: None`), so the high-water mark
+  moves;
+- a child proposed before its parent, for the Rootstock forest;
+- batch cuts at the first new header, at the fork point and at a stored
+  suffix.
 
-A requirement added to `specs/` should come with a matching transition or
-invariant in the executable form, or an entry in this list.
+The regression file is `crates/core/specs/<machine>.txt`. Keep it in version
+control.
 
-### Rootstock checkpoints (`rootstock-checkpoints.md`)
+## Layer 3: exhaustive search
 
-`rsk_checkpoint_policy_matches_the_spec` proposes roots, attempts a checkpoint
-and writes the sync tip over a real finalized Bitcoin tail:
+Random walks sample the state space. When the space is small, search it
+completely. Use the `Hash` derive that `CoreState` already has.
 
-- R1–R3: proposal acceptance, refusal atomicity, and exact forest/root sets;
-- R4–R6: the strict 2/3 threshold, heaviest-root selection, and GHOST subtree
-  work;
-- R7–R8: sync-tip recording/resolution and the read-only attempt.
-
-## How the state machine tests work
-
-Every transition is one `Core::apply(Action)` call — the same entry point the
-node driver uses. A small reference model predicts the accepted header set or
-the reported checkpoint; the test compares that prediction with the real redb
-store after every step and checks the universal invariants there.
-
-`proptest-state-machine` generates a sequence of actions from the model,
-shrinks a failing sequence to a minimal one, and re-runs it from a fresh SUT.
-`core/specs/mod.rs` is wired into the crate as a test-only module:
+The pattern:
 
 ```rust
-#[cfg(test)]
-#[path = "../specs/mod.rs"]
-mod specs;
+use std::collections::{HashSet, VecDeque};
+
+use bitcoin::Network;
+use rsk_core::{Action, Core, CoreState};
+
+const DEPTH: usize = 6;
+
+fn explore() {
+    let mut queue: VecDeque<Vec<Step>> = VecDeque::from([Vec::new()]);
+    let mut seen: HashSet<CoreState> = HashSet::new();
+
+    while let Some(path) = queue.pop_front() {
+        // Replay the path on a fresh in-memory store and on the model.
+        let core = Core::in_memory(Network::Bitcoin).expect("open");
+        let mut model = Model::init();
+        for step in &path {
+            let expected = model.step(*step);
+            let actual = apply(&core, *step);
+            assert_eq!(expected, actual, "diverged at {path:?} then {step:?}");
+        }
+
+        if !seen.insert(core.state().expect("state")) {
+            continue;
+        }
+        if path.len() == DEPTH {
+            continue;
+        }
+        for step in model.steps() {
+            let mut next = path.clone();
+            next.push(step);
+            queue.push_back(next);
+        }
+    }
+}
 ```
 
-## Core surfaces used by the specs
+`apply` maps one `Step` to one `Action` and calls `Core::apply`. Replay from a
+fresh store costs one open and one `path.len()` steps per node. Use this layer
+for a universe below about 10,000 states: fork choice, the 2/3 threshold, the
+sync tip.
 
-The tests drive only public API:
+Why not TLA+? The Rust reference model already is the transition relation, and
+it runs against the real store. A separate `.tla` file would model the model,
+not the code, and it cannot see a `redb` row, a 256-bit overflow or an
+incorrect height by one. Keep TLA+ for a new concurrent or distributed
+protocol, not for this deterministic core.
 
-- `Core::apply(Action)` — the single mutation entry point;
-- `Core::state()` — the whole-state snapshot used for atomicity and
-  deduplication;
-- `Core::stored_headers()`, `Core::canonical_headers()`,
-  `Core::finalized_checkpoints()`, `Core::coinbase_tags()`,
-  `Core::rsk_headers_back()` — iterators over the row collections that can grow
-  without bound;
-- `Core::new(Config)` — opens a store from one configuration value. It
-  initializes a fresh store with the compiled-in trusted checkpoints and
-  refuses an existing store whose network or checkpoints disagree, so no caller
-  can switch chains.
-  `Config::in_memory`/`Config::open` select the backend, and
-  `Config::with_params`/`Config::without_partition_safety` override the network
-  defaults (`Core::in_memory`/`Core::open` are the default-option shortcuts).
-  `Config::with_checkpoints` and `Config::without_difficulty_check` are
-  test-only and crate-private;
-- `Core::reset`, `Core::reset_rsk` — replay from a clean fixture. `Core::reset`
-  initializes again from the configuration; `Core::reset_rsk` drops only the
-  Rootstock tables. These are ordinary public methods; no feature flag is
-  needed.
+## Layer 4: mutation testing
 
-If a requirement is not in `specs/` and has no executable counterpart, it is
-covered — if at all — by an ordinary unit test in the module that owns the
-behaviour.
+`cargo-mutants` changes the code and runs the tests. A mutant that survives
+shows code no test constrains.
+
+Run one file at a time. Do not mutate the whole workspace; it takes hours and
+most survivors are untestable I/O.
+
+```bash
+cargo mutants -p rsk-core -f crates/core/src/btc/validation.rs -- --lib
+```
+
+Preview without running:
+
+```bash
+cargo mutants --list -p rsk-core -f crates/core/src/btc/finality.rs
+```
+
+Read the result:
+
+- `mutants.out/missed.txt` — the survivors, one line each;
+- `mutants.out/diff/<file>_line_<n>.diff` — the change that survived;
+- `mutants.out/log/<file>_line_<n>.log` — the test output for that mutant;
+- `cargo mutants --iterate` — skip the mutants an earlier run caught.
+
+Every run replaces `mutants.out/`. Move a run you want to keep before you start
+the next one. Both paths are ignored by Git.
+
+Always pass `--lib`, so the unit tests in the same crate run. A narrower
+filter such as `--lib specs::bitcoin_header_chain` is a fast loop, but it can
+hide a survivor that only a unit test kills. Confirm a survivor with `--lib`
+before you record it.
+
+### Triage a missed mutant
+
+Decide the class first. Do not write a test to make a survivor disappear.
+
+| Class | Test | Action |
+|---|---|---|
+| Spec violation | The mutant breaks a clause in `spec.md` | Add or tighten the scenario. |
+| Unspecified behaviour | The mutant changes behaviour `spec.md` does not state | Stop. Update the specification first, in its own change. |
+| Equivalent mutant | No input can reach the change, or an earlier guard already blocks it | Delete the redundant branch, or exclude it in the config with a reason. |
+
+An exclusion needs a stated reason. Put it in `.cargo/mutants.toml`, next to
+the pattern. Do not exclude a function that computes a value.
+
+## Layer 5: Kani and fuzzing
+
+Neither tool is installed in this workspace. Install it before you use it.
+
+**Kani** proves a property for all inputs. Use it for the pure arithmetic that
+a random test samples poorly:
+
+- compact-target decode, encode and range check in `btc/validation.rs`;
+- the retarget timespan clamp and the 256-bit multiply;
+- the estimated-work finality law in `btc/finality.rs`;
+- the `3 * work > 2 * tail_work` comparison in `rsk/score.rs`.
+
+The harness shape:
+
+```rust
+#[cfg(kani)]
+#[kani::proof]
+fn compact_target_decode_never_panics() {
+    let bits: u32 = kani::any();
+    let header = header_with_bits(bits);
+    let _ = header.target();
+}
+```
+
+Run it with `cargo kani`.
+
+**Fuzzing** finds a crash in a byte parser. Use `cargo-fuzz` or `bolero` on
+the untrusted input, not on the typed core:
+
+- `btc-p2p` message codec and bloom filter;
+- `rsk-consensus` RLP decoding and header decode;
+- the coinbase `RSKBLOCK:` tag scan;
+- the merged-mining proof check.
+
+## Current coverage
+
+### `bitcoin-header-validation` (HDR-00 to HDR-08)
+
+`crates/core/specs/bitcoin_header_validation.rs` holds one scenario per
+requirement: `hdr_00_supported_networks` to `hdr_08_future_time`.
+`crates/core/specs/bitcoin_headers.rs` holds the HDR-04 and HDR-08 machines.
+
+### `bitcoin-header-chain` (BTC-00 to BTC-08)
+
+`crates/core/specs/bitcoin_header_chain.rs` holds the scenarios
+`btc_00_trusted_checkpoints` to `btc_08_outcome`, and the state machine
+`bitcoin_header_chain_matches_the_spec`.
+
+### Finality and the Rootstock policy
+
+- `finality_and_fork_gate_matches_the_spec` — the mark and the fork gate on a
+  trunk of 240 blocks, delivered in runs.
+- `the_finality_requirement_gates_the_mark` — mainnet estimated work does not
+  clear, so the mark stays.
+- `rsk_checkpoint_policy_matches_the_spec` — proposals, the checkpoint attempt
+  and the sync tip over a real finalized Bitcoin tail.
+
+### Shared fixture
+
+`crates/core/specs/support.rs` holds `mine`, `mine_with_bits`, `mine_bad`, the
+parameter builders, `mainnet_core`, `header_universe` and the submit helpers.
+`crates/core/specs/mod.rs` is wired into the crate at `crates/core/src/lib.rs`
+as a test-only module.
+
+## Known gaps
+
+A requirement added to a capability specification needs a matching scenario,
+a state machine transition, or an entry in this list.
+
+- The clock floor and clockless connects. The median-time-past chain clock and
+  its sparse-window fallback have unit tests only.
+- A heavier fork that crosses the finality mark. The admittance rule has no
+  state machine.
+- Median-time-past with fewer than 11 stored headers, and at a height where an
+  ancestor header is missing.
+- The coinbase actions and the Rootstock actions inside the chain machine. They
+  are tested by their own scenarios only.
+- A fork tree deeper than the fixed delivery universe.
+- One machine that interleaves Bitcoin and Rootstock actions. The Bitcoin mark
+  cannot move inside the Rootstock fixture, so the cross-capability seam is not
+  covered.
+- The node driver in `crates/rsk` has no state machine. `sync`, `ibd`,
+  `coinbase` and `peers` are covered by unit tests and by mutation testing
+  only.
+
+## Anti-patterns
+
+- Do not test a log string.
+- Do not assert an internal branch that `spec.md` does not state.
+- Do not disable the difficulty check in a capability scenario.
+- Do not mutate the whole workspace.
+- Do not add a test only to kill a mutant. Decide the class first.
+- Do not write a reference model that copies the implementation.
