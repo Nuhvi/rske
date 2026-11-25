@@ -23,6 +23,9 @@ exclude_globs = [
 # log text. A deterministic test cannot kill a mutant in them. Exclude them
 # here instead of writing a test that pins a log string.
 exclude_re = [
+  # The Kani proof blocks compile only under `cargo kani`. A mutant in one is
+  # invisible to `cargo test`, so it would always survive.
+  'proofs::',
   '^crates/rsk/src/sync\.rs:\d+:\d+: .*(unix_now|fmt_age|fmt_safety|log_finality_start|partition_note)',
   '^crates/rsk/src/node\.rs:\d+:\d+: .*Node::config',
   '^crates/rsk/src/peers\.rs:\d+:\d+: .*(resolve|candidates)',

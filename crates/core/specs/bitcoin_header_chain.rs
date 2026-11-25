@@ -30,12 +30,21 @@ use proptest_state_machine::{ReferenceStateMachine, StateMachineTest, prop_state
 use super::support::{
     CHECKPOINT_HEIGHT, CHECKPOINT_TIME, EASY_BITS, HeaderKind, HeaderUniverse, NOW,
     canonical_chain, expect_accepted, expect_err, header_universe, mainnet_core, mainnet_params,
-    mine, mine_bad, mine_with_bits, submit, synthetic_mainnet_core, testnet_params, work,
+    mine, mine_bad, mine_with_bits, proptest_cases, submit, synthetic_mainnet_core, testnet_params,
+    work,
 };
 use crate::{
     Action, Config, Core, DIFFICULTY_PERIOD, Error, ForkState, Outcome, RskState, StoredHeader,
     SubmitBitcoinOutcome, header_work,
 };
+
+/// The work of one header, computed here from the target.
+///
+/// The reference model must not call `crate::header_work`: a model that shares
+/// the helper it verifies agrees with a broken helper by construction.
+fn model_work(header: &BitcoinHeader) -> Work {
+    header.target().to_work()
+}
 
 // ── 1. Bitcoin delivery: forks, duplicates, errors ─────────────────────────
 
@@ -57,6 +66,7 @@ enum HeaderPrediction {
     BadPow,
     BadTimestamp,
     BadTarget,
+    BadDifficulty,
 }
 
 /// One fork in the abstract reference model.
@@ -103,6 +113,8 @@ struct HeaderModel {
     universe: HeaderUniverse,
     forks: Vec<ModelFork>,
     best_fork: u64,
+    /// The stored high-water mark of the caller clock, when one was supplied.
+    now_hwm: Option<u64>,
     last: HeaderPrediction,
 }
 
@@ -166,102 +178,8 @@ impl HeaderModel {
 #[derive(Clone, Debug)]
 struct HeaderTransition {
     batch: Vec<usize>,
-}
-
-/// Apply one transition to the reference model according to BTC-02..BTC-08 and
-/// HDR-01..HDR-03, HDR-07.
-fn apply_to_model(state: &mut HeaderModel, batch: &[usize]) {
-    let prev_best_fork = state.best_fork;
-    let current_tip = state.forks[prev_best_fork as usize].tip_height();
-    let headers: Vec<BitcoinHeader> = batch.iter().map(|&i| state.universe.headers[i]).collect();
-
-    // BTC-03: skip the longest leading run of stored headers.
-    let Some(start) = headers
-        .iter()
-        .position(|header| state.locate(header.block_hash()).is_none())
-    else {
-        state.last = HeaderPrediction::Noop {
-            best_fork: prev_best_fork,
-            tip_height: current_tip,
-        };
-        return;
-    };
-
-    // HDR-01 / BTC-04: find the parent of the first new header.
-    let parent_hash = if start == 0 {
-        headers[0].prev_blockhash
-    } else {
-        headers[start - 1].block_hash()
-    };
-    let Some((parent_fork, parent_height)) = state.locate(parent_hash) else {
-        state.last = HeaderPrediction::UnknownAncestor;
-        return;
-    };
-
-    // BTC-04 and HDR-02, HDR-03, HDR-07 validation on the new run.
-    let mut prev = parent_hash;
-    for (offset, header) in headers[start..].iter().enumerate() {
-        if header.prev_blockhash != prev {
-            state.last = HeaderPrediction::LinkBreak;
-            return;
-        }
-        match state.universe.kinds[batch[start + offset]] {
-            HeaderKind::Valid => {}
-            HeaderKind::BadTarget => {
-                state.last = HeaderPrediction::BadTarget;
-                return;
-            }
-            HeaderKind::BadTime => {
-                state.last = HeaderPrediction::BadTimestamp;
-                return;
-            }
-            HeaderKind::BadPow => {
-                state.last = HeaderPrediction::BadPow;
-                return;
-            }
-        }
-        prev = header.block_hash();
-    }
-
-    // BTC-05 / BTC-06: extend the parent fork if `parent` is its tip, else
-    // create a new fork at `parent_height + 1`.
-    let parent_tip = state.forks[parent_fork as usize].tip_height();
-    let mut cumulative = state.row_at(parent_fork, parent_height).1;
-    let forkpoint = parent_height + 1;
-    let mut new_rows = Vec::with_capacity(headers.len() - start);
-    for (offset, header) in headers[start..].iter().enumerate() {
-        cumulative = cumulative + header_work(header);
-        new_rows.push((forkpoint + offset as u64, *header, cumulative));
-    }
-
-    let target_fork = if parent_height == parent_tip {
-        state.forks[parent_fork as usize].rows.extend(new_rows);
-        parent_fork
-    } else {
-        let id = state.forks.len() as u64;
-        state.forks.push(ModelFork {
-            id,
-            forkpoint,
-            parent: Some(parent_fork),
-            rows: new_rows,
-        });
-        id
-    };
-
-    // BTC-07: switch best_fork only when strictly heavier.
-    let best_work = state.forks[state.best_fork as usize].tip_work();
-    let target_work = state.forks[target_fork as usize].tip_work();
-    if target_fork != state.best_fork && target_work > best_work {
-        state.best_fork = target_fork;
-    }
-
-    let tip_height = state.forks[state.best_fork as usize].tip_height();
-    state.last = HeaderPrediction::Connected {
-        accepted: headers.len() - start,
-        prev_best_fork,
-        best_fork: state.best_fork,
-        tip_height,
-    };
+    /// The caller clock for this submission. `None` is the clockless path.
+    now: Option<u64>,
 }
 
 struct HeaderMachine;
@@ -283,6 +201,7 @@ impl ReferenceStateMachine for HeaderMachine {
             universe,
             forks: vec![root],
             best_fork: 0,
+            now_hwm: None,
             last: HeaderPrediction::Noop {
                 best_fork: 0,
                 tip_height: CHECKPOINT_HEIGHT,
@@ -293,15 +212,122 @@ impl ReferenceStateMachine for HeaderMachine {
 
     fn transitions(state: &Self::State) -> BoxedStrategy<Self::Transition> {
         let batches = state.universe.batches.clone();
-        (0..batches.len())
-            .prop_map(move |i| HeaderTransition {
+        (0..batches.len(), prop_oneof![Just(NOW), Just(NOW + 3_600)])
+            .prop_map(move |(i, now)| HeaderTransition {
                 batch: batches[i].clone(),
+                now: Some(now),
             })
             .boxed()
     }
 
+    /// Apply one transition to the reference model according to BTC-02..BTC-08
+    /// and HDR-01..HDR-03, HDR-07.
     fn apply(mut state: Self::State, transition: &Self::Transition) -> Self::State {
-        apply_to_model(&mut state, &transition.batch);
+        let batch = &transition.batch;
+        let now = transition.now;
+        let prev_best_fork = state.best_fork;
+        let current_tip = state.forks[prev_best_fork as usize].tip_height();
+        let headers: Vec<BitcoinHeader> =
+            batch.iter().map(|&i| state.universe.headers[i]).collect();
+
+        // BTC-03: skip the longest leading run of stored headers.
+        let Some(start) = headers
+            .iter()
+            .position(|header| state.locate(header.block_hash()).is_none())
+        else {
+            state.last = HeaderPrediction::Noop {
+                best_fork: prev_best_fork,
+                tip_height: current_tip,
+            };
+            return state;
+        };
+
+        // HDR-01 / BTC-04: find the parent of the first new header.
+        let parent_hash = if start == 0 {
+            headers[0].prev_blockhash
+        } else {
+            headers[start - 1].block_hash()
+        };
+        let Some((parent_fork, parent_height)) = state.locate(parent_hash) else {
+            state.last = HeaderPrediction::UnknownAncestor;
+            return state;
+        };
+
+        // BTC-04 and HDR-02, HDR-03, HDR-07 validation on the new run.
+        let mut prev = parent_hash;
+        for (offset, header) in headers[start..].iter().enumerate() {
+            if header.prev_blockhash != prev {
+                state.last = HeaderPrediction::LinkBreak;
+                return state;
+            }
+            match state.universe.kinds[batch[start + offset]] {
+                HeaderKind::Valid => {}
+                HeaderKind::BadTarget => {
+                    state.last = HeaderPrediction::BadTarget;
+                    return state;
+                }
+                HeaderKind::BadTime => {
+                    state.last = HeaderPrediction::BadTimestamp;
+                    return state;
+                }
+                HeaderKind::BadPow => {
+                    state.last = HeaderPrediction::BadPow;
+                    return state;
+                }
+                HeaderKind::BadDifficulty => {
+                    state.last = HeaderPrediction::BadDifficulty;
+                    return state;
+                }
+            }
+            prev = header.block_hash();
+        }
+
+        // BTC-05 / BTC-06: extend the parent fork if `parent` is its tip, else
+        // create a new fork at `parent_height + 1`.
+        let parent_tip = state.forks[parent_fork as usize].tip_height();
+        let mut cumulative = state.row_at(parent_fork, parent_height).1;
+        let forkpoint = parent_height + 1;
+        let mut new_rows = Vec::with_capacity(headers.len() - start);
+        for (offset, header) in headers[start..].iter().enumerate() {
+            cumulative = cumulative + model_work(header);
+            new_rows.push((forkpoint + offset as u64, *header, cumulative));
+        }
+
+        let target_fork = if parent_height == parent_tip {
+            state.forks[parent_fork as usize].rows.extend(new_rows);
+            parent_fork
+        } else {
+            let id = state.forks.len() as u64;
+            state.forks.push(ModelFork {
+                id,
+                forkpoint,
+                parent: Some(parent_fork),
+                rows: new_rows,
+            });
+            id
+        };
+
+        // BTC-07: switch best_fork only when strictly heavier.
+        let best_work = state.forks[state.best_fork as usize].tip_work();
+        let target_work = state.forks[target_fork as usize].tip_work();
+        if target_fork != state.best_fork && target_work > best_work {
+            state.best_fork = target_fork;
+        }
+
+        // The finality rule runs after a successful write and stores the clock it
+        // judged: the greatest value seen so far. The mark itself cannot move here,
+        // because the delivery universe stays inside the coinbase-maturity window.
+        if let Some(now) = now {
+            state.now_hwm = Some(state.now_hwm.map_or(now, |seen| seen.max(now)));
+        }
+
+        let tip_height = state.forks[state.best_fork as usize].tip_height();
+        state.last = HeaderPrediction::Connected {
+            accepted: headers.len() - start,
+            prev_best_fork,
+            best_fork: state.best_fork,
+            tip_height,
+        };
         state
     }
 }
@@ -338,7 +364,7 @@ impl StateMachineTest for HeaderMachine {
         let before = sut.core.state().expect("state");
         let outcome = sut.core.apply(Action::SubmitBitcoinHeaders {
             headers: &headers,
-            now: None,
+            now: transition.now,
         });
         let after = sut.core.state().expect("state");
 
@@ -385,7 +411,8 @@ impl StateMachineTest for HeaderMachine {
             (HeaderPrediction::UnknownAncestor, Err(Error::UnknownAncestor(_)))
             | (HeaderPrediction::LinkBreak, Err(Error::LinkBreak { .. }))
             | (HeaderPrediction::BadPow, Err(Error::BadPow { .. }))
-            | (HeaderPrediction::BadTimestamp, Err(Error::BadTimestamp { .. })) => {
+            | (HeaderPrediction::BadTimestamp, Err(Error::BadTimestamp { .. }))
+            | (HeaderPrediction::BadDifficulty, Err(Error::BadDifficulty { .. })) => {
                 assert_eq!(before, after, "a rejected batch changed the store");
             }
             (HeaderPrediction::BadTarget, Err(Error::BadPow { detail, .. }))
@@ -417,6 +444,18 @@ impl StateMachineTest for HeaderMachine {
 
     fn check_invariants(sut: &HeaderSut, model: &HeaderModel) {
         let state = sut.core.state().expect("state");
+
+        // The finality rule stores the clock it judged, and the mark cannot
+        // move while the tip is inside the coinbase-maturity window.
+        assert_eq!(
+            state.now_hwm, model.now_hwm,
+            "the clock high-water mark diverged"
+        );
+        assert_eq!(
+            state.finalized,
+            Some(CHECKPOINT_HEIGHT),
+            "the mark moved inside the maturity window"
+        );
 
         // BTC-05, BTC-06: every fork's id, parent, forkpoint, tip height, tip
         // hash and cumulative work must match the model.
@@ -1405,7 +1444,7 @@ fn btc_08_outcome() {
 
 prop_state_machine! {
     #![proptest_config(ProptestConfig {
-        cases: 64,
+        cases: proptest_cases(64),
         .. ProptestConfig::default()
     })]
 

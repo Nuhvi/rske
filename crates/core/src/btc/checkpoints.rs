@@ -32,12 +32,17 @@ pub fn text() -> &'static str {
 /// The trusted checkpoints as `(height, header)`, line `i` at height
 /// `i * DIFFICULTY_PERIOD`.
 pub fn parse() -> Result<Vec<(u64, BitcoinHeader)>, Error> {
+    parse_text(CHECKPOINTS)
+}
+
+/// Parse checkpoint text: one hex 80-byte header per line, in height order.
+///
+/// Empty lines are skipped. Line `i` is at height `i * DIFFICULTY_PERIOD`.
+/// [`parse`] applies this to the embedded file; the separate entry point lets
+/// the fuzz target feed arbitrary bytes.
+pub fn parse_text(text: &str) -> Result<Vec<(u64, BitcoinHeader)>, Error> {
     let mut out = Vec::new();
-    for (i, line) in CHECKPOINTS
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .enumerate()
-    {
+    for (i, line) in text.lines().filter(|l| !l.trim().is_empty()).enumerate() {
         let bytes = hex::decode(line.trim()).map_err(|e| Error::CheckpointFormat {
             line: i,
             detail: e.to_string(),

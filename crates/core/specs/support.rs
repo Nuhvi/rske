@@ -156,6 +156,7 @@ pub(super) enum HeaderKind {
     BadPow,
     BadTime,
     BadTarget,
+    BadDifficulty,
 }
 
 /// The chain-delivery fixture: a trunk, a competing fork, a fork of a fork
@@ -232,6 +233,13 @@ pub(super) fn header_universe() -> HeaderUniverse {
     headers.push(c9);
     kinds.push(HeaderKind::Valid);
 
+    // D2: a valid hash at a target the difficulty rule does not expect
+    // (index 23). Inside a mainnet period the child must carry the parent's
+    // bits, so this is HDR-04 at the submit path.
+    let d2 = mine_with_bits(a1.block_hash(), a1.time + 2, 91, EASY_BITS - 1);
+    headers.push(d2);
+    kinds.push(HeaderKind::BadDifficulty);
+
     let mut batches = Vec::new();
     for i in 0..headers.len() {
         batches.push(vec![i]);
@@ -251,6 +259,7 @@ pub(super) fn header_universe() -> HeaderUniverse {
     batches.push(vec![0, 2]); // A1 then A3: link break
     batches.push(vec![0, 19]); // A1 then P4: bad PoW
     batches.push(vec![0, 21]); // A1 then X2: target above the pow limit
+    batches.push(vec![0, 23]); // A1 then D2: wrong expected bits
     batches.push(vec![0, 0]); // duplicate inside one batch
     batches.push(Vec::new()); // empty batch
 
@@ -270,6 +279,22 @@ pub(super) fn work(core: &Core) -> U256 {
             .expect("initialized")
             .to_be_bytes(),
     )
+}
+
+/// The number of proptest cases for a machine.
+///
+/// The default is the machine's own count. A mutation run replays the whole
+/// suite for every mutant, so it lowers the sample and confirms the survivors
+/// at the full count:
+///
+/// ```text
+/// RSK_PROPTEST_CASES=8 cargo mutants ...
+/// ```
+pub(super) fn proptest_cases(default: u32) -> u32 {
+    std::env::var("RSK_PROPTEST_CASES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
 }
 
 /// The canonical headers from the first trusted checkpoint through the tip.

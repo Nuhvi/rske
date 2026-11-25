@@ -1,0 +1,131 @@
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Nightly audit: the scoped mutation run takes longer than a PR allows.
+    - cron: "0 3 * * *"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The crates use no `#![feature]`; keep the toolchain fixed so a new stable
+  # release cannot change the result under us.
+  RUST_VERSION: "1.99.1"
+
+jobs:
+  kani:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Kani ships its own toolchain and downloads CBMC on first use.
+      - name: Install Kani
+        run: |
+          cargo install --locked kani-verifier
+          cargo kani setup
+
+      - name: Proofs
+        run: cargo kani
+
+  mutants:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+
+      - name: Mutation check on the diff
+        env:
+          RSK_PROPTEST_CASES: "16"
+        run: |
+          git fetch origin "${{ github.base_ref }}" --depth=1
+          git diff "origin/${{ github.base_ref }}..HEAD" > pr.diff
+          cargo mutants --in-diff pr.diff -p rsk-core -- --lib
+
+  mutants-nightly:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ["1/4", "2/4", "3/4", "4/4"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+
+      - name: Scoped audit
+        env:
+          RSK_PROPTEST_CASES: "16"
+        run: |
+          cargo mutants -p rsk-core \
+            -f crates/core/src/btc.rs \
+            -f crates/core/src/btc/validation.rs \
+            -f crates/core/src/btc/finality.rs \
+            -f crates/core/src/btc/checkpoints.rs \
+            -f crates/core/src/rsk.rs \
+            -f crates/core/src/rsk/score.rs \
+            -f crates/core/src/rsk/checkpoint.rs \
+            -f crates/core/src/core.rs \
+            --shard "${{ matrix.shard }}" -- --lib
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-${{ matrix.shard }}
+          path: mutants.out
+          if-no-files-found: ignore
+
+  fuzz-smoke:
+    # Non-blocking until the first green run: the fuzz crate has not been built
+    # on Linux yet.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Build targets
+        working-directory: fuzz
+        run: cargo fuzz build
+
+      - name: Smoke run
+        working-directory: fuzz
+        run: |
+          for target in checkpoints_text rsk_header_rlp btc_message; do
+            cargo fuzz run "$target" -- -runs=10000
+          done

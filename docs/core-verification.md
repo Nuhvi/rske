@@ -10,6 +10,20 @@ repository-root `specs/` directory holds legacy documents. Do not edit them.
 
 Run these commands before you finish a change.
 
+The whole gate is one command:
+
+```bash
+scripts/verify.sh          # format, lints, tests, specification structure
+scripts/verify.sh --full   # adds the Kani proofs
+```
+
+The table below lists the individual steps.
+
+CI runs the workspace suite with `cargo nextest`, and the documentation tests
+with `cargo test --doc`. The fast workflow lives in
+`.github/workflows/ci.yml`; the proofs, mutation and fuzz jobs live in
+`.github/workflows/verify.yml`.
+
 | Command | Scope |
 |---|---|
 | `cargo test -p rsk-core --lib specs::` | every capability scenario and every state machine |
@@ -99,6 +113,19 @@ Extend the fixture when a rule needs it. Cover:
 The regression file is `crates/core/specs/<machine>.txt`. Keep it in version
 control.
 
+The model must not call the crate helper that the system under test uses. A
+model that shares the helper agrees with a broken helper by construction. For
+example, the chain model computes a header's work from the target itself, not
+through `crate::header_work`.
+
+A mutation run replays the whole suite for every mutant. Lower the sample for
+speed, then confirm each survivor at the full count: a rare path, such as an
+equal-work tie, can need all 64 cases.
+
+```bash
+RSK_PROPTEST_CASES=16 cargo mutants -p rsk-core -f FILE -- --lib
+```
+
 ## Layer 3: exhaustive search
 
 Random walks sample the state space. When the space is small, search it
@@ -166,6 +193,13 @@ most survivors are untestable I/O.
 cargo mutants -p rsk-core -f crates/core/src/btc/validation.rs -- --lib
 ```
 
+For a change, run only the touched lines. CI uses the same commands:
+
+```bash
+git diff origin/main..HEAD > pr.diff
+cargo mutants --in-diff pr.diff -p rsk-core -- --lib
+```
+
 Preview without running:
 
 ```bash
@@ -202,37 +236,46 @@ the pattern. Do not exclude a function that computes a value.
 
 ## Layer 5: Kani and fuzzing
 
-Neither tool is installed in this workspace. Install it before you use it.
-
 **Kani** proves a property for all inputs. Use it for the pure arithmetic that
 a random test samples poorly:
 
 - compact-target decode, encode and range check in `btc/validation.rs`;
 - the retarget timespan clamp and the 256-bit multiply;
 - the estimated-work finality law in `btc/finality.rs`;
-- the `3 * work > 2 * tail_work` comparison in `rsk/score.rs`.
+- the CPV sample reach in `rsk/score.rs`.
 
-The harness shape:
+A proof lives next to the function it proves, in a `#[cfg(kani)] mod proofs`
+block in the same file: `btc/validation.rs`, `btc/finality.rs` and
+`rsk/score.rs`. A block in the same module reaches the private helpers that a
+sibling module cannot. Run one:
 
-```rust
-#[cfg(kani)]
-#[kani::proof]
-fn compact_target_decode_never_panics() {
-    let bits: u32 = kani::any();
-    let header = header_with_bits(bits);
-    let _ = header.target();
-}
+```bash
+cargo kani --harness a_mainnet_header_inside_a_period_keeps_the_parent_bits
 ```
 
-Run it with `cargo kani`.
+Run one proof at a time. A proof that reasons about a symbolic sort or about
+floating point is slow in CBMC. Keep a harness to integer arithmetic and
+concrete network parameters.
 
-**Fuzzing** finds a crash in a byte parser. Use `cargo-fuzz` or `bolero` on
-the untrusted input, not on the typed core:
+**Fuzzing** finds a crash in a byte parser. Two layers cover the untrusted
+bytes:
 
-- `btc-p2p` message codec and bloom filter;
-- `rsk-consensus` RLP decoding and header decode;
-- the coinbase `RSKBLOCK:` tag scan;
-- the merged-mining proof check.
+- `crates/core/tests/robustness.rs` runs under `cargo test` with the `bolero`
+  proptest engine. It is the fast check on every commit.
+- `fuzz/` holds the equivalent `cargo-fuzz` targets. Run one:
+
+```bash
+cargo fuzz run checkpoints_text
+```
+
+The `cargo-fuzz` targets need a C++ toolchain for `libfuzzer-sys`. A host
+without one keeps the bolero layer and skips this one.
+
+The surfaces:
+
+- the trusted-checkpoint text parser (`checkpoints_text`);
+- RSK header RLP decoding (`rsk_header_rlp`);
+- Bitcoin P2P frame decoding (`btc_message`).
 
 ## Current coverage
 
@@ -247,6 +290,20 @@ requirement: `hdr_00_supported_networks` to `hdr_08_future_time`.
 `crates/core/specs/bitcoin_header_chain.rs` holds the scenarios
 `btc_00_trusted_checkpoints` to `btc_08_outcome`, and the state machine
 `bitcoin_header_chain_matches_the_spec`.
+
+The machine delivers a 24-header universe: a trunk, a competing fork, a fork
+of a fork, a bad-PoW header, a stale-timestamp header, an out-of-range target,
+a wrong-bits header, and duplicate and empty batches. It submits at two caller
+clocks and checks the stored clock high-water mark. After every step it
+compares the full fork tree, every stored header row, the canonical chain and
+the outcome against the model. The model computes a header's work from the
+header itself, not through the crate helper.
+
+### Untrusted bytes
+
+`crates/core/tests/robustness.rs` feeds arbitrary bytes to the trusted-
+checkpoint text parser, RSK header RLP decoding and Bitcoin header decoding.
+It runs under `cargo test`. `fuzz/` holds the coverage-guided equivalents.
 
 ### Finality and the Rootstock policy
 
@@ -264,19 +321,65 @@ parameter builders, `mainnet_core`, `header_universe` and the submit helpers.
 `crates/core/specs/mod.rs` is wired into the crate at `crates/core/src/lib.rs`
 as a test-only module.
 
+## Audit record
+
+### 2026-11-25 — `bitcoin_header_chain`
+
+Scope: the submit path and the finality rule in `crates/core/src/btc.rs`
+(lines 623 to 1010), against `cargo test -p rsk-core --lib
+specs::bitcoin_header_chain` at `RSK_PROPTEST_CASES=8`.
+
+| Outcome | Count |
+|---|---|
+| Caught | 42 |
+| Missed | 21 |
+| Unviable | 8 |
+| Timeout (a kill: the test hangs) | 1 |
+
+The caught set includes every mutant on the stored-prefix skip, the parent
+lookup, the all-stored branch and the parent-work arithmetic. The suite is not
+vacuous: it constrains the rules a reviewer worries about most.
+
+The survivors were re-run against the full library suite at 64 cases.
+
+| Class | Mutants | Decision |
+|---|---|---|
+| Killed by another suite | 10 | none; the first run sampled too narrowly |
+| Equivalent | 8 | keep, or delete the dead branch |
+| Real gap | 4 | the coinbase prune needs a test |
+
+The equivalent group is `754:17` (the `&&` whose right side is unused when the
+minimum-difficulty rule is off), six rewrites of `tip_height` in the
+`prev_best: None` branch that initialization makes unreachable, and `975:34`
+(where `>=` writes the same high-water mark). The gap is `863:17` and the
+three `873` rewrites: the coinbase prune on a best-fork switch, and the delete
+below the newest finalized boundary. Both run with no stored coinbase, so no
+test can see them.
+
+A negative control checks the oracle. Change the model's tie rule from `>` to
+`>=`, and the machine fails at 64 cases. It passes at 8 cases, which is why a
+mutation run confirms every survivor at the full sample.
+
 ## Known gaps
 
 A requirement added to a capability specification needs a matching scenario,
 a state machine transition, or an entry in this list.
 
-- The clock floor and clockless connects. The median-time-past chain clock and
-  its sparse-window fallback have unit tests only.
-- A heavier fork that crosses the finality mark. The admittance rule has no
-  state machine.
+- The clockless connect path (`now: None`) inside the chain machine. The
+  machine submits at two explicit clocks; the clock floor and the chain clock
+  have unit tests only.
+- Variable per-block work inside the chain machine. Every valid header there
+  carries the same `bits`, so fork choice by work equals fork choice by length.
+  The `btc_07` scenario covers a shorter but heavier fork on testnet.
+- A heavier fork that crosses the finality mark and would win. The finality
+  machine stores light forks only, so the admittance rule that refuses the
+  switch is not exercised. The `crosses_mark` comparison itself is killed by
+  the suite.
 - Median-time-past with fewer than 11 stored headers, and at a height where an
   ancestor header is missing.
 - The coinbase actions and the Rootstock actions inside the chain machine. They
-  are tested by their own scenarios only.
+  are tested by their own scenarios only. The coinbase prune on a best-fork
+  switch has no test.
 - A fork tree deeper than the fixed delivery universe.
 - One machine that interleaves Bitcoin and Rootstock actions. The Bitcoin mark
   cannot move inside the Rootstock fixture, so the cross-capability seam is not
@@ -284,6 +387,9 @@ a state machine transition, or an entry in this list.
 - The node driver in `crates/rsk` has no state machine. `sync`, `ibd`,
   `coinbase` and `peers` are covered by unit tests and by mutation testing
   only.
+- The `prev_best_fork` is `Option` but always present after initialization, so
+  the submit path's `None` branch is dead. A mutant there survives as an
+  equivalent.
 
 ## Anti-patterns
 

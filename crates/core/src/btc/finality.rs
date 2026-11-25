@@ -290,6 +290,50 @@ fn f64_to_u256(value: f64) -> U256 {
     U256::from(value as u128)
 }
 
+/// Kani proofs for the finality requirement. They run under `cargo kani`,
+/// never under `cargo test`.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// E6: outside mainnet the requirement is exactly the tip block's work.
+    /// The price law is a mainnet calibration, so the other networks fall
+    /// back.
+    #[kani::proof]
+    fn a_non_mainnet_requirement_is_the_tip_work() {
+        let tip = Work::from_be_bytes(kani::any());
+        let required = partition_safety_required(
+            Network::Testnet,
+            Work::from_be_bytes(kani::any()),
+            kani::any(),
+            kani::any(),
+            tip,
+            kani::any(),
+        );
+        assert_eq!(required, work_to_u256(tip));
+    }
+
+    /// E6: an anchor at or before genesis cannot price modern work, so the
+    /// rule fails closed at the maximum.
+    #[kani::proof]
+    fn a_genesis_anchor_fails_closed() {
+        let genesis: u64 = kani::any();
+        let anchor: u64 = kani::any();
+        kani::assume(anchor <= genesis);
+        // Concrete work values keep the symbolic state small; only the times
+        // vary.
+        let required = partition_safety_required(
+            Network::Bitcoin,
+            Work::from_be_bytes([0; 32]),
+            anchor,
+            genesis,
+            Work::from_be_bytes([1; 32]),
+            0,
+        );
+        assert_eq!(required, U256::MAX);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -113,6 +113,86 @@ pub fn median_time_past(mut times: [u32; MEDIAN_TIME_PAST]) -> u32 {
     times[MEDIAN_TIME_PAST / 2]
 }
 
+/// Kani proofs for the target rules. They run under `cargo kani`, never under
+/// `cargo test`.
+///
+/// There is no proof of [`median_time_past`]: it sorts eleven elements, and
+/// `sort_unstable` needs a very deep unwind in CBMC. `hdr_07` pins the rule at
+/// its boundaries instead.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+    use bitcoin::Network;
+    use bitcoin::block::Version;
+    use bitcoin::hashes::Hash as _;
+
+    /// A header with the fields that the rule reads set by the caller.
+    fn header(bits: u32, time: u32, nonce: u32) -> BitcoinHeader {
+        BitcoinHeader {
+            version: Version::ONE,
+            prev_blockhash: bitcoin::block::BlockHash::all_zeros(),
+            merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+            time,
+            bits: CompactTarget::from_consensus(bits),
+            nonce,
+        }
+    }
+
+    /// HDR-02: the range check never panics on any 32-bit compact target.
+    #[kani::proof]
+    fn target_in_range_is_total() {
+        let raw: u32 = kani::any();
+        let _ = target_in_range(
+            CompactTarget::from_consensus(raw),
+            &Params::new(Network::Bitcoin),
+        );
+    }
+
+    /// HDR-02: a negative mantissa is always out of range, whatever the
+    /// exponent.
+    #[kani::proof]
+    fn target_range_rejects_a_negative_mantissa() {
+        let exponent: u8 = kani::any();
+        let mantissa: u32 = kani::any();
+        // Keep the sign bit of the mantissa, so the decoder must reject it.
+        let raw = u32::from(exponent) << 24 | (mantissa | 0x0080_0000) & 0x00ff_ffff;
+        assert!(!target_in_range(
+            CompactTarget::from_consensus(raw),
+            &Params::new(Network::Bitcoin),
+        ));
+    }
+
+    /// HDR-04: on mainnet, inside a period, the child must carry the parent's
+    /// bits, for every height that is not a period boundary.
+    #[kani::proof]
+    fn a_mainnet_header_inside_a_period_keeps_the_parent_bits() {
+        let height: u64 = kani::any();
+        kani::assume(!height.is_multiple_of(DIFFICULTY_PERIOD));
+        let parent = header(kani::any(), kani::any(), kani::any());
+        let params = Params::new(Network::Bitcoin);
+        assert!(!params.allow_min_difficulty_blocks);
+        assert_eq!(
+            expected_bits(height, kani::any(), &parent, None, parent.bits, &params),
+            Some(parent.bits)
+        );
+    }
+
+    /// HDR-06: a network that does not retarget keeps the parent's bits at a
+    /// period boundary.
+    #[kani::proof]
+    fn a_network_without_retargeting_keeps_the_parent_bits_at_a_boundary() {
+        let height: u64 = kani::any();
+        kani::assume(height.is_multiple_of(DIFFICULTY_PERIOD));
+        let parent = header(kani::any(), kani::any(), kani::any());
+        let params = Params::new(Network::Regtest);
+        assert!(params.no_pow_retargeting);
+        assert_eq!(
+            expected_bits(height, kani::any(), &parent, None, parent.bits, &params),
+            Some(parent.bits)
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

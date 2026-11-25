@@ -15,7 +15,8 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 // The error enum deliberately mirrors redb's error types (`thiserror`), which
 // makes `Result<_, Error>` larger than clippy's default threshold. That shape
-// is intentional (see CONTRIBUTING.md); every fallible method returns it.
+// is intentional (see docs/core-verification.md); every fallible method returns
+// it.
 #![allow(clippy::result_large_err)]
 
 pub mod btc;
