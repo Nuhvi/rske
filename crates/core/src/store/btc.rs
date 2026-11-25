@@ -493,6 +493,22 @@ impl ReadTxn {
         Ok(table.get(height)?.map(|v| v.value().0))
     }
 
+    /// The first stored header on `fork_id` in `from_height..=tip_height`.
+    pub(crate) fn next_stored_header(
+        &self,
+        fork_id: u64,
+        from_height: u64,
+        tip_height: u64,
+    ) -> Result<Option<(u64, BitcoinHeader)>, Error> {
+        let table = self.txn.open_table(BTC_HEADERS)?;
+        let mut range = table.range((fork_id, from_height)..=(fork_id, tip_height))?;
+        let Some(item) = range.next() else {
+            return Ok(None);
+        };
+        let (key, row) = item?;
+        Ok(Some((key.value().1, row.value().header)))
+    }
+
     /// Every fork's metadata, by id, for the whole-state view.
     pub(crate) fn all_forks(&self) -> Result<Vec<(u64, ForkMeta)>, Error> {
         let forks = self.txn.open_table(BTC_FORKS)?;

@@ -112,10 +112,9 @@ that does not hold SHALL fail with `LinkBreak` at that height.
 Let the parent be the stored block that the first new header names. When the
 parent is the tip of its fork, the submission SHALL extend that fork. Otherwise
 the submission SHALL start a new fork at the parent's height plus one. The
-parent fork SHALL be the fork that stores the parent block. A fork SHALL fill
-contiguous heights from its first height; two forks SHALL not share a first
-hash. The finality rule can refuse a new fork with `ForkBelowFinalized`, and
-`bitcoin-finality` owns that rule.
+parent fork SHALL be the fork that stores the parent block. A new fork SHALL
+fill contiguous heights from its first height; two forks SHALL not share a
+first hash. `bitcoin-finality` can refuse a new fork with `ForkBelowFinalized`.
 
 #### Scenario: Extend the tip
 - **WHEN** the first new header names the tip of its fork
@@ -136,6 +135,13 @@ hash. The finality rule can refuse a new fork with `ForkBelowFinalized`, and
   headers
 - **THEN** the store holds two forks with the same first height and different
   first hashes
+
+#### Scenario: Distinct first hash
+- **WHEN** a submission starts with a fork's first header and diverges at the
+  next height
+- **THEN** the store skips the first header and starts the new fork at the next
+  height
+- **AND** no two forks share a first hash
 
 #### Scenario: Below the best tip
 - **WHEN** a submission starts at a stored block below the best tip
@@ -178,6 +184,11 @@ able to become best again.
 - **WHEN** a submission stores headers on a fork with more cumulative work than
   the best fork
 - **THEN** the store makes that fork best
+
+#### Scenario: Shorter but heavier fork wins
+- **WHEN** a submission stores headers on a fork with fewer blocks than the
+  best fork but more cumulative work
+- **THEN** the store makes that shorter fork best
 
 #### Scenario: Lighter stays
 - **WHEN** a submission stores headers on a fork with less cumulative work than

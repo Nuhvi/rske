@@ -63,10 +63,6 @@ pub struct Config {
     /// difficulty rules on a chain that is cheap to mine. A production node
     /// must keep this enabled.
     pub partition_safety: bool,
-    /// Check the expected `bits` of every new header (HDR-04..HDR-06). The default is
-    /// `true`. A test turns it off to exercise other checks on a fixture that
-    /// does not follow the schedule.
-    pub(crate) difficulty_check: bool,
     /// The trusted checkpoints this store starts from.
     ///
     /// The crate chooses them, so nothing outside `rsk-core` can change them:
@@ -95,7 +91,6 @@ impl Config {
             params: Params::new(network),
             rsk_chain: rsk::chain_config(network),
             partition_safety: true,
-            difficulty_check: true,
             checkpoints: CheckpointSource::Embedded,
         }
     }
@@ -107,7 +102,6 @@ impl Config {
             params: Params::new(network),
             rsk_chain: rsk::chain_config(network),
             partition_safety: true,
-            difficulty_check: true,
             checkpoints: CheckpointSource::Embedded,
         }
     }
@@ -122,16 +116,6 @@ impl Config {
                 network => Ok(vec![(0, genesis_block(network).header)]),
             },
         }
-    }
-
-    /// Turn off the expected-bits check.
-    ///
-    /// Test-only: HDR-04 has its own machine, and the delivery universe needs to
-    /// reach the other checks with a target that the schedule would reject.
-    #[cfg(test)]
-    pub(crate) fn without_difficulty_check(mut self) -> Self {
-        self.difficulty_check = false;
-        self
     }
 
     /// Replace the embedded trusted checkpoints with an explicit list.
@@ -329,9 +313,11 @@ impl Core {
     /// The canonical chain, oldest first, streamed from one read snapshot.
     ///
     /// The first row is the first trusted checkpoint of the root fork, which
-    /// may be above height 0. Yields an [`Error::Internal`] once if a canonical
-    /// height has no stored row. A sparse checkpoint set has such gaps; a full
-    /// chain does not.
+    /// may be above height 0. Between the first and highest trusted
+    /// checkpoints the iterator yields each period-boundary checkpoint; above
+    /// the highest trusted checkpoint it yields every contiguous height
+    /// through the tip. Yields an [`Error::Internal`] once if a canonical
+    /// height has no stored row.
     pub fn canonical_headers(&self) -> Result<CanonicalHeaders, Error> {
         let txn = self.store.read()?;
         let Some(best) = txn.best_fork()? else {
@@ -438,24 +424,25 @@ impl Iterator for StoredHeaders {
         loop {
             if let Some((fork, height, tip)) = self.current {
                 if height <= tip {
-                    self.current = Some((fork, height + 1, tip));
-                    match self.txn.header_at(fork, height) {
-                        Ok(Some(header)) => {
+                    match self.txn.next_stored_header(fork, height, tip) {
+                        Ok(Some((stored_height, header))) => {
+                            self.current = Some((fork, stored_height + 1, tip));
                             return Some(Ok(StoredHeader {
                                 fork,
-                                height,
+                                height: stored_height,
                                 hash: header.block_hash(),
                             }));
                         }
-                        Ok(None) => continue,
+                        Ok(None) => self.current = None,
                         Err(error) => {
                             self.current = None;
                             self.forks = Vec::new().into_iter();
                             return Some(Err(error));
                         }
                     }
+                } else {
+                    self.current = None;
                 }
-                self.current = None;
             }
 
             let (fork, meta) = self.forks.next()?;
@@ -499,7 +486,19 @@ impl Iterator for CanonicalHeaders {
             return None;
         }
         let height = self.next;
-        self.next += 1;
+        self.next = match txn.header_at(self.best, height + 1) {
+            Ok(None)
+                if height.is_multiple_of(crate::DIFFICULTY_PERIOD)
+                    && txn
+                        .checkpoint_at(height + crate::DIFFICULTY_PERIOD)
+                        .ok()
+                        .flatten()
+                        .is_some() =>
+            {
+                height + crate::DIFFICULTY_PERIOD
+            }
+            _ => height + 1,
+        };
         match txn.header_at(self.best, height) {
             Ok(Some(header)) => Some(Ok(header)),
             Ok(None) => {

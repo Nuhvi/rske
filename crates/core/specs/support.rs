@@ -63,31 +63,17 @@ pub(super) fn testnet_params() -> Params {
 /// It keeps the consensus rules of `params` and disables only the estimated-work
 /// finality requirement, which a synthetic chain cannot clear. `checkpoints`
 /// is the trusted checkpoint set the machine starts from; production code
-/// cannot replace the embedded set. `check_difficulty` is false for the delivery machine: with the
-/// expected-bits rules on, an out-of-range target fails before HDR-02 can see
-/// it, so the `BadTarget` transition would be unreachable. HDR-04 has its own
-/// machine.
-pub(super) fn synthetic_mainnet_core(
-    params: Params,
-    checkpoints: &[(u64, BitcoinHeader)],
-    check_difficulty: bool,
-) -> Core {
-    let mut config = Config::in_memory(Network::Bitcoin)
+/// cannot replace the embedded set.
+pub(super) fn synthetic_mainnet_core(params: Params, checkpoints: &[(u64, BitcoinHeader)]) -> Core {
+    let config = Config::in_memory(Network::Bitcoin)
         .with_params(params)
         .without_partition_safety()
         .with_checkpoints(checkpoints);
-    if !check_difficulty {
-        config = config.without_difficulty_check();
-    }
     Core::new(config).expect("in-memory store")
 }
 
 pub(super) fn mainnet_core(checkpoints: &[(u64, BitcoinHeader)]) -> Core {
-    synthetic_mainnet_core(mainnet_params(), checkpoints, true)
-}
-
-pub(super) fn delivery_core(checkpoints: &[(u64, BitcoinHeader)]) -> Core {
-    synthetic_mainnet_core(mainnet_params(), checkpoints, false)
+    synthetic_mainnet_core(mainnet_params(), checkpoints)
 }
 
 /// A header with a chosen compact target and no mining.
@@ -240,6 +226,12 @@ pub(super) fn header_universe() -> HeaderUniverse {
     headers.push(x2);
     kinds.push(HeaderKind::BadTarget);
 
+    // C9: extends C8 (index 18) to height 9 (index 22), so the fork-of-a-fork
+    // can outgrow B3..B8 (height 8) and become best when A is shorter than 9.
+    let c9 = mine(c8.block_hash(), c8.time + 1, 71);
+    headers.push(c9);
+    kinds.push(HeaderKind::Valid);
+
     let mut batches = Vec::new();
     for i in 0..headers.len() {
         batches.push(vec![i]);
@@ -247,7 +239,7 @@ pub(super) fn header_universe() -> HeaderUniverse {
     let runs: [&[usize]; 3] = [
         &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
         &[12, 13, 14, 15, 16, 17],
-        &[18],
+        &[18, 22],
     ];
     for run in runs {
         for len in 2..=3 {

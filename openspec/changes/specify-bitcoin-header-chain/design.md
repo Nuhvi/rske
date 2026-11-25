@@ -271,9 +271,9 @@ Scenario map:
 | BTC-02 | fork then failure, refused batch |
 | BTC-03 | repeated prefix, all stored, empty, prefix on a losing fork |
 | BTC-04 | gap, prefix link, stored header after a new header |
-| BTC-05 | extend, fork from a non-tip, fork of a fork, siblings, below the best tip, contiguous fork |
+| BTC-05 | extend, fork from a non-tip, fork of a fork, siblings, distinct first hash, below the best tip, contiguous fork |
 | BTC-06 | losing fork, no removal, cumulative work |
-| BTC-07 | heavier wins, lighter stays, equal keeps, later win, root wins back, canonical |
+| BTC-07 | heavier wins, shorter but heavier fork wins, lighter stays, equal keeps, later win, root wins back, canonical |
 | BTC-08 | extend, switch, no-op, losing fork |
 
 ### D10. Order and traceability

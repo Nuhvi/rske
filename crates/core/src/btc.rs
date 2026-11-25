@@ -241,8 +241,13 @@ impl Core {
                 });
             }
             if txn.fork_meta(0)?.is_some() {
+                let best = txn.best_fork()?.unwrap_or(0);
                 for (height, header) in &self.config.resolve_checkpoints()? {
-                    if let Some(stored) = txn.checkpoint_at(*height)?
+                    let stored = match txn.header_at(best, *height)? {
+                        Some(header) => Some(header),
+                        None => txn.checkpoint_at(*height)?,
+                    };
+                    if let Some(stored) = stored
                         && stored.block_hash() != header.block_hash()
                     {
                         return Err(Error::CheckpointMismatch {
@@ -704,11 +709,11 @@ impl Core {
             (id, forkpoint)
         };
 
-        // Validate continuity, expected difficulty, median-time-past and PoW
-        // for the new run. Earlier headers of this batch are visible to later
-        // ones, so a long run validates itself.
+        // Validate continuity, target range, expected difficulty,
+        // median-time-past, future time and PoW for the new run. Earlier
+        // headers of this batch are visible to later ones, so a long run
+        // validates itself.
         let params = &self.config.params;
-        let check_difficulty = self.config.difficulty_check;
         let new_headers = &headers[start..];
         // Header at `height` on the chain being extended: a header already
         // accepted in this batch, or a stored ancestor (walking to ancestor
@@ -732,36 +737,41 @@ impl Core {
                 });
             }
 
-            if check_difficulty {
-                let parent_header = at(height - 1)?
-                    .ok_or_else(|| Error::Internal(format!("missing parent at {height}")))?;
-                let period_start = match height.checked_sub(DIFFICULTY_PERIOD) {
-                    Some(h) => at(h)?,
-                    None => None,
-                };
-                let last_normal_bits = if params.allow_min_difficulty_blocks
-                    && !height.is_multiple_of(DIFFICULTY_PERIOD)
-                {
-                    last_normal_bits(&at, height, &parent_header, params)?
-                } else {
-                    parent_header.bits
-                };
-                let expected = validation::expected_bits(
+            if !validation::target_in_range(header.bits, params) {
+                return Err(Error::BadPow {
                     height,
-                    header.time,
-                    &parent_header,
-                    period_start.as_ref(),
-                    last_normal_bits,
-                    params,
-                )
-                .ok_or_else(|| Error::Internal(format!("missing period start at {height}")))?;
-                if header.bits != expected {
-                    return Err(Error::BadDifficulty {
-                        height,
-                        expected: expected.to_consensus(),
-                        got: header.bits.to_consensus(),
-                    });
-                }
+                    detail: "target out of range".into(),
+                });
+            }
+
+            let parent_header = at(height - 1)?
+                .ok_or_else(|| Error::Internal(format!("missing parent at {height}")))?;
+            let period_start = match height.checked_sub(DIFFICULTY_PERIOD) {
+                Some(h) => at(h)?,
+                None => None,
+            };
+            let last_normal_bits = if params.allow_min_difficulty_blocks
+                && !height.is_multiple_of(DIFFICULTY_PERIOD)
+            {
+                last_normal_bits(&at, height, &parent_header, params)?
+            } else {
+                parent_header.bits
+            };
+            let expected = validation::expected_bits(
+                height,
+                header.time,
+                &parent_header,
+                period_start.as_ref(),
+                last_normal_bits,
+                params,
+            )
+            .ok_or_else(|| Error::Internal(format!("missing period start at {height}")))?;
+            if header.bits != expected {
+                return Err(Error::BadDifficulty {
+                    height,
+                    expected: expected.to_consensus(),
+                    got: header.bits.to_consensus(),
+                });
             }
 
             if let Some(median) = median_time_past_at(&at, height)?
@@ -788,12 +798,6 @@ impl Core {
                 });
             }
 
-            if !validation::target_in_range(header.bits, params) {
-                return Err(Error::BadPow {
-                    height,
-                    detail: "target out of range".into(),
-                });
-            }
             header
                 .validate_pow(header.target())
                 .map_err(|e| Error::BadPow {
@@ -1554,17 +1558,6 @@ mod tests {
             .expect("in-memory store")
     }
 
-    /// The same, with the expected-bits check off. Fixtures that vary the
-    /// target (to exercise work arithmetic or a bad-PoW header) use this.
-    fn initialized_with_unchecked(network: Network, entries: &[(u64, BitcoinHeader)]) -> Core {
-        Core::new(
-            crate::Config::in_memory(network)
-                .without_difficulty_check()
-                .with_checkpoints(entries),
-        )
-        .expect("in-memory store")
-    }
-
     /// A fresh in-memory regtest chain initialized with a synthetic checkpoint
     /// at 0.
     ///
@@ -1979,15 +1972,17 @@ mod tests {
         genesis
             .validate_pow(genesis.target())
             .expect("real genesis PoW");
-        let chain = initialized_with_unchecked(Network::Regtest, &[(0, genesis)]);
+        let chain = initialized_with(Network::Regtest, &[(0, genesis)]);
         assert_eq!(
             chain.header_at(0)?.unwrap().block_hash(),
             genesis.block_hash()
         );
-        // And we can extend on top of the real genesis hash with synthetic
-        // headers (continuity is what matters here, not difficulty).
-        let run = mine_chain_from(&genesis, 2, EASY_BITS, 1);
-        let out = chain.submit_bitcoin_headers(&run, NOW)?;
+        // Regtest permits minimum-difficulty blocks after a 20-minute gap, so
+        // synthetic easy-target headers connect on top of the real genesis
+        // hash with production difficulty rules enabled.
+        let h1 = mine_at(genesis.block_hash(), genesis.time + 1_201, EASY_BITS);
+        let h2 = mine_at(h1.block_hash(), h1.time + 1_201, EASY_BITS);
+        let out = chain.submit_bitcoin_headers(&[h1, h2], NOW)?;
         assert_eq!(out.accepted, 2);
         assert_eq!(out.tip_height, 2);
         Ok(())
@@ -2363,46 +2358,39 @@ mod tests {
     /// the header at the boundary must carry it.
     #[test]
     fn the_boundary_retarget_is_enforced() -> eyre::Result<()> {
-        // Regtest parameters with the expected-bits rule switched on. The pow
-        // limit is the easy target, so a fourfold retarget stays mineable.
+        const PERIOD_BITS: u32 = 0x200f_ffff;
+        const QUARTER_RETARGET_BITS: u32 = 0x2003_ffff;
+
         let mut params = bitcoin::consensus::Params::new(Network::Regtest);
         params.allow_min_difficulty_blocks = false;
         params.no_pow_retargeting = false;
-        let genesis = mine_genesis(0);
+        params.pow_target_timespan = 4;
+        let genesis = mine_at(BlockHash::all_zeros(), BASE_TIME + 2_015, PERIOD_BITS);
         let chain = Core::new(
             crate::Config::in_memory(Network::Regtest)
                 .with_params(params.clone())
                 .with_checkpoints(&[(0, genesis)]),
         )?;
 
-        // 2,015 blocks at 150 s each: a quarter of the two-week timespan.
         let mut parent = genesis;
         let mut run = Vec::with_capacity(2_015);
         for i in 1..=2_015u32 {
-            let header = mine_at(parent.block_hash(), BASE_TIME + i * 150, EASY_BITS);
+            let header = mine_at(parent.block_hash(), BASE_TIME + i, PERIOD_BITS);
             run.push(header);
             parent = header;
         }
         chain.submit_bitcoin_headers_clockless(&run)?;
         assert_eq!(chain.tip_height()?, Some(2_015));
 
-        // The boundary header must carry the recomputed bits.
+        // The boundary header must carry the fourfold harder target.
         let expected = CompactTarget::from_header_difficulty_adjustment(genesis, parent, &params);
-        assert_ne!(
-            expected.to_consensus(),
-            EASY_BITS,
-            "a quarter-length period must retarget"
-        );
-        let boundary = mine_at(
-            parent.block_hash(),
-            BASE_TIME + 2_016 * 150,
-            expected.to_consensus(),
-        );
+        assert_eq!(expected.to_consensus(), QUARTER_RETARGET_BITS);
+        let boundary = mine_at(parent.block_hash(), parent.time + 1, QUARTER_RETARGET_BITS);
         chain.submit_bitcoin_headers_clockless(&[boundary])?;
         assert_eq!(chain.tip_height()?, Some(2_016));
 
         // A sibling that keeps the old bits is refused at the boundary.
-        let wrong = mine_at(parent.block_hash(), BASE_TIME + 2_016 * 150 + 1, EASY_BITS);
+        let wrong = mine_at(parent.block_hash(), parent.time + 2, PERIOD_BITS);
         let err = chain
             .submit_bitcoin_headers_clockless(&[wrong])
             .unwrap_err();
@@ -2414,15 +2402,11 @@ mod tests {
         // Inside the new period the expected bits are the boundary's bits.
         let after = mine_at(
             boundary.block_hash(),
-            BASE_TIME + 2_017 * 150,
-            expected.to_consensus(),
+            boundary.time + 1,
+            QUARTER_RETARGET_BITS,
         );
         chain.submit_bitcoin_headers_clockless(&[after])?;
-        let stale = mine_at(
-            boundary.block_hash(),
-            BASE_TIME + 2_017 * 150 + 1,
-            EASY_BITS,
-        );
+        let stale = mine_at(boundary.block_hash(), boundary.time + 2, PERIOD_BITS);
         let err = chain
             .submit_bitcoin_headers_clockless(&[stale])
             .unwrap_err();
@@ -2557,25 +2541,14 @@ mod tests {
     /// after the boundary, it is 2016 * 20, below the preceding ~2015 * 22.
     #[test]
     fn btc_tail_work_uses_the_period_after_the_start() -> eyre::Result<()> {
-        let chain = initialized_with_unchecked(Network::Regtest, &[(0, mine_genesis(0))]);
+        let g0 = mine_at(BlockHash::all_zeros(), BASE_TIME, WORK22_BITS);
+        let g2016 = mine_at(g0.block_hash(), BASE_TIME + 1, WORK20_BITS);
+        let chain = initialized_with(Network::Regtest, &[(0, g0), (DIFFICULTY_PERIOD, g2016)]);
         let period = DIFFICULTY_PERIOD as usize;
 
-        // Genesis has easy-target work. Period 0 blocks use work 22.
-        // Keep the clock above the synthetic header times so the future-time
-        // check does not reject them.
-        let now = canonical(&chain, 0).time as u64 + 1_000 * finality::TARGET_BLOCK_SECONDS;
-        let run1 = mine_chain_from(&canonical(&chain, 0), period, WORK22_BITS, 1);
-        chain.submit_bitcoin_headers(&run1, now)?;
-
-        // Tail after boundary 2016 at the lower work 20, enough to outweigh the
-        // period before it and finalize.
+        let now = g2016.time as u64 + 1_000 * finality::TARGET_BLOCK_SECONDS;
         let tail_needed = (period * 22).div_ceil(20);
-        let tail = mine_chain_from(
-            &canonical(&chain, period as u64),
-            tail_needed,
-            WORK20_BITS,
-            1,
-        );
+        let tail = mine_chain_from(&g2016, tail_needed, WORK20_BITS, 1);
         chain.submit_bitcoin_headers(&tail, now)?;
 
         assert_eq!(

@@ -2,36 +2,31 @@ schema: spec-driven
 
 context: |
   Wrap Markdown prose at 80 columns so the files stay readable in a terminal.
-  Leave tables, fenced code blocks and long links unwrapped; they cannot be
-  split without breaking their syntax.
+  Leave tables, fenced code blocks, long links, and `**Source**:` metadata
+  lines unwrapped on one line. When a `**Source**:` line wraps, the OpenSpec
+  parser reads the next lines as requirement text.
 
-# Project context (optional)
-# Add only constraints that should guide OpenSpec artifacts and workflows.
-# Include constraints an agent cannot infer by reading the code.
-# Keep general project documentation and discoverable codebase facts out.
-# Example:
-#   context: |
-#     Designs and tasks must cover Windows, macOS, and Linux
-#     Write all artifacts in Spanish
-
-# Per-artifact rules (optional)
-# Add custom rules for specific artifacts.
-# Example:
-#   rules:
-#     proposal:
-#       - Keep proposals under 500 words
-#       - Always state what is out of scope
-#     tasks:
-#       - Break tasks into chunks of max 2 hours
-
-# Per-operation guidance (optional)
-# Add advisory guidance for how apply and archive work should be conducted.
-# This is separate from artifact rules above.
-# Example:
-#   operations:
-#     apply:
-#       guidance:
-#         - Keep test summaries concise
-#     archive:
-#       guidance:
-#         - Summarize the archive outcome before finishing
+rules:
+  specs:
+    - Each requirement ID (`[HDR-xx]`, `[BTC-xx]`, `[FIN-xx]`, `[RSK-xx]`) is
+      append-only and must appear in the requirement heading.
+    - Keep each requirement under 500 characters. Keep each `**Source**:`
+      metadata entry on one line so the parser excludes it from the count.
+    - Every numeric or order boundary (`<`, `<=`, `>`, `>=`, window size N)
+      must have scenarios for the exact boundary and one step past it.
+  design:
+    - Record every intentional difference from Bitcoin Core or rskj in a
+      deviation table.
+    - State-machine reference models must predict the full relevant `CoreState`
+      and `Outcome` fields, not only a hash set.
+  tasks:
+    - Capability scenario tests must call `Core::apply` with production
+      validation flags enabled. Do not disable difficulty checks in capability
+      tests.
+    - Write scenario tests and `ReferenceStateMachine` models from `spec.md`
+      and public `Core` types. Do not copy implementation branches into the
+      reference model.
+    - Run `openspec validate --all --strict` and
+      `cargo test -p rsk-core --lib specs::` in the integration gate.
+    - Run `cargo mutants -p rsk-core -- --lib specs::` when you audit test
+      completeness against a capability spec.

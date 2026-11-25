@@ -66,18 +66,18 @@
 ## 5. Tree (BTC-05, BTC-06)
 
 - [x] 5.1 Add `btc_05_forks`: extend the tip, fork from a non-tip, fork of a
-  fork, siblings, a start below the best tip, and a second submission at a fork
-  tip. Verify `Core::state().forks` reports the parent and the forkpoint, and
-  `Core::locate` finds each first header.
+  fork, siblings, distinct first hash, a start below the best tip, and a second
+  submission at a fork tip. Verify `Core::state().forks` reports the parent and
+  the forkpoint, and `Core::locate` finds each first header.
 - [x] 5.2 Add `btc_06_stored_set`: a losing fork stays stored, a switch removes
   no header, and the tip work equals the parent work plus the run's work.
   Verify `Core::stored_headers` and `ForkState::tip_work`.
 
 ## 6. Best fork and outcome (BTC-07, BTC-08)
 
-- [x] 6.1 Add `btc_07_best_fork`: heavier wins, lighter stays, equal keeps, a
-  later win, the root wins back, and the canonical read. Verify
-  `Core::state().best_fork` and the canonical tip.
+- [x] 6.1 Add `btc_07_best_fork`: heavier wins, shorter but heavier fork wins,
+  lighter stays, equal keeps, a later win, the root wins back, and the
+  canonical read. Verify `Core::state().best_fork` and the canonical tip.
 - [x] 6.2 Add `btc_08_outcome`: extend, switch, no-op, and a losing-fork batch.
   Verify the accepted count, the previous best fork, the best fork and the
   canonical tip.
