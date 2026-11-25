@@ -266,7 +266,7 @@ Scenario map:
 
 | Requirement | Scenarios |
 |---|---|
-| BTC-00 | fresh store, initial mark |
+| BTC-00 | fresh store, initial cumulative work, malformed checkpoint set, initial mark |
 | BTC-01 | reopen, longer checkpoint set, different network, different checkpoint |
 | BTC-02 | fork then failure, refused batch |
 | BTC-03 | repeated prefix, all stored, empty, prefix on a losing fork |
@@ -291,6 +291,24 @@ There is no separate verification map.
 The legacy `specs/bitcoin-headers.md` and `docs/` stay read-only. No task edits
 them or reads them as an input. `crates/core/specs/` is the executable test
 directory and stays.
+
+### D11. Differences from Bitcoin Core
+
+The capability states the properties this crate needs. Bitcoin Core's header
+path adds message-level rules that this capability does not keep. Record them
+here so a later change does not "fix" the difference by accident.
+
+| Difference | Bitcoin Core v29.0 | This crate | Effect |
+|---|---|---|---|
+| Batch atomicity | `ProcessNewBlockHeaders` keeps the headers that passed before a later header failed | `BTC-02` rolls the whole submission back in one transaction | accepts less |
+| Prefix skip | `ProcessHeadersMessage` requires the whole message to be one continuous header sequence, stored headers included (`non-continuous-headers-sequence`) | `BTC-03` skips leading stored headers by hash, then `BTC-04` checks links from the first new header | accepts more |
+| Initial work | `nChainWork` sums every stored block from height 0 | `BTC-00` counts a whole period at the lower checkpoint's `bits` between adjacent trusted checkpoints | equal for a well-formed set, cheaper to store |
+
+The atomic rollback is the deliberate choice: a refused batch has no visible
+effect, so a caller can retry the whole batch after a peer error. The prefix
+skip lets a caller repeat a stored suffix without re-sending the links. Both
+differences are observable only on a malformed or repeated batch, never on the
+canonical chain.
 
 ## Risks / Trade-offs
 

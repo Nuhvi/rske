@@ -27,7 +27,7 @@ use super::support::{
     synthetic_mainnet_core, testnet_params,
 };
 use crate::btc::validation::MAX_FUTURE_BLOCK_TIME;
-use crate::{Config, Core, Error};
+use crate::{Config, Core, DIFFICULTY_PERIOD, Error};
 
 /// HDR-00: only mainnet, testnet3 and regtest open.
 #[test]
@@ -223,6 +223,85 @@ fn hdr_05_minimum_difficulty_networks() {
             if expected == normal && got == EASY_BITS),
         "got {err:?}"
     );
+
+    // Scenario: Walk back through the submission
+    // The first header of the batch is a minimum-difficulty block; the second
+    // header's walk-back must see it (it is not stored yet) and stop at
+    // block1's normal bits. The whole batch is refused, so the
+    // minimum-difficulty header is not stored.
+    let fresh = synthetic_mainnet_core(testnet_params(), &[(0, genesis)]);
+    assert_eq!(expect_accepted(&fresh, &[block1], None), 1);
+    let batch_min = mine_with_bits(block1.block_hash(), t2, 5, EASY_BITS);
+    let batch_bad = mine_with_bits(batch_min.block_hash(), t3, 6, EASY_BITS);
+    let err = expect_err(&fresh, &[batch_min, batch_bad], None);
+    assert!(
+        matches!(err, Error::BadDifficulty { expected, got, .. }
+            if expected == normal && got == EASY_BITS),
+        "got {err:?}"
+    );
+    assert_eq!(
+        fresh.tip_height().expect("read"),
+        Some(1),
+        "the refused batch must not store its minimum-difficulty header"
+    );
+
+    // Scenario: Walk back stops at the period start
+    // The period start (height 2016) and the only later ancestor carry the
+    // limit, so the walk-back stops there and expects the limit, not the
+    // normal header at height 0.
+    let period_start = mine_with_bits(BlockHash::all_zeros(), CHECKPOINT_TIME - 2_000, 7, normal);
+    let at_boundary = mine_with_bits(
+        period_start.block_hash(),
+        CHECKPOINT_TIME - 1_000,
+        8,
+        EASY_BITS,
+    );
+    let boundary_core = synthetic_mainnet_core(
+        testnet_params(),
+        &[(0, period_start), (DIFFICULTY_PERIOD, at_boundary)],
+    );
+    let keep_limit = mine_with_bits(
+        at_boundary.block_hash(),
+        at_boundary.time + 600,
+        9,
+        EASY_BITS,
+    );
+    assert_eq!(expect_accepted(&boundary_core, &[keep_limit], None), 1);
+    let wrong_bits = mine_with_bits(at_boundary.block_hash(), at_boundary.time + 600, 10, normal);
+    let err = expect_err(&boundary_core, &[wrong_bits], None);
+    assert!(
+        matches!(err, Error::BadDifficulty { expected, got, .. }
+            if expected == EASY_BITS && got == normal),
+        "got {err:?}"
+    );
+
+    // Scenario: Long gap with the limit (regtest)
+    // Regtest permits minimum-difficulty blocks inside a period, like testnet3.
+    let regtest_checkpoint = mine_with_bits(BlockHash::all_zeros(), CHECKPOINT_TIME, 11, EASY_BITS);
+    let regtest_core = Core::new(
+        Config::in_memory(Network::Regtest)
+            .with_checkpoints(&[(DIFFICULTY_PERIOD, regtest_checkpoint)]),
+    )
+    .expect("in-memory store");
+    let regtest_min = mine_with_bits(
+        regtest_checkpoint.block_hash(),
+        regtest_checkpoint.time + 1_201,
+        12,
+        EASY_BITS,
+    );
+    assert_eq!(expect_accepted(&regtest_core, &[regtest_min], None), 1);
+    let regtest_normal = mine_with_bits(
+        regtest_checkpoint.block_hash(),
+        regtest_checkpoint.time + 1_201,
+        13,
+        EASY_BITS - 1,
+    );
+    let err = expect_err(&regtest_core, &[regtest_normal], None);
+    assert!(
+        matches!(err, Error::BadDifficulty { expected, got, .. }
+            if expected == EASY_BITS && got == EASY_BITS - 1),
+        "got {err:?}"
+    );
 }
 
 /// HDR-06: mainnet and testnet3 retarget at a boundary; regtest keeps the bits.
@@ -247,8 +326,10 @@ fn hdr_06_mainnet_and_regtest_boundaries() {
     params.max_attainable_target = Target::from_compact(CompactTarget::from_consensus(EASY_BITS));
     params.pow_target_timespan = 4;
 
+    // The checkpoint starts at a recent period boundary, not at height 0, so
+    // the boundary lookup must read `height - 2016` rather than the genesis.
     let genesis = mine_with_bits(BlockHash::all_zeros(), CHECKPOINT_TIME + 2015, 0, BASE_BITS);
-    let core = synthetic_mainnet_core(params.clone(), &[(0, genesis)]);
+    let core = synthetic_mainnet_core(params.clone(), &[(CHECKPOINT_HEIGHT, genesis)]);
 
     let mut h2014 = genesis;
     let mut run = Vec::with_capacity(2015);
@@ -258,7 +339,12 @@ fn hdr_06_mainnet_and_regtest_boundaries() {
         h2014 = header;
     }
     // `parent_fast` at height 2015 ends the period at `genesis.time` (0 s
-    // elapsed, less than one quarter of the 4 s target timespan).
+    // elapsed, less than one quarter of the 4 s target timespan). A parent
+    // time at or before the period start takes the same path: the timespan
+    // saturates to zero and clamps to one quarter, so a strictly negative
+    // timespan cannot produce a different result. The test does not build one,
+    // because a parent below the period start must still beat the median of
+    // its previous 11 times, which needs a contrived timestamp sequence.
     let parent_fast = mine_with_bits(h2014.block_hash(), CHECKPOINT_TIME + 2015, 0, BASE_BITS);
     run.push(parent_fast);
     assert_eq!(expect_accepted(&core, &run, None), 2015);
@@ -377,6 +463,64 @@ fn hdr_06_mainnet_and_regtest_boundaries() {
         "got {err:?}"
     );
 
+    // Scenario: Testnet3 retarget from a minimum-difficulty parent
+    // A separate chain keeps the 256-bit arithmetic clear of overflow: the
+    // limit target 0x200f_ffff times the 16-times clamp stays below 2^256, and
+    // the retarget from the parent (the limit) differs from one from the last
+    // normal bits (0x200f_fffc).
+    const MIN_DIFF_LIMIT_BITS: u32 = 0x200f_ffff;
+    const MIN_DIFF_NORMAL_BITS: u32 = 0x2003_ffff;
+    const MIN_DIFF_WRONG_BITS: u32 = 0x200f_fffc;
+    let mut min_params = testnet_params();
+    min_params.pow_target_timespan = 4;
+    min_params.max_attainable_target =
+        Target::from_compact(CompactTarget::from_consensus(MIN_DIFF_LIMIT_BITS));
+    let start = mine_with_bits(
+        BlockHash::all_zeros(),
+        CHECKPOINT_TIME,
+        0,
+        MIN_DIFF_NORMAL_BITS,
+    );
+    let min_core = synthetic_mainnet_core(min_params, &[(CHECKPOINT_HEIGHT, start)]);
+    let mut prev = start;
+    let mut period = Vec::with_capacity(2015);
+    for i in 1..=2014u32 {
+        let header = mine_with_bits(
+            prev.block_hash(),
+            CHECKPOINT_TIME + i,
+            0,
+            MIN_DIFF_NORMAL_BITS,
+        );
+        period.push(header);
+        prev = header;
+    }
+    let parent_min = mine_with_bits(
+        prev.block_hash(),
+        CHECKPOINT_TIME + 2014 + 1_201,
+        1,
+        MIN_DIFF_LIMIT_BITS,
+    );
+    period.push(parent_min);
+    assert_eq!(expect_accepted(&min_core, &period, None), 2015);
+    let limit_boundary = mine_with_bits(
+        parent_min.block_hash(),
+        parent_min.time + 1,
+        2,
+        MIN_DIFF_LIMIT_BITS,
+    );
+    assert_eq!(expect_accepted(&min_core, &[limit_boundary], None), 1);
+    let from_last_normal = header_with(
+        parent_min.block_hash(),
+        parent_min.time + 1,
+        MIN_DIFF_WRONG_BITS,
+    );
+    let err = expect_err(&min_core, &[from_last_normal], None);
+    assert!(
+        matches!(err, Error::BadDifficulty { expected, got, .. }
+            if expected == MIN_DIFF_LIMIT_BITS && got == MIN_DIFF_WRONG_BITS),
+        "got {err:?}"
+    );
+
     // Scenario: Regtest boundary
     // Regtest keeps the parent's bits at a boundary.
     let Core { store, config } = core;
@@ -454,6 +598,24 @@ fn hdr_07_median_time_past() {
     assert_eq!(expect_accepted(&core, trunk, None), 11);
     let above = mine(trunk[10].block_hash(), CHECKPOINT_TIME + 7, 2);
     assert_eq!(expect_accepted(&core, &[above], None), 1);
+
+    // Scenario: Ancestors from the submission
+    // One stored header and ten more in the same call fill the window; the
+    // eleventh carries the median, so it is refused. The refused batch is
+    // rolled back, so the same core can accept the corrected batch.
+    let batched = mainnet_core(&[(CHECKPOINT_HEIGHT, universe.genesis)]);
+    let ten_in_batch = &universe.headers[..10];
+    let mut bad_batch = ten_in_batch.to_vec();
+    bad_batch.push(mine(ten_in_batch[9].block_hash(), CHECKPOINT_TIME + 5, 5));
+    let err = expect_err(&batched, &bad_batch, None);
+    assert!(
+        matches!(err, Error::BadTimestamp { median, got, .. }
+            if median == CHECKPOINT_TIME + 5 && got == CHECKPOINT_TIME + 5),
+        "got {err:?}"
+    );
+    let mut good_batch = ten_in_batch.to_vec();
+    good_batch.push(mine(ten_in_batch[9].block_hash(), CHECKPOINT_TIME + 6, 6));
+    assert_eq!(expect_accepted(&batched, &good_batch, None), 11);
 }
 
 /// HDR-08: the two-hour future-time window is inclusive, and optional.

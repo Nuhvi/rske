@@ -10,18 +10,28 @@ contract; `bitcoin-header-validation` owns the per-header rules and
 ## ADDED Requirements
 
 ### Requirement: [BTC-00] Trusted checkpoints
-Opening an empty store SHALL initialize the store with the configured
-trusted checkpoints. Each
-checkpoint SHALL lie at a Bitcoin period boundary, and the heights SHALL be one
-period apart. The root fork SHALL hold the checkpoints from the first height to
-the highest. The root fork SHALL be the best fork. The highest checkpoint SHALL
-be the initial finality mark.
+Opening an empty store SHALL initialize it with the configured trusted
+checkpoints. Each checkpoint SHALL lie at a Bitcoin period boundary, and the
+heights SHALL be one period apart; a malformed set SHALL be refused. The root
+fork SHALL hold the checkpoints from the first height to the highest. Each
+period between adjacent checkpoints SHALL count one period at the lower
+checkpoint's `bits`. The highest checkpoint SHALL be the initial finality mark.
 
 #### Scenario: Fresh store
 - **WHEN** the core opens an empty store with the configured trusted checkpoints
 - **THEN** the root fork holds the checkpoints from the first height to the
   highest
 - **AND** the root fork is the best fork
+
+#### Scenario: Initial cumulative work
+- **WHEN** the core opens an empty store with two adjacent trusted checkpoints
+- **THEN** the root fork's tip work counts one full period at the first
+  checkpoint's `bits` plus the second checkpoint's own work
+
+#### Scenario: Malformed checkpoint set
+- **WHEN** a configured checkpoint is not at a period boundary, or two
+  checkpoints are not one period apart
+- **THEN** the open fails and no store is initialized
 
 #### Scenario: Initial finality mark
 - **WHEN** the core opens an empty store with the configured trusted checkpoints

@@ -537,9 +537,41 @@ fn btc_00_trusted_checkpoints() {
         (0, high, second.block_hash())
     );
 
+    // Scenario: Initial cumulative work
+    // One full period at the first checkpoint's bits, plus the second
+    // checkpoint's own work.
+    let expected_work = U256::from(2016u64)
+        * U256::from_be_slice(&header_work(&first).to_be_bytes())
+        + U256::from_be_slice(&header_work(&second).to_be_bytes());
+    assert_eq!(root.tip_work, expected_work.to_be_bytes());
+
     // Scenario: Initial finality mark
     assert_eq!(state.finalized, Some(high));
     assert_eq!(canonical_chain(&core), vec![first, second]);
+
+    // Scenario: Malformed checkpoint set
+    // A start that is not a period boundary and a gap that is not one period
+    // are both refused before a store is initialized.
+    let not_a_boundary = Core::new(
+        Config::in_memory(Network::Bitcoin)
+            .with_params(mainnet_params())
+            .without_partition_safety()
+            .with_checkpoints(&[(CHECKPOINT_HEIGHT + 1, first)]),
+    );
+    assert!(
+        matches!(not_a_boundary, Err(Error::Internal(_))),
+        "a non-boundary start must be refused"
+    );
+    let uneven = Core::new(
+        Config::in_memory(Network::Bitcoin)
+            .with_params(mainnet_params())
+            .without_partition_safety()
+            .with_checkpoints(&[(CHECKPOINT_HEIGHT, first), (high + 1, second)]),
+    );
+    assert!(
+        matches!(uneven, Err(Error::Internal(_))),
+        "a non-period-spaced set must be refused"
+    );
 }
 
 /// BTC-01: reopening compares the network and every stored checkpoint, and
@@ -1042,6 +1074,48 @@ fn btc_05_forks() {
         state.forks.len(),
         "two forks shared a first hash"
     );
+
+    // Scenario: Below the best tip
+    // With fork A best, a run from a block below its forkpoint attaches to the
+    // root fork, and a run at the root fork's own tip extends it without
+    // creating a fork.
+    let extend = contiguous(f2, 10, 66);
+    assert_eq!(expect_accepted(&core, &extend, None), 10);
+    let state = core.state().expect("state");
+    assert_eq!(
+        state.best_fork,
+        Some(fork_a),
+        "fork A must be best before the below-tip runs"
+    );
+    let below_non_root = mine(trunk[2].block_hash(), trunk[2].time + 3, 67);
+    assert_eq!(expect_accepted(&core, &[below_non_root], None), 1);
+    let (fork_e, height_e) = core
+        .locate(&below_non_root.block_hash())
+        .expect("read")
+        .expect("the below-tip header is stored");
+    assert_eq!(height_e, CHECKPOINT_HEIGHT + 4);
+    let state = core.state().expect("state");
+    let e = state
+        .forks
+        .iter()
+        .find(|fork| fork.id == fork_e)
+        .expect("the below-tip fork is listed");
+    assert_eq!(e.parent, Some(0));
+    assert_eq!(e.forkpoint, CHECKPOINT_HEIGHT + 4);
+    let forks_before = state.forks.len();
+    let root_next = mine(next.block_hash(), next.time + 1, 68);
+    assert_eq!(expect_accepted(&core, &[root_next], None), 1);
+    let state = core.state().expect("state");
+    assert_eq!(
+        state.forks.len(),
+        forks_before,
+        "extending a tip created a fork"
+    );
+    assert_eq!(
+        state.best_fork,
+        Some(fork_a),
+        "the heavier fork must stay best"
+    );
 }
 
 /// BTC-06: the store keeps every header and every fork, and the tip work is
@@ -1186,6 +1260,17 @@ fn btc_07_best_fork() {
         .expect("the heavy fork is listed");
     assert_eq!(heavy_meta.tip_height, CHECKPOINT_HEIGHT + 6);
 
+    // Scenario: Equal keeps
+    // Extend the root fork to exactly the heavy fork's cumulative work: the
+    // tie keeps the non-root incumbent.
+    let tie = contiguous(trunk[3], 2, 105);
+    assert_eq!(expect_accepted(&core, &tie, None), 2);
+    assert_eq!(
+        core.state().expect("state").best_fork,
+        Some(heavy_id),
+        "equal work must keep the incumbent, not the root fork"
+    );
+
     // Scenario: Canonical
     // Canonical: the best fork's chain from the checkpoint height is canonical.
     let chain = canonical_chain(&core);
@@ -1217,14 +1302,15 @@ fn btc_07_best_fork() {
     assert_eq!(lighter_meta.tip_height, CHECKPOINT_HEIGHT + 7);
 
     // Scenario: Root wins back
-    // Root wins back.
-    let more = contiguous(trunk[3], 5, 104);
+    // Root wins back from its tied tip, so it is strictly heavier than the
+    // lighter fork.
+    let more = contiguous(tie[1], 5, 104);
     assert_eq!(expect_accepted(&core, &more, None), 5);
     let state = core.state().expect("state");
     assert_eq!(state.best_fork, Some(0));
     assert_eq!(
         core.tip_height().expect("read"),
-        Some(CHECKPOINT_HEIGHT + 9)
+        Some(CHECKPOINT_HEIGHT + 11)
     );
 
     // Scenario: Shorter but heavier fork wins

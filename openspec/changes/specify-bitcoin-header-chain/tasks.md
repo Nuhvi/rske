@@ -41,8 +41,10 @@
 ## 3. Store identity (BTC-00, BTC-01)
 
 - [x] 3.1 Add `btc_00_trusted_checkpoints` with a two-entry checkpoint set:
-  the root fork holds the checkpoints, the root fork is best, and the highest
-  checkpoint is the mark. Verify the test passes and asserts `Core::state()`.
+  the root fork holds the checkpoints, the root fork is best, the highest
+  checkpoint is the mark, and the tip work counts one period at the first
+  checkpoint's `bits`. A non-boundary or non-period-spaced set fails at open.
+  Verify the test passes and asserts `Core::state()`.
 - [x] 3.2 Add `btc_01_store_identity`: reopen with the same set; a longer set
   on the same chain; a different network; a different header at a checkpoint
   height. Assert `NetworkMismatch`, `CheckpointMismatch`, the store unchanged
@@ -66,9 +68,10 @@
 ## 5. Tree (BTC-05, BTC-06)
 
 - [x] 5.1 Add `btc_05_forks`: extend the tip, fork from a non-tip, fork of a
-  fork, siblings, distinct first hash, a start below the best tip, and a second
-  submission at a fork tip. Verify `Core::state().forks` reports the parent and
-  the forkpoint, and `Core::locate` finds each first header.
+  fork, siblings, distinct first hash, a start below the best tip (with the
+  root fork best and with a non-root fork best), and a second submission at a
+  fork tip. Verify `Core::state().forks` reports the parent and the forkpoint,
+  and `Core::locate` finds each first header.
 - [x] 5.2 Add `btc_06_stored_set`: a losing fork stays stored, a switch removes
   no header, and the tip work equals the parent work plus the run's work.
   Verify `Core::stored_headers` and `ForkState::tip_work`.
@@ -76,8 +79,9 @@
 ## 6. Best fork and outcome (BTC-07, BTC-08)
 
 - [x] 6.1 Add `btc_07_best_fork`: heavier wins, shorter but heavier fork wins,
-  lighter stays, equal keeps, a later win, the root wins back, and the
-  canonical read. Verify `Core::state().best_fork` and the canonical tip.
+  lighter stays, equal keeps (with the root fork and with a non-root incumbent),
+  a later win, the root wins back, and the canonical read. Verify
+  `Core::state().best_fork` and the canonical tip.
 - [x] 6.2 Add `btc_08_outcome`: extend, switch, no-op, and a losing-fork batch.
   Verify the accepted count, the previous best fork, the best fork and the
   canonical tip.
@@ -92,6 +96,9 @@
 - [x] 7.2 Run `cargo check --workspace`. Verify it passes.
 - [x] 7.3 Run `openspec validate "specify-bitcoin-header-chain" --type change
   --strict`. Verify it passes.
+- [x] 7.4 Record the Bitcoin Core deviations in `design.md` D11: batch
+  atomicity, the prefix skip, and the initial cumulative-work formula. Verify
+  each row names the Bitcoin Core function or reject reason it departs from.
 
 ## Deferred work
 
