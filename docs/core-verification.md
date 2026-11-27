@@ -24,10 +24,9 @@ with `cargo test --doc`. The fast workflow lives in
 `.github/workflows/ci.yml`; the proofs, mutation and fuzz jobs live in
 `.github/workflows/verify.yml`.
 
-The mutation job does not run on a pull request. One mutant replays the whole
-lib suite, so a diff-scoped check costs about a minute for each mutant. The
-nightly job audits the scoped files instead. Dispatch the workflow on the
-branch when you want the check before a merge.
+One mutant replays the whole lib suite. A pull request runs the diff-scoped
+check in four shards. The nightly job runs the full scoped audit in eight
+shards.
 
 | Command | Scope |
 |---|---|
@@ -208,13 +207,12 @@ cargo mutants --in-diff pr.diff -p rsk-core -- --lib
 Three dots compare against the merge base. Two dots also report the commits
 that landed on `master` after the branch point.
 
-The `verify` workflow runs the same check on demand. Select the branch, and set
-`base` to the branch that the change forks from. Do not expect the check on a
-pull request: the nightly job covers the scoped files in eight shards.
+The `verify` workflow runs the same check on a pull request, and on demand.
+For a dispatch, select the branch, and set `base` to the branch that the change
+forks from. A dispatch needs the workflow on the default branch.
 
-A large diff holds many mutants. The `shard` input takes `i/n`. Shards count
-from zero, so pass `0/4`, `1/4`, `2/4` and `3/4` to split the work across four
-runs.
+Four shards bound the wall clock. Each shard runs one quarter of the mutants,
+and all four start at the same time.
 
 Preview without running:
 

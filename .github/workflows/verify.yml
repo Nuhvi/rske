@@ -5,9 +5,8 @@ on:
     branches: [master]
   pull_request:
   schedule:
-    # Nightly audit. The scoped mutation run replays the lib suite for every
-    # mutant and costs about two hours on each of eight shards, so it does not
-    # run on a pull request.
+    # The full scoped audit runs at night, in eight shards. A pull request
+    # runs only the diff-scoped check, in four shards.
     - cron: "0 3 * * *"
   workflow_dispatch:
     inputs:
@@ -15,9 +14,6 @@ on:
         description: Base ref for the diff-scoped mutation check
         required: false
         default: master
-      shard:
-        description: "Shard to run, as i/n. Leave empty to run every mutant."
-        required: false
 
 concurrency:
   # Keep the nightly audit in its own group. A push to `master` must not cancel
@@ -56,13 +52,19 @@ jobs:
         run: cargo kani
 
   mutants:
-    # One mutant costs about a minute of runner time, because each mutant
-    # replays the whole lib suite. Keep the default pull-request path fast:
-    # dispatch this workflow on the branch when you want the check before a
-    # merge. The nightly job audits the scoped files in full.
-    if: github.event_name == 'workflow_dispatch'
-    timeout-minutes: 180
+    # A diff-scoped run mutates only the lines that the change touches. One
+    # mutant replays the whole lib suite, so split the mutants over four jobs
+    # to keep the wall clock near one quarter of a single run.
+    #
+    # A dispatch needs this file on the default branch. Until then, the pull
+    # request event is the only way to run the check.
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 120
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ["0/4", "1/4", "2/4", "3/4"]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -81,15 +83,20 @@ jobs:
       - name: Mutation check on the diff
         env:
           RSK_PROPTEST_CASES: "16"
-          BASE: ${{ inputs.base }}
-          SHARD: ${{ inputs.shard }}
+          BASE: ${{ github.base_ref || inputs.base }}
         run: |
           # Three dots: diff from the merge base. Two dots would report the
           # commits that landed on the base branch after the fork.
           git diff "origin/$BASE...HEAD" > pr.diff
-          shard=()
-          if [ -n "$SHARD" ]; then shard=(--shard "$SHARD"); fi
-          cargo mutants --in-diff pr.diff -p rsk-core "${shard[@]}" -- --lib
+          cargo mutants --in-diff pr.diff -p rsk-core \
+            --shard "${{ matrix.shard }}" -- --lib
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-diff-${{ strategy.job-index }}
+          path: mutants.out
+          if-no-files-found: ignore
 
   mutants-nightly:
     if: github.event_name == 'schedule'
@@ -154,11 +161,17 @@ jobs:
 
       - name: Build targets
         working-directory: fuzz
-        run: cargo fuzz build
+        run: |
+          # taiki-e installs the musl build of cargo-fuzz. That build defaults
+          # the target to x86_64-unknown-linux-musl, and the runner has no std
+          # for it. Build for the host instead.
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          cargo fuzz build --target "$host"
 
       - name: Smoke run
         working-directory: fuzz
         run: |
+          host=$(rustc -vV | sed -n 's/^host: //p')
           for target in checkpoints_text rsk_header_rlp btc_message; do
-            cargo fuzz run "$target" -- -runs=10000
+            cargo fuzz run --target "$host" "$target" -- -runs=10000
           done
