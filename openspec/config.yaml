@@ -56,7 +56,7 @@ rules:
       whole workspace. A narrower `specs::` filter is a fast loop only; confirm
       a survivor with `--lib`.
     - Before archive, write the change diff with
-      `git diff origin/main..HEAD > pr.diff` and run
+      `git diff origin/master...HEAD > pr.diff` and run
       `cargo mutants --in-diff pr.diff -p rsk-core -- --lib`.
     - Triage every missed mutant before you write a test. A spec violation
       gets the test. Unspecified behaviour gets a specification change first.
