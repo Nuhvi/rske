@@ -3,7 +3,7 @@
 //! Each test carries the requirement ID it proves:
 //!
 //! - `hdr_00_supported_networks` — HDR-00
-//! - `hdr_01_parent_of_the_first_new_header_is_known` — HDR-01
+//! - `btc_04_unknown_parent` — BTC-04 (retained from the retired HDR-01)
 //! - `hdr_02_target_range` — HDR-02
 //! - `hdr_03_proof_of_work` — HDR-03
 //! - `hdr_04_expected_bits_inside_a_period` — HDR-04
@@ -11,19 +11,21 @@
 //! - `hdr_06_mainnet_and_regtest_boundaries` — HDR-06
 //! - `hdr_07_median_time_past` — HDR-07
 //! - `hdr_08_future_time` — HDR-08
+//! - `hdr_09_version_is_not_checked` — HDR-09
+//! - `hdr_10_network_parameters` — HDR-10
 //!
 //! Each spec scenario carries a `// Scenario:` comment at the assertion that
 //! proves it.
 
 use bitcoin::Network;
-use bitcoin::block::BlockHash;
+use bitcoin::block::{BlockHash, Version};
 use bitcoin::consensus::Params;
 use bitcoin::hashes::Hash as _;
 use bitcoin::pow::{CompactTarget, Target};
 
 use super::support::{
     CHECKPOINT_HEIGHT, CHECKPOINT_TIME, EASY_BITS, NOW, expect_accepted, expect_err,
-    header_universe, header_with, mainnet_core, mine, mine_bad, mine_with_bits,
+    header_universe, header_with, mainnet_core, mine, mine_bad, mine_with_bits, mine_with_version,
     synthetic_mainnet_core, testnet_params,
 };
 use crate::btc::validation::MAX_FUTURE_BLOCK_TIME;
@@ -61,9 +63,9 @@ fn hdr_00_supported_networks() {
     }
 }
 
-/// HDR-01: the first new header must name a stored parent.
+/// BTC-04: the first new header must name a stored parent.
 #[test]
-fn hdr_01_parent_of_the_first_new_header_is_known() {
+fn btc_04_unknown_parent() {
     let genesis = mine(BlockHash::all_zeros(), CHECKPOINT_TIME, 0);
     let core = mainnet_core(&[(CHECKPOINT_HEIGHT, genesis)]);
 
@@ -76,7 +78,8 @@ fn hdr_01_parent_of_the_first_new_header_is_known() {
         "got {err:?}"
     );
 
-    // Scenario: Stored parent
+    // The stored-parent case is also the HDR-01 acceptance case that the
+    // retired requirement covered.
     let child = mine(genesis.block_hash(), CHECKPOINT_TIME + 1, 0);
     assert_eq!(expect_accepted(&core, &[child], None), 1);
 }
@@ -95,6 +98,7 @@ fn hdr_02_target_range() {
     for (label, bits) in [
         ("negative", 0x1d80_0000),
         ("zero", 0x1d00_0000),
+        ("zero after truncation", 0x0100_0001),
         ("overflow", 0x2300_0001),
         ("above the limit", 0x2100_ffff),
     ] {
@@ -118,6 +122,13 @@ fn hdr_02_target_range() {
         matches!(&err, Error::BadPow { detail, .. } if detail == "target out of range"),
         "got {err:?}"
     );
+
+    // Scenario: Target equal to the network limit
+    // `EASY_BITS` is the relaxed mainnet proof-of-work limit. A mined header
+    // at that target must pass the range check and the work check.
+    let at_limit = mine(parent, CHECKPOINT_TIME + 3, 0);
+    assert_eq!(at_limit.bits.to_consensus(), EASY_BITS);
+    assert_eq!(expect_accepted(&core, &[at_limit], None), 1);
 
     // Scenario: Range check before proof of work
     // The range check runs before proof of work: the hash misses its own
@@ -275,8 +286,8 @@ fn hdr_05_minimum_difficulty_networks() {
         "got {err:?}"
     );
 
-    // Scenario: Long gap with the limit (regtest)
-    // Regtest permits minimum-difficulty blocks inside a period, like testnet3.
+    // Extra coverage: a long gap on regtest also takes the limit bits. The
+    // HDR-05 requirement names both testnet3 and regtest.
     let regtest_checkpoint = mine_with_bits(BlockHash::all_zeros(), CHECKPOINT_TIME, 11, EASY_BITS);
     let regtest_core = Core::new(
         Config::in_memory(Network::Regtest)
@@ -317,7 +328,7 @@ fn hdr_06_mainnet_and_regtest_boundaries() {
     //   - 5x unclamped (20 s):   0x0f_ffff * 5 = 0x4f_fffb -> 0x204f_fffb
     const BASE_BITS: u32 = 0x200f_ffff;
     const QUARTER_CLAMP_BITS: u32 = 0x2003_ffff;
-    const UNCLAMPED_FAST_BITS: u32 = 0x2001_ffff;
+    const WRONG_FAST_BITS: u32 = 0x2001_ffff;
     const FOUR_TIMES_CLAMP_BITS: u32 = 0x203f_fffc;
     const UNCLAMPED_SLOW_BITS: u32 = 0x204f_fffb;
     const POW_LIMIT_CLAMP_BITS: u32 = 0x201f_ffff;
@@ -359,6 +370,20 @@ fn hdr_06_mainnet_and_regtest_boundaries() {
     );
     assert_eq!(expect_accepted(&core, &[parent_slow], None), 1);
 
+    // `parent_quarter` and `parent_four` are siblings at height 2015 that end
+    // the period exactly one quarter and exactly four times the target
+    // timespan after `genesis.time`.
+    let parent_quarter =
+        mine_with_bits(h2014.block_hash(), CHECKPOINT_TIME + 2015 + 1, 2, BASE_BITS);
+    assert_eq!(expect_accepted(&core, &[parent_quarter], None), 1);
+    let parent_four = mine_with_bits(
+        h2014.block_hash(),
+        CHECKPOINT_TIME + 2015 + 16,
+        3,
+        BASE_BITS,
+    );
+    assert_eq!(expect_accepted(&core, &[parent_four], None), 1);
+
     // Scenario: Mainnet quarter-timespan clamp
     let boundary_fast = mine_with_bits(
         parent_fast.block_hash(),
@@ -367,6 +392,15 @@ fn hdr_06_mainnet_and_regtest_boundaries() {
         QUARTER_CLAMP_BITS,
     );
     assert_eq!(expect_accepted(&core, &[boundary_fast], None), 1);
+
+    // Scenario: Mainnet exact quarter-timespan clamp
+    let boundary_quarter = mine_with_bits(
+        parent_quarter.block_hash(),
+        parent_quarter.time + 1,
+        4,
+        QUARTER_CLAMP_BITS,
+    );
+    assert_eq!(expect_accepted(&core, &[boundary_quarter], None), 1);
 
     // Scenario: Mainnet boundary with the parent bits
     let stale = mine_with_bits(parent_fast.block_hash(), parent_fast.time + 1, 1, BASE_BITS);
@@ -377,18 +411,22 @@ fn hdr_06_mainnet_and_regtest_boundaries() {
         "got {err:?}"
     );
 
-    // Scenario: Unclamped retarget
+    // A wrong fast target is refused. The unclamped retarget at 0 s elapsed
+    // would be a zero target, so this value only proves that the clamped value
+    // is required; the slow case below carries the real unclamped retarget.
     let bad_fast = header_with(
         parent_fast.block_hash(),
         parent_fast.time + 1,
-        UNCLAMPED_FAST_BITS,
+        WRONG_FAST_BITS,
     );
     let err = expect_err(&core, &[bad_fast], None);
     assert!(
         matches!(err, Error::BadDifficulty { expected, got, .. }
-            if expected == QUARTER_CLAMP_BITS && got == UNCLAMPED_FAST_BITS),
+            if expected == QUARTER_CLAMP_BITS && got == WRONG_FAST_BITS),
         "got {err:?}"
     );
+
+    // Scenario: Unclamped retarget
     let bad_slow = header_with(
         parent_slow.block_hash(),
         parent_slow.time + 1,
@@ -410,6 +448,15 @@ fn hdr_06_mainnet_and_regtest_boundaries() {
     );
     assert_eq!(expect_accepted(&core, &[boundary_slow], None), 1);
 
+    // Scenario: Mainnet exact four-times-timespan clamp
+    let boundary_four = mine_with_bits(
+        parent_four.block_hash(),
+        parent_four.time + 1,
+        5,
+        FOUR_TIMES_CLAMP_BITS,
+    );
+    assert_eq!(expect_accepted(&core, &[boundary_four], None), 1);
+
     // Scenario: Retarget clamped to the proof-of-work limit
     // Lower the network proof-of-work limit to 2x BASE_BITS (0x201f_ffff), so
     // the 4x retarget on `parent_slow` clamps at the proof-of-work limit.
@@ -428,6 +475,25 @@ fn hdr_06_mainnet_and_regtest_boundaries() {
         POW_LIMIT_CLAMP_BITS,
     );
     assert_eq!(expect_accepted(&core, &[capped_boundary], None), 1);
+
+    // Scenario: Retarget equal to the proof-of-work limit
+    // Set the limit to exactly the 4x retarget on `parent_slow`, so the
+    // retarget and the limit agree and the boundary is accepted.
+    let mut equal_params = params.clone();
+    equal_params.max_attainable_target =
+        Target::from_compact(CompactTarget::from_consensus(FOUR_TIMES_CLAMP_BITS));
+    let Core { store, config } = core;
+    let core = Core {
+        store,
+        config: config.with_params(equal_params),
+    };
+    let equal_boundary = mine_with_bits(
+        parent_slow.block_hash(),
+        parent_slow.time + 3,
+        2,
+        FOUR_TIMES_CLAMP_BITS,
+    );
+    assert_eq!(expect_accepted(&core, &[equal_boundary], None), 1);
 
     // Scenario: Testnet3 boundary retarget
     // On testnet3, a period boundary recomputes the retarget from the parent's
@@ -616,6 +682,24 @@ fn hdr_07_median_time_past() {
     let mut good_batch = ten_in_batch.to_vec();
     good_batch.push(mine(ten_in_batch[9].block_hash(), CHECKPOINT_TIME + 6, 6));
     assert_eq!(expect_accepted(&batched, &good_batch, None), 11);
+
+    // Scenario: Older headers outside the window
+    // Twelve ancestors with times 1000, 1, 2, ..., 11. The median of the last
+    // 11 is +6; the median of the last 12 is +7. A header at +7 is above the
+    // 11-window but at the 12-window, so it must be accepted.
+    let window_genesis = mine(BlockHash::all_zeros(), CHECKPOINT_TIME, 0);
+    let window_core = mainnet_core(&[(CHECKPOINT_HEIGHT, window_genesis)]);
+    let far = mine(window_genesis.block_hash(), CHECKPOINT_TIME + 1_000, 7);
+    let mut twelve = vec![far];
+    let mut prev = far;
+    for i in 1..=11u32 {
+        let next = mine(prev.block_hash(), CHECKPOINT_TIME + i, 8);
+        twelve.push(next);
+        prev = next;
+    }
+    assert_eq!(expect_accepted(&window_core, &twelve, None), 12);
+    let inside = mine(prev.block_hash(), CHECKPOINT_TIME + 7, 9);
+    assert_eq!(expect_accepted(&window_core, &[inside], None), 1);
 }
 
 /// HDR-08: the two-hour future-time window is inclusive, and optional.
@@ -643,4 +727,66 @@ fn hdr_08_future_time() {
     // Scenario: No clock
     let no_clock = mine(parent, (NOW + 1_000_000) as u32, 2);
     assert_eq!(expect_accepted(&core, &[no_clock], None), 1);
+}
+
+/// HDR-09: the version is not checked (declared deviation).
+#[test]
+fn hdr_09_version_is_not_checked() {
+    let genesis = mine(BlockHash::all_zeros(), CHECKPOINT_TIME, 0);
+    let core = mainnet_core(&[(CHECKPOINT_HEIGHT, genesis)]);
+
+    // Scenario: Version 1 at a high height
+    // Height 969,697 is above the BIP34, BIP66 and BIP65 activation heights
+    // 227,931, 363,725 and 388,381. Every version from 1 to 4 is accepted.
+    let versions = [
+        Version::ONE,
+        Version::TWO,
+        Version::from_consensus(3),
+        Version::from_consensus(4),
+    ];
+    for (tag, version) in versions.into_iter().enumerate() {
+        let header = mine_with_version(
+            genesis.block_hash(),
+            CHECKPOINT_TIME + 1,
+            tag as u32,
+            version,
+        );
+        assert_eq!(expect_accepted(&core, &[header], None), 1);
+    }
+}
+
+/// HDR-10: the network parameters and the regtest period deviation.
+#[test]
+fn hdr_10_network_parameters() {
+    assert_eq!(DIFFICULTY_PERIOD, 2016);
+
+    for (network, limit_bits) in [
+        (Network::Bitcoin, 0x1d00_ffffu32),
+        (Network::Testnet, 0x1d00_ffffu32),
+        (Network::Regtest, 0x207f_ffffu32),
+    ] {
+        let params = Params::new(network);
+        assert_eq!(params.pow_target_spacing, 600, "{network}");
+        assert_eq!(params.pow_target_timespan, 1_209_600, "{network}");
+        let limit = Target::from_compact(CompactTarget::from_consensus(limit_bits));
+        assert_eq!(params.max_attainable_target, limit, "{network}");
+    }
+
+    // Scenario: Regtest period
+    // Bitcoin Core uses a 144-block period on regtest, so height 288 is a
+    // boundary there. This crate uses 2016, so the minimum-difficulty rule
+    // applies at 288 and the header carries the limit bits.
+    let genesis = mine_with_bits(BlockHash::all_zeros(), CHECKPOINT_TIME, 0, 0x207f_fffe);
+    let core = Core::new(Config::in_memory(Network::Regtest).with_checkpoints(&[(0, genesis)]))
+        .expect("in-memory store");
+    let mut parent = genesis;
+    let mut chain = Vec::with_capacity(287);
+    for i in 1..=287u32 {
+        let next = mine_with_bits(parent.block_hash(), CHECKPOINT_TIME + i, 0, 0x207f_fffe);
+        chain.push(next);
+        parent = next;
+    }
+    assert_eq!(expect_accepted(&core, &chain, None), 287);
+    let child = mine_with_bits(parent.block_hash(), parent.time + 1_201, 0, 0x207f_ffff);
+    assert_eq!(expect_accepted(&core, &[child], None), 1);
 }

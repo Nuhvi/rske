@@ -50,7 +50,12 @@ pub fn target_in_range(bits: CompactTarget, params: &Params) -> bool {
     if size > 34 || (mantissa > 0xff && size > 33) || (mantissa > 0xffff && size > 32) {
         return false;
     }
-    Target::from_compact(bits) <= params.max_attainable_target
+    let target = Target::from_compact(bits);
+    // A nonzero mantissa can truncate to zero, for example `0x01000001`.
+    if target == Target::ZERO {
+        return false;
+    }
+    target <= params.max_attainable_target
 }
 
 /// The maximum time a header may lead the caller's clock, in seconds.
@@ -341,6 +346,11 @@ mod tests {
         // A zero mantissa is not a target.
         assert!(!target_in_range(
             CompactTarget::from_consensus(0x1d00_0000),
+            &params
+        ));
+        // A nonzero mantissa that truncates to zero is not a target either.
+        assert!(!target_in_range(
+            CompactTarget::from_consensus(0x0100_0001),
             &params
         ));
         // An exponent past the 256-bit range overflows.

@@ -149,6 +149,33 @@ pub(super) fn mine_with_bits(prev: BlockHash, time: u32, tag: u32, bits: u32) ->
     }
 }
 
+/// A mined header with a chosen version, so HDR-09 can prove that the version
+/// is not checked.
+pub(super) fn mine_with_version(
+    prev: BlockHash,
+    time: u32,
+    tag: u32,
+    version: Version,
+) -> BitcoinHeader {
+    let target = CompactTarget::from_consensus(EASY_BITS);
+    let mut nonce = tag;
+    loop {
+        let header = BitcoinHeader {
+            version,
+            prev_blockhash: prev,
+            merkle_root: TxMerkleNode::all_zeros(),
+            time,
+            bits: target,
+            nonce,
+        };
+        if header.validate_pow(header.target()).is_ok() {
+            return header;
+        }
+        nonce = nonce.wrapping_add(1);
+        assert!(nonce != 0, "could not mine a header");
+    }
+}
+
 /// One header in the delivery universe and the rule that rejects it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum HeaderKind {
