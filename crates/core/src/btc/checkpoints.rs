@@ -2,7 +2,8 @@
 //!
 //! One trusted header per difficulty period — heights `0, 2016, 4032, …` — one
 //! lowercase-hex 80-byte header per line, line `i` at height
-//! `i * DIFFICULTY_PERIOD`. Writing these to an empty store lets a node skip
+//! `i * DIFFICULTY_PERIOD`. The period is 2016 on every supported network;
+//! Bitcoin Core uses 144 on regtest, and HDR-10 records that deviation. Writing these to an empty store lets a node skip
 //! the whole-history download (the Electrum model) while still PoW-,
 //! continuity-, difficulty- and timestamp-validating every header above the
 //! first trusted checkpoint.

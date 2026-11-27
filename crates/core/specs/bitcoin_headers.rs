@@ -4,9 +4,8 @@
 //! `bitcoin-header-chain` capability. This file keeps the clauses that do not
 //! have an OpenSpec capability yet:
 //!
-//! - `finality_and_fork_gate_matches_the_spec` checks E3 and E6 on a long trunk
-//!   delivered in runs, at the production depth, including light forks
-//!   below/above the mark.
+//! - `finality_matches_the_spec` checks E6 on a long trunk delivered in runs,
+//!   at the production depth.
 //! - `difficulty_matches_the_spec` checks HDR-04 with the mainnet expected-bits
 //!   rule.
 //! - `future_time_matches_the_spec` checks HDR-08 against the caller clock.
@@ -54,10 +53,6 @@ const FINALITY_BATCH: usize = 12;
 struct FinalityUniverse {
     genesis: BitcoinHeader,
     headers: Vec<BitcoinHeader>,
-    /// A light child of each trunk header, used to attempt forks. The child of
-    /// header `i` has height `CHECKPOINT_HEIGHT + i + 2`; it can never outweigh the
-    /// trunk when the parent is below the tip.
-    forks: Vec<BitcoinHeader>,
 }
 
 fn finality_universe() -> FinalityUniverse {
@@ -68,22 +63,7 @@ fn finality_universe() -> FinalityUniverse {
         prev = mine(prev.block_hash(), CHECKPOINT_TIME + i, 0);
         headers.push(prev);
     }
-    let forks = headers
-        .iter()
-        .enumerate()
-        .map(|(i, header)| {
-            mine(
-                header.block_hash(),
-                header.time + 1_000 + i as u32,
-                900 + i as u32,
-            )
-        })
-        .collect();
-    FinalityUniverse {
-        genesis,
-        headers,
-        forks,
-    }
+    FinalityUniverse { genesis, headers }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,8 +71,6 @@ enum FinalityPrediction {
     Noop,
     UnknownAncestor,
     Connected { connected: usize, advanced: bool },
-    ForkStored,
-    ForkBelowFinalized { forkpoint: u64, finalized: u64 },
 }
 
 #[derive(Clone, Debug)]
@@ -109,11 +87,7 @@ enum FinalityTransition {
     /// One header by index: a duplicate, an orphan, or the next trunk header.
     Deliver(usize),
     /// A contiguous run of fresh trunk headers, the way a sync delivers them.
-    Advance {
-        start: usize,
-        len: usize,
-    },
-    Fork(usize),
+    Advance { start: usize, len: usize },
 }
 
 struct FinalityMachine;
@@ -141,30 +115,14 @@ impl ReferenceStateMachine for FinalityMachine {
         let frontier = state.tip.saturating_sub(CHECKPOINT_HEIGHT) as usize;
         let any_deliver = (0..len).prop_map(FinalityTransition::Deliver);
         if frontier >= len {
-            // The trunk is exhausted: only duplicates and forks remain.
-            let parents = 0..(frontier - 1);
-            return prop_oneof![
-                1 => any_deliver,
-                2 => parents.prop_map(FinalityTransition::Fork),
-            ]
-            .boxed();
+            // The trunk is exhausted: only duplicates remain.
+            return any_deliver.boxed();
         }
         let advance = (1usize..=FINALITY_BATCH).prop_map(move |n| FinalityTransition::Advance {
             start: frontier,
             len: n.min(len - frontier),
         });
-        if frontier < 3 {
-            return prop_oneof![3 => advance, 1 => any_deliver].boxed();
-        }
-        // A branch must leave the current tip as the tip: parents are kept one
-        // below it, so the fork can at most tie the trunk's work.
-        let parents = 0..(frontier - 1);
-        prop_oneof![
-            3 => advance,
-            1 => any_deliver,
-            2 => parents.prop_map(FinalityTransition::Fork),
-        ]
-        .boxed()
+        prop_oneof![3 => advance, 1 => any_deliver].boxed()
     }
 
     fn apply(mut state: Self::State, transition: &Self::Transition) -> Self::State {
@@ -203,25 +161,6 @@ impl ReferenceStateMachine for FinalityMachine {
                     connected: *len,
                     advanced: state.mark > before,
                 };
-            }
-            FinalityTransition::Fork(index) => {
-                let fork = state.universe.forks[*index];
-                if state.stored.contains(&fork.block_hash()) {
-                    state.last = FinalityPrediction::Noop;
-                } else {
-                    // E3: a fork at or below the mark is refused. A fork above
-                    // the mark is stored, but it can only tie the trunk here.
-                    let forkpoint = CHECKPOINT_HEIGHT + *index as u64 + 2;
-                    if forkpoint <= state.mark {
-                        state.last = FinalityPrediction::ForkBelowFinalized {
-                            forkpoint,
-                            finalized: state.mark,
-                        };
-                    } else {
-                        state.stored.insert(fork.block_hash());
-                        state.last = FinalityPrediction::ForkStored;
-                    }
-                }
             }
         }
         state
@@ -272,7 +211,6 @@ impl StateMachineTest for FinalityMachine {
             FinalityTransition::Advance { start, len } => {
                 &model.universe.headers[start..start + len]
             }
-            FinalityTransition::Fork(index) => std::slice::from_ref(&model.universe.forks[index]),
         };
         let before = sut.core.state().expect("state");
         let outcome = sut
@@ -315,25 +253,6 @@ impl StateMachineTest for FinalityMachine {
                 assert_eq!(result.accepted, *connected);
                 assert_eq!(result.tip_height, model.tip);
                 assert_eq!(result.finalized, None, "the mark advanced unexpectedly");
-            }
-            (FinalityPrediction::ForkStored, Ok(Outcome::BitcoinSubmitted(result))) => {
-                assert_eq!(result.accepted, 1);
-                assert_eq!(after.best_fork, Some(0), "a light fork became best");
-                assert!(result.finalized.is_none(), "a fork advanced the mark");
-            }
-            (
-                FinalityPrediction::ForkBelowFinalized {
-                    forkpoint,
-                    finalized,
-                },
-                Err(Error::ForkBelowFinalized {
-                    fork,
-                    finalized: got,
-                }),
-            ) => {
-                assert_eq!(*forkpoint, *fork);
-                assert_eq!(*finalized, *got);
-                assert_eq!(before, after, "a refused fork changed the store");
             }
             (expected, other) => panic!("model expected {expected:?}, core returned {other:?}"),
         }
@@ -801,7 +720,7 @@ prop_state_machine! {
 
     /// E3 and E6: the fork gate and the mark on a trunk.
     #[test]
-    fn finality_and_fork_gate_matches_the_spec(sequential 1..64 => FinalityMachine);
+    fn finality_matches_the_spec(sequential 1..64 => FinalityMachine);
 }
 
 prop_state_machine! {

@@ -115,8 +115,8 @@ other depth rule SHALL refuse a fork.
 - **AND** the store is unchanged
 
 #### Scenario: First fork above the floor
-- **WHEN** a submission names the highest entry as its parent with a different
-  first header, so the forkpoint is the floor plus one
+- **WHEN** the highest entry is not a tip and a submission names it with a
+  different first header, so the forkpoint is the floor plus one
 - **THEN** the submission creates the fork and accepts the header
 
 #### Scenario: Extension skips the floor
@@ -357,10 +357,11 @@ error and no outcome.
 **Source**: Electrum [`BlockchainManager._instantiate_chain`](https://github.com/spesmilo/electrum/blob/master/electrum/blockchain.py#L152-L185); a chain at or below the last checkpoint is deleted.
 
 After the comparison, an open SHALL remove every fork whose chain does not
-carry the highest entry, every header row on such a fork, and every header
-below that entry that is not an entry. It SHALL make the heaviest surviving
-fork best. A matching header below the entry SHALL be removed as well. The
-adopt and prune SHALL run in one transaction.
+carry the highest entry, every header row on such a fork, and every header of
+the initial chain below that entry that is not an entry. It SHALL make the
+heaviest surviving fork best. A matching header of the initial chain below the
+entry SHALL be removed as well. The adopt and prune SHALL run in one
+transaction.
 
 #### Scenario: Higher checkpoint
 - **WHEN** the open adopts an entry above the tip of the best fork

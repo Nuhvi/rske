@@ -7,28 +7,24 @@
 //! whose parent is a known block but not a chain tip starts a **new fork**,
 //! which is kept (not rejected) and can later win if it becomes heavier.
 //!
-//! The **trusted checkpoints** are one header per difficulty-period boundary
-//! (2016 blocks). They come from this crate's embedded `checkpoints.txt` and
-//! are written to the store when it is initialized. "Checkpoint" in this
-//! module always means that Bitcoin period boundary — never an RSK checkpoint
-//! (a trusted RSK block) and never a CPV sample. Because Bitcoin difficulty is
-//! constant within a period, each trusted checkpoint pins the work of its whole
-//! period, so the cumulative work of the *entire* chain is known without
-//! holding every block.
+//! The **trusted checkpoints** are one header per difficulty period, at the
+//! period's first height (`P` blocks, 2016 on every network). They come from
+//! this crate's embedded `checkpoints.txt`, from genesis on every other
+//! network, or from a caller list. "Checkpoint" in this module always means
+//! that Bitcoin period start — never an RSK checkpoint (a trusted RSK block)
+//! and never a CPV sample. Because Bitcoin difficulty is constant within a
+//! period, each trusted checkpoint pins the work of its whole period, so the
+//! cumulative work of the *entire* chain is known without holding every block.
 //!
-//! The trusted checkpoints also set the **finality mark**: a pointer to the
-//! newest header we
-//! treat as un-reorgable. The mark may be any height — the rule keeps it a
-//! coinbase-maturity window below the tip — and a **checkpoint** is the newest
-//! difficulty-period start at or below it ([`finality::is_checkpoint`]). Like
-//! Electrum, which rejects a fork whose first height is at or below its shipped
-//! checkpoint height, we refuse forks whose `forkpoint` falls at or below the
-//! mark. We **do not prune** the chain when it advances — headers are retained
-//! until Rootstock establishes a checkpoint, at which point pruning can occur.
-//! The checkpoint table (`btc_checkpoints`) is broader: it starts with the
-//! trusted checkpoints and grows with validated root-chain boundaries, which is
-//! what makes the whole chain's work computable. [`crate::btc::finality`] holds
-//! the rule that gates the mark.
+//! The set is fixed at each open. An open adopts a configured entry above the
+//! stored floor, then prunes every fork that does not carry the highest entry
+//! and every initial-chain header below it that is not an entry. A submission
+//! never extends the set. The **checkpoint floor** is the highest stored entry;
+//! a new fork at or below it is refused.
+//!
+//! The **finality mark** is separate. The rule still advances it, but the chain
+//! path does not consult it: a fork above the floor wins on work alone. A later
+//! `bitcoin-finality` capability will own the mark.
 //!
 //! Simplifications for this slice, stated explicitly so they are easy to lift:
 //!
@@ -227,6 +223,7 @@ impl Core {
     /// the same chain identity. Initialization never extends an existing store:
     /// a configured checkpoint that the store does not hold is not written.
     pub(crate) fn initialize_with_checkpoints(&self) -> Result<(), Error> {
+        let entries = self.config.resolve_checkpoints()?;
         {
             let txn = self.store.read()?;
             // The network is recorded when the store is initialized. Refuse a
@@ -242,31 +239,55 @@ impl Core {
             }
             if txn.fork_meta(0)?.is_some() {
                 let best = txn.best_fork()?.unwrap_or(0);
-                for (height, header) in &self.config.resolve_checkpoints()? {
+                let tip = txn.fork_tip(best)?.map_or(0, |(height, _)| height);
+                for (height, header) in &entries {
+                    if *height > tip {
+                        continue;
+                    }
                     let stored = match txn.header_at(best, *height)? {
                         Some(header) => Some(header),
                         None => txn.checkpoint_at(*height)?,
                     };
-                    if let Some(stored) = stored
-                        && stored.block_hash() != header.block_hash()
-                    {
-                        return Err(Error::CheckpointMismatch {
-                            height: *height,
-                            stored: stored.block_hash(),
-                            configured: header.block_hash(),
-                        });
+                    match stored {
+                        Some(stored) if stored.block_hash() != header.block_hash() => {
+                            return Err(Error::CheckpointMismatch {
+                                height: *height,
+                                stored: stored.block_hash(),
+                                configured: header.block_hash(),
+                            });
+                        }
+                        None => {
+                            return Err(Error::Internal(format!(
+                                "no stored header at checkpoint height {height}"
+                            )));
+                        }
+                        Some(_) => {}
                     }
                 }
+
+                // Adopt the entries above the stored floor, then prune the
+                // forks and headers that the higher entry leaves behind.
+                let txn = self.store.write()?;
+                let floor = txn.checkpoint_floor()?;
+                let adopted: Vec<(u64, BitcoinHeader)> = entries
+                    .iter()
+                    .filter(|(height, _)| *height <= tip && floor.is_none_or(|f| *height > f))
+                    .copied()
+                    .collect();
+                if !adopted.is_empty() {
+                    txn.put_checkpoint_rows(&adopted)?;
+                }
+                txn.prune_to_floor()?;
+                txn.commit()?;
                 return Ok(());
             }
         }
 
-        let checkpoints = self.config.resolve_checkpoints()?;
-        if checkpoints.is_empty() {
+        if entries.is_empty() {
             return Ok(());
         }
         let txn = self.store.write()?;
-        txn.put_checkpoints(&checkpoints)?;
+        txn.put_checkpoints(&entries)?;
         txn.set_network(self.config.params.network)?;
         txn.commit()
     }
@@ -599,10 +620,9 @@ impl Core {
     ///   (see [`crate::btc::validation`]).
     /// - The best chain is re-selected by cumulative work; a fork only wins
     ///   when it is strictly heavier.
-    /// - A fork whose `forkpoint` is at or below the finality mark is refused
-    ///   ([`Error::ForkBelowFinalized`]) — the mark's floor. A fork created
-    ///   above the mark earlier also never becomes best once the mark has
-    ///   overtaken its `forkpoint`; it is kept stored instead.
+    /// - A fork whose `forkpoint` is at or below the checkpoint floor is
+    ///   refused ([`Error::ForkBelowCheckpoint`]). A fork above the floor wins
+    ///   on cumulative work alone; the finality mark does not gate it.
     ///
     /// `now` is the caller's clock (unix seconds), when the caller has one. The
     /// core keeps no internal clock. The future-time check (HDR-08) runs only on
@@ -616,10 +636,10 @@ impl Core {
     /// Returns [`Error::NetworkMismatch`] if the store was initialized for a
     /// different network than this [`Core`] validates against.
     ///
-    /// The whole operation — reads, validation, writes and the automatic mark
-    /// advance below — runs inside one write transaction, so nothing can change
-    /// the store between the reads a decision is based on and the writes that
-    /// act on it.
+    /// The whole operation — reads, validation, writes and the finality side
+    /// effects below — runs inside one write transaction, so nothing can
+    /// change the store between the reads a decision is based on and the
+    /// writes that act on it.
     pub(crate) fn submit_bitcoin_headers_impl(
         &self,
         headers: &[BitcoinHeader],
@@ -697,12 +717,12 @@ impl Core {
             (parent_fork, parent_height + 1)
         } else {
             let forkpoint = parent_height + 1;
-            if let Some(finalized) = txn.finalized_height()?
-                && forkpoint <= finalized
+            if let Some(floor) = txn.checkpoint_floor()?
+                && forkpoint <= floor
             {
-                return Err(Error::ForkBelowFinalized {
+                return Err(Error::ForkBelowCheckpoint {
                     fork: forkpoint,
-                    finalized,
+                    checkpoint: floor,
                 });
             }
             let id = txn.create_fork(parent_fork, forkpoint, headers[start].block_hash())?;
@@ -829,28 +849,10 @@ impl Core {
             .fork_chainwork(target_fork)?
             .unwrap_or(Work::from_be_bytes([0; 32]));
         if target_fork != best && target_work > best_work {
-            // A fork created above the mark can outlive it. Once the mark has
-            // passed its divergence point, letting it win would reorg finalized
-            // history: the fork stays stored but never becomes the best chain.
-            let mark = txn.finalized_height()?.unwrap_or(0);
-            // Fork 0 is the root fork (the mark lives on it), so it is
-            // always allowed to win back. Any other fork may only win if it
-            // carries the mark's block. The fork's own `forkpoint` is not
-            // enough: a fork branched off another fork can start above the mark
-            // while its chain diverged below it, so the block at the mark is
-            // resolved through the fork's ancestors (`header_at`) instead.
-            let crosses_mark = if target_fork == 0 {
-                false
-            } else {
-                let at_mark = txn.header_at(target_fork, mark)?;
-                let canonical = txn.header_at(0, mark)?;
-                at_mark.map(|header| header.block_hash())
-                    != canonical.map(|header| header.block_hash())
-            };
-            if !crosses_mark {
-                txn.set_best_fork(target_fork)?;
-                best = target_fork;
-            }
+            // The checkpoint floor is the only reorg limit. A fork above it
+            // wins on work alone; the finality mark has no say here.
+            txn.set_best_fork(target_fork)?;
+            best = target_fork;
         }
 
         let tip_height = match prev_best {
@@ -1796,22 +1798,17 @@ mod tests {
     }
 
     #[test]
-    fn fork_below_finalized_is_refused() -> eyre::Result<()> {
-        let chain = initialized();
-        let main = easy_chain(&canonical(&chain, 0), 6, 1);
-        chain.submit_bitcoin_headers(&main, NOW)?;
+    fn fork_below_checkpoint_is_refused() -> eyre::Result<()> {
+        let genesis = mine_genesis(0);
+        let high = DIFFICULTY_PERIOD;
+        let second = mine_at(genesis.block_hash(), genesis.time + 1, EASY_BITS);
+        let chain = initialized_with(Network::Regtest, &[(0, genesis), (high, second)]);
 
-        // Advance the finality mark to height 1, as an advance would.
-        let txn = chain.store.write()?;
-        txn.set_finalized(1)?;
-        txn.commit()?;
-        assert_eq!(chain.finalized_height()?, Some(1));
-
-        // A fork starting at height 1 (forkpoint 1 <= finalized 1) is refused.
-        let fork = easy_chain(&canonical(&chain, 0), 3, 1000);
+        // A fork from the first entry has forkpoint 1, at or below the floor.
+        let fork = easy_chain(&genesis, 3, 1000);
         let err = chain.submit_bitcoin_headers(&fork, NOW).unwrap_err();
         assert!(
-            matches!(err, Error::ForkBelowFinalized { .. }),
+            matches!(err, Error::ForkBelowCheckpoint { .. }),
             "got {err:?}"
         );
         Ok(())
@@ -2228,42 +2225,6 @@ mod tests {
                 && blocks < alloy_primitives::U256::from(3_500u64),
             "requirement {blocks} blocks"
         );
-        Ok(())
-    }
-
-    /// A fork that was created above the mark can outlive it. Once the mark has
-    /// passed its forkpoint, the fork must never become the best chain, or it
-    /// would reorg finalized history (and the export would read its blocks).
-    #[test]
-    fn a_fork_the_mark_overtook_cannot_become_best() -> eyre::Result<()> {
-        let chain = initialized();
-        let genesis = canonical(&chain, 0);
-
-        // Build the main chain to 2,100: the mark is 2,000, so a fork at 2,001
-        // is still above it and may be created.
-        let main = easy_chain(&genesis, 2_100, 1);
-        chain.submit_bitcoin_headers(&main, NOW)?;
-        assert_eq!(chain.finalized_height()?, Some(2_000));
-
-        // Keep the branch lighter than the trunk for now, so the trunk stays
-        // the best chain and the mark can advance.
-        let fork = easy_chain(&main[1_999], 50, 2_000);
-        chain.submit_bitcoin_headers(&fork, NOW)?;
-        assert_eq!(chain.best_fork()?, Some(0));
-
-        // Advance the main chain past the forkpoint: the mark reaches 3,132.
-        let rest = easy_chain(&canonical(&chain, 2_100), 1_132, 1);
-        chain.submit_bitcoin_headers(&rest, NOW)?;
-        assert_eq!(chain.tip_height()?, Some(3_232));
-        assert_eq!(chain.finalized_height()?, Some(3_132));
-
-        // Make the fork heavier than the main chain: it must not win.
-        let extension = easy_chain(&fork[49], 2_000, 3_000);
-        let out = chain.submit_bitcoin_headers(&extension, NOW)?;
-        assert_eq!(out.accepted, 2_000);
-        assert_eq!(chain.best_fork()?, Some(0), "the finality mark is a floor");
-        assert_eq!(chain.tip_height()?, Some(3_232));
-        assert_eq!(chain.finalized_height()?, Some(3_132));
         Ok(())
     }
 

@@ -279,25 +279,41 @@ The surfaces:
 
 ## Current coverage
 
-### `bitcoin-header-validation` (HDR-00 to HDR-08)
+### `bitcoin-header-validation` (HDR-00 and HDR-02 to HDR-10)
 
-`crates/core/specs/bitcoin_header_validation.rs` holds one scenario per
-requirement: `hdr_00_supported_networks` to `hdr_08_future_time`.
+`crates/core/specs/bitcoin_header_validation.rs` holds the tests
+`hdr_00_supported_networks` to `hdr_10_network_parameters`.
 `crates/core/specs/bitcoin_headers.rs` holds the HDR-04 and HDR-08 machines.
 
-### `bitcoin-header-chain` (BTC-00 to BTC-08)
+HDR-01 moved to `bitcoin-header-chain` as BTC-07. The unknown-parent scenario
+lives in `btc_07_forks`; `btc_06_contiguity` covers the link cases.
+
+Every HDR scenario has a `// Scenario:` assertion. `hdr_02_target_range` covers
+the zero target both as a zero mantissa and as a nonzero mantissa that
+truncates to zero. `hdr_06` covers both clamps at their exact bounds, and
+`hdr_10_network_parameters` pins the parameter table and the regtest period.
+
+### `bitcoin-header-chain` (BTC-00 to BTC-11)
 
 `crates/core/specs/bitcoin_header_chain.rs` holds the scenarios
-`btc_00_trusted_checkpoints` to `btc_08_outcome`, and the state machine
-`bitcoin_header_chain_matches_the_spec`.
+`btc_00_trusted_checkpoints` to `btc_11_prune_to_the_floor`, and the state
+machine `bitcoin_header_chain_matches_the_spec`.
 
 The machine delivers a 24-header universe: a trunk, a competing fork, a fork
 of a fork, a bad-PoW header, a stale-timestamp header, an out-of-range target,
 a wrong-bits header, and duplicate and empty batches. It submits at two caller
-clocks and checks the stored clock high-water mark. After every step it
+clocks. After every step it
 compares the full fork tree, every stored header row, the canonical chain and
 the outcome against the model. The model computes a header's work from the
 header itself, not through the crate helper.
+
+The open-time adopt and prune have their own scenarios:
+`btc_02_store_identity` (compare, adopt, ignore an entry above the tip),
+`btc_03_checkpoint_floor` (the gate and the testnet transition) and
+`btc_11_prune_to_the_floor` (fork purge, initial-chain prune, tip retention).
+`btc_11_legacy_ladder_is_pruned` covers a store that the old runtime ladder
+filled. The `Two ancestor forks` scenario has its own test:
+`btc_09_two_ancestor_forks`.
 
 ### Untrusted bytes
 
@@ -307,8 +323,9 @@ It runs under `cargo test`. `fuzz/` holds the coverage-guided equivalents.
 
 ### Finality and the Rootstock policy
 
-- `finality_and_fork_gate_matches_the_spec` — the mark and the fork gate on a
-  trunk of 240 blocks, delivered in runs.
+- `finality_matches_the_spec` — the mark on a trunk of 240 blocks, delivered
+  in runs. The chain path no longer gates on the mark; `bitcoin-finality` will
+  own the rule.
 - `the_finality_requirement_gates_the_mark` — mainnet estimated work does not
   clear, so the mark stays.
 - `rsk_checkpoint_policy_matches_the_spec` — proposals, the checkpoint attempt
@@ -366,17 +383,15 @@ A requirement added to a capability specification needs a matching scenario,
 a state machine transition, or an entry in this list.
 
 - The clockless connect path (`now: None`) inside the chain machine. The
-  machine submits at two explicit clocks; the clock floor and the chain clock
-  have unit tests only.
+  machine submits at two explicit clocks.
+- The finality rule still advances the mark inside the submit path. The chain
+  capability states no finality rule, and the chain path no longer gates on the
+  mark. `bitcoin-finality` owns it.
 - Variable per-block work inside the chain machine. Every valid header there
   carries the same `bits`, so fork choice by work equals fork choice by length.
-  The `btc_07` scenario covers a shorter but heavier fork on testnet.
-- A heavier fork that crosses the finality mark and would win. The finality
-  machine stores light forks only, so the admittance rule that refuses the
-  switch is not exercised. The `crosses_mark` comparison itself is killed by
-  the suite.
-- Median-time-past with fewer than 11 stored headers, and at a height where an
-  ancestor header is missing.
+  The `btc_09` scenario covers a shorter but heavier fork on testnet.
+- Median-time-past at a height where an ancestor header is missing from the
+  store.
 - The coinbase actions and the Rootstock actions inside the chain machine. They
   are tested by their own scenarios only. The coinbase prune on a best-fork
   switch has no test.

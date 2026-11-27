@@ -75,6 +75,9 @@ pub enum Error {
     #[error("fork at height {fork} is at or below the finality mark {finalized}")]
     ForkBelowFinalized { fork: u64, finalized: u64 },
 
+    #[error("fork at height {fork} is at or below the checkpoint floor {checkpoint}")]
+    ForkBelowCheckpoint { fork: u64, checkpoint: u64 },
+
     #[error("rootstock: {0}")]
     Rootstock(String),
 

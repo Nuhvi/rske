@@ -1,16 +1,14 @@
 //! Executable specification for the `bitcoin-header-chain` capability.
 //!
-//! The state machine checks BTC-02 to BTC-07 over a delivery universe with a
+//! The state machine checks BTC-04 to BTC-10 over a delivery universe with a
 //! trunk, a competing fork, a fork of a fork, a bad-PoW header, a
 //! stale-timestamp header, an out-of-range target header, duplicates and empty
-//! batches. BTC-03 skips the stored prefix and BTC-04 links the new run.
+//! batches. BTC-05 skips the stored prefix and BTC-06 links the new run.
 //!
 //! The per-header rules live in `bitcoin_header_validation.rs`: HDR-01, HDR-02,
 //! HDR-03 and HDR-07. The synthetic chain starts at a recent mainnet height
-//! and relaxes the proof-of-work limit, so it mines in no time. The mainnet
-//! estimated-work finality requirement is disabled because a synthetic chain
-//! cannot clear it. Each spec scenario carries a `// Scenario:` comment at the
-//! assertion that proves it.
+//! and relaxes the proof-of-work limit, so it mines in no time. Each spec
+//! scenario carries a `// Scenario:` comment at the assertion that proves it.
 //!
 //! Run just this capability's spec:
 //!
@@ -113,8 +111,6 @@ struct HeaderModel {
     universe: HeaderUniverse,
     forks: Vec<ModelFork>,
     best_fork: u64,
-    /// The stored high-water mark of the caller clock, when one was supplied.
-    now_hwm: Option<u64>,
     last: HeaderPrediction,
 }
 
@@ -201,7 +197,6 @@ impl ReferenceStateMachine for HeaderMachine {
             universe,
             forks: vec![root],
             best_fork: 0,
-            now_hwm: None,
             last: HeaderPrediction::Noop {
                 best_fork: 0,
                 tip_height: CHECKPOINT_HEIGHT,
@@ -224,7 +219,6 @@ impl ReferenceStateMachine for HeaderMachine {
     /// and HDR-01..HDR-03, HDR-07.
     fn apply(mut state: Self::State, transition: &Self::Transition) -> Self::State {
         let batch = &transition.batch;
-        let now = transition.now;
         let prev_best_fork = state.best_fork;
         let current_tip = state.forks[prev_best_fork as usize].tip_height();
         let headers: Vec<BitcoinHeader> =
@@ -314,13 +308,6 @@ impl ReferenceStateMachine for HeaderMachine {
             state.best_fork = target_fork;
         }
 
-        // The finality rule runs after a successful write and stores the clock it
-        // judged: the greatest value seen so far. The mark itself cannot move here,
-        // because the delivery universe stays inside the coinbase-maturity window.
-        if let Some(now) = now {
-            state.now_hwm = Some(state.now_hwm.map_or(now, |seen| seen.max(now)));
-        }
-
         let tip_height = state.forks[state.best_fork as usize].tip_height();
         state.last = HeaderPrediction::Connected {
             accepted: headers.len() - start,
@@ -332,12 +319,10 @@ impl ReferenceStateMachine for HeaderMachine {
     }
 }
 
-/// The SUT plus the history the invariants need: the canonical prefix at the
-/// mark the first time it was finalized, and the chainwork of the previous
-/// step.
+/// The SUT plus the chainwork of the previous step, for the monotonicity
+/// invariant.
 struct HeaderSut {
     core: Core,
-    finalized_prefix: Vec<BlockHash>,
     last_work: U256,
 }
 
@@ -348,11 +333,7 @@ impl StateMachineTest for HeaderMachine {
     fn init_test(model: &HeaderModel) -> HeaderSut {
         let core = mainnet_core(&[(CHECKPOINT_HEIGHT, model.universe.genesis)]);
         let last_work = work(&core);
-        HeaderSut {
-            core,
-            finalized_prefix: vec![model.universe.genesis.block_hash()],
-            last_work,
-        }
+        HeaderSut { core, last_work }
     }
 
     fn apply(mut sut: HeaderSut, model: &HeaderModel, transition: HeaderTransition) -> HeaderSut {
@@ -422,22 +403,6 @@ impl StateMachineTest for HeaderMachine {
             }
             (expected, other) => panic!("model expected {expected:?}, core returned {other:?}"),
         }
-
-        // The mark is monotone and the finalized prefix never moves.
-        let mark = after.finalized.expect("initialized store has a mark");
-        assert!(
-            mark >= before.finalized.unwrap_or(0),
-            "the finality mark regressed"
-        );
-        while CHECKPOINT_HEIGHT + sut.finalized_prefix.len() as u64 <= mark {
-            let height = CHECKPOINT_HEIGHT + sut.finalized_prefix.len() as u64;
-            let header = sut
-                .core
-                .header_at(height)
-                .expect("read")
-                .unwrap_or_else(|| panic!("no canonical header at {height}"));
-            sut.finalized_prefix.push(header.block_hash());
-        }
         sut.last_work = work(&sut.core);
         sut
     }
@@ -445,16 +410,11 @@ impl StateMachineTest for HeaderMachine {
     fn check_invariants(sut: &HeaderSut, model: &HeaderModel) {
         let state = sut.core.state().expect("state");
 
-        // The finality rule stores the clock it judged, and the mark cannot
-        // move while the tip is inside the coinbase-maturity window.
+        // BTC-00, BTC-11: the configured floor never moves on a submission.
         assert_eq!(
-            state.now_hwm, model.now_hwm,
-            "the clock high-water mark diverged"
-        );
-        assert_eq!(
-            state.finalized,
+            state.checkpoint_floor,
             Some(CHECKPOINT_HEIGHT),
-            "the mark moved inside the maturity window"
+            "the checkpoint floor moved"
         );
 
         // BTC-05, BTC-06: every fork's id, parent, forkpoint, tip height, tip
@@ -510,25 +470,6 @@ impl StateMachineTest for HeaderMachine {
             assert!(fork_work <= best_work, "the best fork is not the heaviest");
         }
 
-        // BTC-07: no admitted fork can move a height at or below the mark.
-        let mark = state.finalized.expect("initialized store has a mark");
-        assert!(mark <= best_fork.tip_height);
-        assert_eq!(
-            sut.finalized_prefix.len() as u64,
-            mark - CHECKPOINT_HEIGHT + 1
-        );
-        for (offset, expected) in sut.finalized_prefix.iter().enumerate() {
-            let height = CHECKPOINT_HEIGHT + offset as u64;
-            assert_eq!(
-                sut.core
-                    .header_at(height)
-                    .expect("read")
-                    .map(|header| header.block_hash()),
-                Some(*expected),
-                "height {height} is at or below the mark and moved"
-            );
-        }
-
         assert!(work(&sut.core) >= sut.last_work, "chainwork regressed");
         assert_eq!(
             state.rootstock,
@@ -538,7 +479,7 @@ impl StateMachineTest for HeaderMachine {
     }
 }
 
-// ── 2. Store identity (BTC-00, BTC-01) ──────────────────────────────────────
+// ── 2. Checkpoints and store identity (BTC-00 to BTC-03) ───────────────────
 
 /// BTC-00: opening an empty store initializes it with the trusted
 /// checkpoints.
@@ -584,8 +525,6 @@ fn btc_00_trusted_checkpoints() {
         + U256::from_be_slice(&header_work(&second).to_be_bytes());
     assert_eq!(root.tip_work, expected_work.to_be_bytes());
 
-    // Scenario: Initial finality mark
-    assert_eq!(state.finalized, Some(high));
     assert_eq!(canonical_chain(&core), vec![first, second]);
 
     // Scenario: Malformed checkpoint set
@@ -613,10 +552,41 @@ fn btc_00_trusted_checkpoints() {
     );
 }
 
-/// BTC-01: reopening compares the network and every stored checkpoint, and
+/// BTC-01: the trusted set starts at the network genesis and holds a header.
+#[test]
+fn btc_01_checkpoint_validity() {
+    let genesis = bitcoin::blockdata::constants::genesis_block(Network::Bitcoin).header;
+
+    // Scenario: A genesis-only set opens
+    // The public positional path accepts the real genesis and sets the floor.
+    let core = Core::new(Config::in_memory(Network::Bitcoin).with_trusted_checkpoints(&[genesis]))
+        .expect("a genesis-only set opens");
+    assert_eq!(core.state().expect("state").checkpoint_floor, Some(0));
+
+    // Scenario: First entry is not genesis
+    let bad = mine(BlockHash::all_zeros(), CHECKPOINT_TIME, 0);
+    let err = match Core::new(Config::in_memory(Network::Bitcoin).with_trusted_checkpoints(&[bad]))
+    {
+        Ok(_) => panic!("a non-genesis first entry must be refused"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, Error::CheckpointFormat { line: 0, .. }),
+        "got {err:?}"
+    );
+
+    // Scenario: Empty set
+    let err = match Core::new(Config::in_memory(Network::Bitcoin).with_trusted_checkpoints(&[])) {
+        Ok(_) => panic!("an empty set must be refused"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, Error::CheckpointFormat { .. }), "got {err:?}");
+}
+
+/// BTC-02: reopening compares the network and every stored checkpoint, and
 /// changes nothing.
 #[test]
-fn btc_01_store_identity() {
+fn btc_02_store_identity() {
     let path = std::env::temp_dir().join(format!(
         "rsk-core-btc-01-{}-identity.redb",
         std::process::id()
@@ -724,7 +694,7 @@ fn btc_01_store_identity() {
     // Sync the store past the next period boundary on a winning fork and verify
     // that reopening with a longer checkpoint set checks the canonical header
     // at `high + DIFFICULTY_PERIOD`.
-    let (synced_boundary, synced_state) = {
+    let (root_step, synced_boundary, synced_state) = {
         let core = open(&checkpoints).expect("open to sync");
         let root_step = mine(second.block_hash(), second.time + 1, 10);
         assert_eq!(expect_accepted(&core, &[root_step], None), 1);
@@ -743,7 +713,7 @@ fn btc_01_store_identity() {
         let boundary = *fork_run.last().expect("period boundary");
         let state = core.state().expect("state");
         assert_ne!(state.best_fork, Some(0), "the winning fork must be best");
-        (boundary, state)
+        (root_step, boundary, state)
     };
 
     let matching_longer = [
@@ -752,7 +722,31 @@ fn btc_01_store_identity() {
         (high + DIFFICULTY_PERIOD, synced_boundary),
     ];
     let core = open(&matching_longer).expect("reopen synced store with matching longer set");
-    assert_eq!(core.state().expect("state"), synced_state);
+    let adopted = core.state().expect("state");
+    // The new entry is adopted and the floor rises with it.
+    assert_eq!(adopted.checkpoint_floor, Some(high + DIFFICULTY_PERIOD));
+    assert_eq!(adopted.best_fork, synced_state.best_fork);
+    assert_eq!(
+        core.tip_height().expect("read"),
+        Some(high + DIFFICULTY_PERIOD)
+    );
+    // The initial chain's transient header below the new entry is pruned, so
+    // its tip falls back to the previous entry.
+    let root = adopted
+        .forks
+        .iter()
+        .find(|fork| fork.id == 0)
+        .expect("the initial chain");
+    assert_eq!(root.tip_height, high);
+    let stored: std::collections::HashSet<_> = core
+        .stored_headers()
+        .expect("read")
+        .map(|row| row.expect("row").hash)
+        .collect();
+    assert!(
+        !stored.contains(&root_step.block_hash()),
+        "the transient header is pruned"
+    );
     drop(core);
 
     let mismatching_longer = [
@@ -769,13 +763,71 @@ fn btc_01_store_identity() {
         Error::CheckpointMismatch { height, .. } if height == high + DIFFICULTY_PERIOD
     ));
     let core = open(&matching_longer).expect("reopen after the synced checkpoint refusal");
-    assert_eq!(core.state().expect("state"), synced_state);
+    assert_eq!(core.state().expect("state"), adopted);
     drop(core);
 
     let _ = std::fs::remove_file(&path);
 }
 
-// ── 3. Batch contract (BTC-02, BTC-03, BTC-04) ─────────────────────────────
+/// BTC-03: the checkpoint floor decides which forks a submission may start.
+#[test]
+fn btc_03_checkpoint_floor() {
+    let first = mine(BlockHash::all_zeros(), CHECKPOINT_TIME, 0);
+    let high = CHECKPOINT_HEIGHT + DIFFICULTY_PERIOD;
+    let second = mine(first.block_hash(), CHECKPOINT_TIME + 1, 0);
+    let core = mainnet_core(&[(CHECKPOINT_HEIGHT, first), (high, second)]);
+
+    // Extend the highest entry so it stops being the tip: only then can a
+    // submission fork from it.
+    // Scenario: First header above the floor
+    let above = mine(second.block_hash(), CHECKPOINT_TIME + 2, 100);
+    assert_eq!(expect_accepted(&core, &[above], None), 1);
+
+    // Scenario: Fork below the floor
+    let below = mine(first.block_hash(), CHECKPOINT_TIME + 3, 101);
+    let err = expect_err(&core, &[below], None);
+    assert!(
+        matches!(
+            err,
+            Error::ForkBelowCheckpoint { fork, checkpoint }
+                if fork == CHECKPOINT_HEIGHT + 1 && checkpoint == high
+        ),
+        "got {err:?}"
+    );
+
+    // Scenario: First fork above the floor
+    // The highest entry is not a tip, so a different first header forks it.
+    let sibling = mine(second.block_hash(), CHECKPOINT_TIME + 4, 102);
+    assert_eq!(expect_accepted(&core, &[sibling], None), 1);
+
+    // Scenario: Extension skips the floor
+    let next = mine(sibling.block_hash(), CHECKPOINT_TIME + 5, 103);
+    assert_eq!(expect_accepted(&core, &[next], None), 1);
+
+    // Scenario: Deep reorg above the floor
+    // The fork from the floor plus one is now strictly heavier.
+    assert_ne!(
+        core.state().expect("state").best_fork,
+        Some(0),
+        "the fork above the floor is best"
+    );
+
+    // Scenario: Floor at genesis
+    let genesis = mine(BlockHash::all_zeros(), CHECKPOINT_TIME, 200);
+    let core = mainnet_core(&[(CHECKPOINT_HEIGHT, genesis)]);
+    let child = mine(genesis.block_hash(), CHECKPOINT_TIME + 1, 201);
+    assert_eq!(expect_accepted(&core, &[child], None), 1);
+
+    // Scenario: Testnet first header after a long gap
+    // A normal parent at the floor; the long gap expects the limit bits.
+    let normal = 0x200c_cccc;
+    let parent = mine_with_bits(BlockHash::all_zeros(), CHECKPOINT_TIME, 300, normal);
+    let core = synthetic_mainnet_core(testnet_params(), &[(CHECKPOINT_HEIGHT, parent)]);
+    let slow = mine_with_bits(parent.block_hash(), parent.time + 1_201, 301, EASY_BITS);
+    assert_eq!(expect_accepted(&core, &[slow], None), 1);
+}
+
+// ── 3. Batch contract (BTC-04 to BTC-06) ───────────────────────────────────
 
 /// The initial checkpoint every chain test starts from.
 fn initial_checkpoint() -> BitcoinHeader {
@@ -804,10 +856,10 @@ fn store_with_trunk(count: usize) -> (Core, BitcoinHeader, Vec<BitcoinHeader>) {
     (core, checkpoint, trunk)
 }
 
-/// BTC-02: a refused submission changes nothing, and a failed fork leaves no
+/// BTC-04: a refused submission changes nothing, and a failed fork leaves no
 /// fork.
 #[test]
-fn btc_02_atomicity() {
+fn btc_04_atomicity() {
     let (core, _, trunk) = store_with_trunk(5);
     let before = core.state().expect("state");
     let stored = || {
@@ -847,9 +899,9 @@ fn btc_02_atomicity() {
     assert_eq!(stored(), stored_before, "a refused batch stored a header");
 }
 
-/// BTC-03: the store skips the stored prefix, and a no-op changes nothing.
+/// BTC-05: the store skips the stored prefix, and a no-op changes nothing.
 #[test]
-fn btc_03_idempotency() {
+fn btc_05_idempotency() {
     let (core, _, trunk) = store_with_trunk(6);
 
     // Scenario: Repeated prefix
@@ -915,9 +967,9 @@ fn btc_03_idempotency() {
     assert_eq!(branch_tip.tip_hash, new.block_hash().to_byte_array());
 }
 
-/// BTC-04: every new header names the header before it.
+/// BTC-06: every new header names the header before it.
 #[test]
-fn btc_04_contiguity() {
+fn btc_06_contiguity() {
     let (core, _, trunk) = store_with_trunk(8);
     let before = core.state().expect("state");
 
@@ -967,11 +1019,11 @@ fn btc_04_contiguity() {
     );
 }
 
-// ── 4. Tree (BTC-05, BTC-06) ───────────────────────────────────────────────
+// ── 4. Tree (BTC-07, BTC-08) ───────────────────────────────────────────────
 
-/// BTC-05: the parent block, not the tip, chooses the fork.
+/// BTC-07: the parent block, not the tip, chooses the fork.
 #[test]
-fn btc_05_forks() {
+fn btc_07_forks() {
     let (core, _, trunk) = store_with_trunk(6);
     let root_tip = *trunk.last().expect("trunk");
 
@@ -1157,10 +1209,10 @@ fn btc_05_forks() {
     );
 }
 
-/// BTC-06: the store keeps every header and every fork, and the tip work is
+/// BTC-08: the store keeps every header and every fork, and the tip work is
 /// the parent work plus the run's work.
 #[test]
-fn btc_06_stored_set() {
+fn btc_08_stored_set() {
     let (core, _, trunk) = store_with_trunk(6);
 
     // Scenario: Losing fork
@@ -1253,7 +1305,7 @@ fn btc_06_stored_set() {
     assert_eq!(root.tip_work, tip_work.to_be_bytes());
 }
 
-// ── 5. Best fork and outcome (BTC-07, BTC-08) ─────────────────────────────
+// ── 5. Best fork and outcome (BTC-09, BTC-10) ──────────────────────────────
 
 /// Submit `headers` and return the outcome, or panic.
 fn submitted(core: &Core, headers: &[BitcoinHeader], now: Option<u64>) -> SubmitBitcoinOutcome {
@@ -1263,10 +1315,10 @@ fn submitted(core: &Core, headers: &[BitcoinHeader], now: Option<u64>) -> Submit
     }
 }
 
-/// BTC-07: strict work decides, ties keep the incumbent, and the root fork can
+/// BTC-09: strict work decides, ties keep the incumbent, and the root fork can
 /// win back.
 #[test]
-fn btc_07_best_fork() {
+fn btc_09_best_fork() {
     let (core, initial, trunk) = store_with_trunk(4);
 
     // Scenario: Lighter stays
@@ -1396,9 +1448,62 @@ fn btc_07_best_fork() {
     );
 }
 
-/// BTC-08: the four chain outcome fields.
+/// BTC-09: the canonical chain resolves through two ancestor forks.
+///
+/// The best fork's rows start at its own forkpoint. Below it, the chain comes
+/// from its parent fork, and below that from the root fork. This is the walk
+/// that `header_at` performs through `ForkMeta::parent`.
 #[test]
-fn btc_08_outcome() {
+fn btc_09_two_ancestor_forks() {
+    let checkpoint = initial_checkpoint();
+    let core = mainnet_core(&[(CHECKPOINT_HEIGHT, checkpoint)]);
+
+    let root = contiguous(checkpoint, 5, 0);
+    assert_eq!(expect_accepted(&core, &root, None), 5);
+
+    // Fork A from root[1] (+2): headers at +3..+7, heavier than the root.
+    let a = contiguous(root[1], 5, 300);
+    assert_eq!(expect_accepted(&core, &a, None), 5);
+    let a_id = core
+        .locate(&a[0].block_hash())
+        .expect("read")
+        .expect("stored")
+        .0;
+    assert_eq!(core.state().expect("state").best_fork, Some(a_id));
+
+    // Fork B from A[1] (+4): headers at +5..+10, heavier than A.
+    let b = contiguous(a[1], 6, 400);
+    assert_eq!(expect_accepted(&core, &b, None), 6);
+    let b_id = core
+        .locate(&b[0].block_hash())
+        .expect("read")
+        .expect("stored")
+        .0;
+    assert_eq!(core.state().expect("state").best_fork, Some(b_id));
+
+    // Scenario: Two ancestor forks
+    // The canonical chain walks B, then A, then the root.
+    let expected: Vec<BitcoinHeader> = std::iter::once(checkpoint)
+        .chain(root[..2].iter().copied())
+        .chain(a[..2].iter().copied())
+        .chain(b.iter().copied())
+        .collect();
+    assert_eq!(canonical_chain(&core), expected);
+    assert_eq!(
+        core.tip_height().expect("read"),
+        Some(CHECKPOINT_HEIGHT + 10)
+    );
+    assert_eq!(
+        core.header_at(CHECKPOINT_HEIGHT + 5)
+            .expect("read")
+            .expect("the canonical header"),
+        b[0]
+    );
+}
+
+/// BTC-10: the four chain outcome fields.
+#[test]
+fn btc_10_outcome() {
     let (core, _, trunk) = store_with_trunk(4);
 
     // Scenario: Extend
@@ -1452,4 +1557,158 @@ prop_state_machine! {
     /// choice on the delivery universe.
     #[test]
     fn bitcoin_header_chain_matches_the_spec(sequential 1..32 => HeaderMachine);
+}
+
+/// BTC-11: a higher entry prunes the forks and initial-chain rows below it.
+#[test]
+fn btc_11_prune_to_the_floor() {
+    let path =
+        std::env::temp_dir().join(format!("rsk-core-btc-11-{}-prune.redb", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let open = |entries: &[(u64, BitcoinHeader)]| {
+        let mut params = mainnet_params();
+        params.no_pow_retargeting = true;
+        Core::new(
+            Config::open(&path, Network::Bitcoin)
+                .with_params(params)
+                .without_partition_safety()
+                .with_checkpoints(entries),
+        )
+        .expect("open")
+    };
+
+    let first = mine(BlockHash::all_zeros(), CHECKPOINT_TIME, 0);
+    let high = CHECKPOINT_HEIGHT + DIFFICULTY_PERIOD;
+    let core = open(&[(CHECKPOINT_HEIGHT, first)]);
+
+    // Sync the initial chain past the next period start, plus three headers.
+    let mut run = Vec::new();
+    let mut prev = first;
+    for i in 1..=DIFFICULTY_PERIOD as u32 + 3 {
+        let next = mine(prev.block_hash(), CHECKPOINT_TIME + i, 0);
+        run.push(next);
+        prev = next;
+    }
+    // A lighter fork from the first entry. Its tip is below the new entry.
+    let mut fork = Vec::new();
+    let mut prev = first;
+    for i in 1..=3u32 {
+        let next = mine(prev.block_hash(), CHECKPOINT_TIME + 10_000 + i, 900);
+        fork.push(next);
+        prev = next;
+    }
+    assert_eq!(expect_accepted(&core, &run, None), run.len());
+    assert_eq!(expect_accepted(&core, &fork, None), fork.len());
+    // A synced boundary never extends the trusted set.
+    assert_eq!(
+        core.state().expect("state").checkpoint_floor,
+        Some(CHECKPOINT_HEIGHT)
+    );
+    let entry = run[(DIFFICULTY_PERIOD - 1) as usize];
+    let tip = *run.last().expect("tip");
+    drop(core);
+
+    // Scenario: Higher checkpoint
+    // Scenario: Matching header pruned
+    // Scenario: Tip stays
+    let core = open(&[(CHECKPOINT_HEIGHT, first), (high, entry)]);
+    let state = core.state().expect("state");
+
+    assert_eq!(state.checkpoint_floor, Some(high));
+    assert_eq!(core.tip_height().expect("read"), Some(high + 3));
+    assert_eq!(state.forks.len(), 1, "the lighter fork is pruned");
+    assert_eq!(state.forks[0].id, 0);
+    assert_eq!(state.best_fork, Some(0));
+
+    let stored: Vec<_> = core
+        .stored_headers()
+        .expect("read")
+        .map(|row| row.expect("row"))
+        .collect();
+    // The two entries and the three canonical headers above the new entry.
+    assert_eq!(stored.len(), 5);
+    assert!(
+        stored
+            .iter()
+            .all(|row| row.height == CHECKPOINT_HEIGHT || row.height == high || row.height > high),
+        "an initial-chain header below the entry survived"
+    );
+    assert!(
+        core.header_at(CHECKPOINT_HEIGHT + 1)
+            .expect("read")
+            .is_none(),
+        "the matching header below the entry is pruned"
+    );
+    assert_eq!(
+        core.header_at(high + 3)
+            .expect("read")
+            .map(|h| h.block_hash()),
+        Some(tip.block_hash())
+    );
+    drop(core);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The open prunes a legacy runtime-ladder entry even when the configuration
+/// does not add a higher one.
+#[test]
+fn btc_11_legacy_ladder_is_pruned() {
+    let path = std::env::temp_dir().join(format!(
+        "rsk-core-btc-11-{}-legacy.redb",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let open = |entries: &[(u64, BitcoinHeader)]| {
+        let mut params = mainnet_params();
+        params.no_pow_retargeting = true;
+        Core::new(
+            Config::open(&path, Network::Bitcoin)
+                .with_params(params)
+                .without_partition_safety()
+                .with_checkpoints(entries),
+        )
+        .expect("open")
+    };
+
+    let first = mine(BlockHash::all_zeros(), CHECKPOINT_TIME, 0);
+    let high = CHECKPOINT_HEIGHT + DIFFICULTY_PERIOD;
+    let core = open(&[(CHECKPOINT_HEIGHT, first)]);
+    let mut run = Vec::new();
+    let mut prev = first;
+    for i in 1..=DIFFICULTY_PERIOD as u32 + 3 {
+        let next = mine(prev.block_hash(), CHECKPOINT_TIME + i, 0);
+        run.push(next);
+        prev = next;
+    }
+    let mut fork = Vec::new();
+    let mut prev = first;
+    for i in 1..=3u32 {
+        let next = mine(prev.block_hash(), CHECKPOINT_TIME + 10_000 + i, 900);
+        fork.push(next);
+        prev = next;
+    }
+    assert_eq!(expect_accepted(&core, &run, None), run.len());
+    assert_eq!(expect_accepted(&core, &fork, None), fork.len());
+    let entry = run[(DIFFICULTY_PERIOD - 1) as usize];
+
+    // Simulate the old runtime ladder: insert the boundary as a trusted row
+    // without a higher configured entry.
+    {
+        let txn = core.store.write().expect("write");
+        txn.put_checkpoint_rows(&[(high, entry)]).expect("insert");
+        txn.commit().expect("commit");
+    }
+    drop(core);
+
+    let core = open(&[(CHECKPOINT_HEIGHT, first)]);
+    let state = core.state().expect("state");
+    assert_eq!(state.checkpoint_floor, Some(high), "the stored floor wins");
+    assert_eq!(
+        state.forks.len(),
+        1,
+        "the fork below the stored floor is pruned"
+    );
+    assert_eq!(core.tip_height().expect("read"), Some(high + 3));
+    drop(core);
+    let _ = std::fs::remove_file(&path);
 }

@@ -63,12 +63,12 @@ pub struct Config {
     /// difficulty rules on a chain that is cheap to mine. A production node
     /// must keep this enabled.
     pub partition_safety: bool,
-    /// The trusted checkpoints this store starts from.
+    /// The trusted checkpoints fixed at each open.
     ///
-    /// The crate chooses them, so nothing outside `rsk-core` can change them:
-    /// the embedded trusted checkpoints on mainnet, genesis on every other
-    /// network, and an explicit list in tests. A store that already holds a
-    /// checkpoint at a configured height must agree with it.
+    /// The embedded set on mainnet, genesis on every other network, or a
+    /// caller list. Entry `k` sits at `k * DIFFICULTY_PERIOD`. The store
+    /// adopts the entries a shorter set left behind; a submission never
+    /// extends the set.
     checkpoints: CheckpointSource,
 }
 
@@ -78,7 +78,10 @@ pub(crate) enum CheckpointSource {
     /// The trusted checkpoints compiled into the crate: the embedded set on
     /// mainnet, genesis on every other network.
     Embedded,
-    /// An explicit list. Tests set it; production code cannot.
+    /// A caller list, with heights resolved from the position.
+    List(Vec<(u64, BitcoinHeader)>),
+    /// An explicit list at explicit heights. Test-only: the synthetic fixtures
+    /// start at a recent height instead of genesis.
     #[cfg(test)]
     Explicit(Vec<(u64, BitcoinHeader)>),
 }
@@ -108,19 +111,58 @@ impl Config {
 
     /// The trusted checkpoints for this configuration, resolved for its network.
     pub(crate) fn resolve_checkpoints(&self) -> Result<Vec<(u64, BitcoinHeader)>, Error> {
-        match &self.checkpoints {
+        let entries = match &self.checkpoints {
             #[cfg(test)]
-            CheckpointSource::Explicit(entries) => Ok(entries.clone()),
+            CheckpointSource::Explicit(entries) => return Ok(entries.clone()),
+            CheckpointSource::List(entries) => entries.clone(),
             CheckpointSource::Embedded => match self.params.network {
-                Network::Bitcoin => crate::btc::checkpoints::parse(),
-                network => Ok(vec![(0, genesis_block(network).header)]),
+                Network::Bitcoin => crate::btc::checkpoints::parse()?,
+                network => vec![(0, genesis_block(network).header)],
             },
+        };
+        Self::validate_trusted(&entries, self.params.network)?;
+        Ok(entries)
+    }
+
+    /// Check the set shape that the public paths must satisfy: one header per
+    /// difficulty period from the network genesis.
+    fn validate_trusted(entries: &[(u64, BitcoinHeader)], network: Network) -> Result<(), Error> {
+        let Some((height, first)) = entries.first() else {
+            return Err(Error::CheckpointFormat {
+                line: 0,
+                detail: "empty checkpoint set".into(),
+            });
+        };
+        if *height != 0 || first.block_hash() != genesis_block(network).header.block_hash() {
+            return Err(Error::CheckpointFormat {
+                line: 0,
+                detail: "entry zero is not the network genesis".into(),
+            });
         }
+        Ok(())
+    }
+
+    /// Fix the trusted checkpoints to a list of period-start headers.
+    ///
+    /// Entry `k` sits at height `k * DIFFICULTY_PERIOD`; entry zero must be the
+    /// network genesis. The open adopts the entries that a shorter set left
+    /// behind, and a submission never extends the set.
+    pub fn with_trusted_checkpoints(mut self, headers: &[BitcoinHeader]) -> Self {
+        let period = crate::DIFFICULTY_PERIOD;
+        self.checkpoints = CheckpointSource::List(
+            headers
+                .iter()
+                .enumerate()
+                .map(|(k, header)| (k as u64 * period, *header))
+                .collect(),
+        );
+        self
     }
 
     /// Replace the embedded trusted checkpoints with an explicit list.
     ///
-    /// Test-only: the checkpoints are a crate decision, not a runtime option.
+    /// Test-only: the synthetic fixtures start at a recent height instead of
+    /// genesis, so they keep explicit heights and skip the genesis check.
     #[cfg(test)]
     pub(crate) fn with_checkpoints(mut self, entries: &[(u64, BitcoinHeader)]) -> Self {
         self.checkpoints = CheckpointSource::Explicit(entries.to_vec());
@@ -280,6 +322,7 @@ impl Core {
             network: txn.network()?,
             best_fork: txn.best_fork()?,
             finalized: txn.finalized_height()?,
+            checkpoint_floor: txn.checkpoint_floor()?,
             now_hwm: txn.now_hwm()?,
             forks,
             rootstock: RskState {
@@ -394,6 +437,8 @@ pub struct CoreState {
     pub network: Option<Network>,
     pub best_fork: Option<u64>,
     pub finalized: Option<u64>,
+    /// The height of the highest stored trusted checkpoint.
+    pub checkpoint_floor: Option<u64>,
     pub now_hwm: Option<u64>,
     pub forks: Vec<ForkState>,
     pub rootstock: RskState,

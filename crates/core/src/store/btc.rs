@@ -24,9 +24,9 @@ const BTC_HEADERS: TableDefinition<(u64, u64), BtcRow> = TableDefinition::new("b
 const BTC_HASH_LOC: TableDefinition<&[u8], (u64, u64)> = TableDefinition::new("btc_hash_loc");
 /// Fork metadata: `fork_id → ForkMeta`.
 const BTC_FORKS: TableDefinition<u64, ForkMeta> = TableDefinition::new("btc_forks");
-/// The checkpoint table: one header per difficulty-period boundary, never
-/// pruned. It starts with the trusted checkpoints and grows with validated
-/// root-chain boundaries. It is the cheap whole-chain work ladder.
+/// The checkpoint table: the trusted set as configured at the last open, one
+/// header per difficulty period. A submission never grows it; an open adopts a
+/// higher configured entry and prunes what that entry leaves behind.
 const BTC_CHECKPOINTS: TableDefinition<u64, BtcHeader> = TableDefinition::new("btc_checkpoints");
 /// Canonical coinbase transactions and their BIP37 merkle proofs, keyed by
 /// height. The row carries the block hash so a reorg can be detected.
@@ -411,6 +411,30 @@ macro_rules! btc_read_methods {
             }
         }
 
+        /// The trusted checkpoint header stored at `height`, if any.
+        pub(crate) fn checkpoint_at(&self, height: u64) -> Result<Option<BitcoinHeader>, Error> {
+            let table = self.txn.open_table(BTC_CHECKPOINTS)?;
+            Ok(table.get(height)?.map(|v| v.value().0))
+        }
+
+        /// Every fork's metadata, by id, for the whole-state view.
+        pub(crate) fn all_forks(&self) -> Result<Vec<(u64, ForkMeta)>, Error> {
+            let forks = self.txn.open_table(BTC_FORKS)?;
+            let mut out = Vec::new();
+            for item in forks.iter()? {
+                let (id, meta) = item?;
+                out.push((id.value(), meta.value()));
+            }
+            out.sort_by_key(|(id, _)| *id);
+            Ok(out)
+        }
+
+        /// The height of the highest stored trusted checkpoint, if any.
+        pub(crate) fn checkpoint_floor(&self) -> Result<Option<u64>, Error> {
+            let table = self.txn.open_table(BTC_CHECKPOINTS)?;
+            Ok(table.last()?.map(|(height, _)| height.value()))
+        }
+
         /// The finality mark, if the store is initialized. Monotonic: only the
         /// submit path
         /// advances it, and only forward.
@@ -487,12 +511,6 @@ impl super::Store {
 impl ReadTxn {
     btc_read_methods!();
 
-    /// The trusted checkpoint header stored at `height`, if any.
-    pub(crate) fn checkpoint_at(&self, height: u64) -> Result<Option<BitcoinHeader>, Error> {
-        let table = self.txn.open_table(BTC_CHECKPOINTS)?;
-        Ok(table.get(height)?.map(|v| v.value().0))
-    }
-
     /// The first stored header on `fork_id` in `from_height..=tip_height`.
     pub(crate) fn next_stored_header(
         &self,
@@ -507,18 +525,6 @@ impl ReadTxn {
         };
         let (key, row) = item?;
         Ok(Some((key.value().1, row.value().header)))
-    }
-
-    /// Every fork's metadata, by id, for the whole-state view.
-    pub(crate) fn all_forks(&self) -> Result<Vec<(u64, ForkMeta)>, Error> {
-        let forks = self.txn.open_table(BTC_FORKS)?;
-        let mut out = Vec::new();
-        for item in forks.iter()? {
-            let (id, meta) = item?;
-            out.push((id.value(), meta.value()));
-        }
-        out.sort_by_key(|(id, _)| *id);
-        Ok(out)
     }
 
     /// Number of live forks (test-only).
@@ -676,8 +682,9 @@ impl WriteTxn {
 
     /// Append a contiguous run of headers to a fork in this transaction. Each
     /// entry carries its cumulative work (through that header, on this fork).
-    /// Period-boundary heights on the root chain also extend the checkpoint
-    /// table.
+    ///
+    /// The checkpoint table stays as the configured set. A synced boundary is
+    /// an ordinary header row and never becomes a trusted checkpoint.
     pub(crate) fn put_headers(
         &self,
         fork_id: u64,
@@ -689,7 +696,6 @@ impl WriteTxn {
         {
             let mut headers = self.txn.open_table(BTC_HEADERS)?;
             let mut hash_loc = self.txn.open_table(BTC_HASH_LOC)?;
-            let mut checkpoints = self.txn.open_table(BTC_CHECKPOINTS)?;
             let mut forks = self.txn.open_table(BTC_FORKS)?;
             for &(height, header, cum) in entries {
                 headers.insert(
@@ -703,11 +709,6 @@ impl WriteTxn {
                     header.block_hash().as_byte_array().as_slice(),
                     (fork_id, height),
                 )?;
-                // Extend the checkpoint table when the root chain crosses a
-                // period boundary (the table stays a full-chain work ladder).
-                if fork_id == 0 && height % DIFFICULTY_PERIOD == 0 {
-                    checkpoints.insert(height, BtcHeader(*header))?;
-                }
             }
             let last = entries.last().expect("checked non-empty above");
             let last_hash = last.1.block_hash();
@@ -720,6 +721,142 @@ impl WriteTxn {
             let meta = meta.expect("fork meta must exist before appending headers");
             forks.insert(fork_id, meta)?;
         }
+        Ok(())
+    }
+
+    /// Adopt trusted checkpoint rows into an existing store. The header rows
+    /// already exist; only the checkpoint table changes.
+    pub(crate) fn put_checkpoint_rows(
+        &self,
+        entries: &[(u64, BitcoinHeader)],
+    ) -> Result<(), Error> {
+        let mut checkpoints = self.txn.open_table(BTC_CHECKPOINTS)?;
+        for (height, header) in entries {
+            checkpoints.insert(*height, BtcHeader(*header))?;
+        }
+        Ok(())
+    }
+
+    /// Drop every fork that does not carry the highest entry, and every header
+    /// below it that is not an entry. Then make the heaviest survivor best and
+    /// drop the coinbase rows that stopped being canonical.
+    pub(crate) fn prune_to_floor(&self) -> Result<(), Error> {
+        let Some(entry_height) = self.checkpoint_floor()? else {
+            return Ok(());
+        };
+        let Some(entry) = self.checkpoint_at(entry_height)? else {
+            return Ok(());
+        };
+        let entry_hash = entry.block_hash();
+
+        for (fork, meta) in self.all_forks()? {
+            if fork == 0 {
+                continue;
+            }
+            let carries = self
+                .header_at(fork, entry_height)?
+                .is_some_and(|header| header.block_hash() == entry_hash);
+            if !carries {
+                self.remove_fork_rows(fork, meta.forkpoint, meta.tip_height)?;
+                let mut forks = self.txn.open_table(BTC_FORKS)?;
+                forks.remove(fork)?;
+            }
+        }
+
+        let stale: Vec<(u64, BlockHash)> = {
+            let headers = self.txn.open_table(BTC_HEADERS)?;
+            let mut stale = Vec::new();
+            for item in headers.range((0u64, 0u64)..(0u64, entry_height))? {
+                let (key, row) = item?;
+                let height = key.value().1;
+                if self.checkpoint_at(height)?.is_none() {
+                    stale.push((height, row.value().header.block_hash()));
+                }
+            }
+            stale
+        };
+        for (height, hash) in stale {
+            self.remove_header_row(0, height, hash)?;
+        }
+
+        // The prune can remove the initial chain's tip. Move the tip down to
+        // the highest row that remains.
+        if let Some(mut meta) = self.fork_meta(0)?
+            && self.header_at(0, meta.tip_height)?.is_none()
+        {
+            let last = {
+                let headers = self.txn.open_table(BTC_HEADERS)?;
+                let mut last = None;
+                for item in headers.range((0u64, 0u64)..=(0u64, entry_height))? {
+                    let (key, row) = item?;
+                    last = Some((
+                        key.value().1,
+                        row.value().header.block_hash(),
+                        row.value().work,
+                    ));
+                }
+                last
+            };
+            if let Some((height, hash, work)) = last {
+                meta.tip_height = height;
+                meta.tip_hash = hash;
+                meta.tip_work = work;
+            }
+            let mut forks = self.txn.open_table(BTC_FORKS)?;
+            forks.insert(0, meta)?;
+        }
+
+        let zero = || Work::from_be_bytes([0; 32]);
+        let mut best = self.best_fork()?;
+        if let Some(fork) = best
+            && self.fork_meta(fork)?.is_none()
+        {
+            best = None;
+        }
+        let mut best_work = match best {
+            Some(fork) => self.fork_chainwork(fork)?.unwrap_or_else(zero),
+            None => zero(),
+        };
+        for (fork, _) in self.all_forks()? {
+            let work = self.fork_chainwork(fork)?.unwrap_or_else(zero);
+            if best.is_none() || work > best_work {
+                best = Some(fork);
+                best_work = work;
+            }
+        }
+        if let Some(fork) = best {
+            self.set_best_fork(fork)?;
+        }
+        self.prune_non_canonical_coinbases()?;
+        Ok(())
+    }
+
+    fn remove_fork_rows(&self, fork: u64, from: u64, tip: u64) -> Result<(), Error> {
+        if tip < from {
+            return Ok(());
+        }
+        let rows: Vec<(u64, BlockHash)> = {
+            let headers = self.txn.open_table(BTC_HEADERS)?;
+            let mut out = Vec::new();
+            for item in headers.range((fork, from)..=(fork, tip))? {
+                let (key, row) = item?;
+                out.push((key.value().1, row.value().header.block_hash()));
+            }
+            out
+        };
+        for (height, hash) in rows {
+            self.remove_header_row(fork, height, hash)?;
+        }
+        Ok(())
+    }
+
+    fn remove_header_row(&self, fork: u64, height: u64, hash: BlockHash) -> Result<(), Error> {
+        {
+            let mut headers = self.txn.open_table(BTC_HEADERS)?;
+            headers.remove((fork, height))?;
+        }
+        let mut hash_loc = self.txn.open_table(BTC_HASH_LOC)?;
+        hash_loc.remove(hash.as_byte_array().as_slice())?;
         Ok(())
     }
 

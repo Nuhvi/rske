@@ -226,8 +226,8 @@ its checkpoint row. It then prunes against the highest stored entry:
 - every fork whose block at that entry differs from the entry or is absent,
   with its `btc_forks` row and every `btc_headers` and `btc_hash_loc` row on
   it;
-- every `btc_headers` and `btc_hash_loc` row below the entry that is not an
-  entry.
+- every `btc_headers` and `btc_hash_loc` row of fork 0 below the entry that
+  is not an entry.
 
 The prune leaves fork 0 and every fork that branches above the entry; those
 carry the entry through their ancestors. It makes the heaviest surviving fork
