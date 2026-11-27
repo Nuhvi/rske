@@ -1,4 +1,4 @@
-# bitcoin-header-validation Specification
+# Spec Delta
 
 ## Purpose
 Defines which Bitcoin headers the core accepts. The core is a header-only
