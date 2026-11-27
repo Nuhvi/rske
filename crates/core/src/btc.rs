@@ -265,13 +265,14 @@ impl Core {
                     }
                 }
 
-                // Adopt the entries above the stored floor, then prune the
-                // forks and headers that the higher entry leaves behind.
+                // Adopt every entry at or below the tip. The comparison above
+                // proved each one matches the stored header, so rewriting an
+                // entry the store already holds is a no-op. Then prune the
+                // forks and headers that the highest entry leaves behind.
                 let txn = self.store.write()?;
-                let floor = txn.checkpoint_floor()?;
                 let adopted: Vec<(u64, BitcoinHeader)> = entries
                     .iter()
-                    .filter(|(height, _)| *height <= tip && floor.is_none_or(|f| *height > f))
+                    .filter(|(height, _)| *height <= tip)
                     .copied()
                     .collect();
                 if !adopted.is_empty() {
