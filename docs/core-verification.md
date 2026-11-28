@@ -188,7 +188,10 @@ protocol, not for this deterministic core.
 ## Layer 4: mutation testing
 
 `cargo-mutants` changes the code and runs the tests. A mutant that survives
-shows code no test constrains.
+shows code no test constrains. A mutant that hangs is a kill: the suite
+constrains the code by not terminating. `cargo-mutants` reports a hang as a
+timeout and exits with code 3. The workflow accepts a run whose only problem
+is a timeout.
 
 Run one file at a time. Do not mutate the whole workspace; it takes hours and
 most survivors are untestable I/O.
@@ -206,6 +209,14 @@ cargo mutants --in-diff pr.diff -p rsk-core -- --lib
 
 Three dots compare against the merge base. Two dots also report the commits
 that landed on `master` after the branch point.
+
+`scripts/mutants.sh` runs the same check from the repository root:
+
+```bash
+scripts/mutants.sh                    # list the mutants in the diff
+scripts/mutants.sh --run              # run them, about one minute for each
+scripts/mutants.sh --run --shard 0/4  # run one quarter
+```
 
 The `verify` workflow runs the same check on a pull request, and on demand.
 For a dispatch, select the branch, and set `base` to the branch that the change
