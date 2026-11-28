@@ -15,7 +15,8 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 // The error enum deliberately mirrors redb's error types (`thiserror`), which
 // makes `Result<_, Error>` larger than clippy's default threshold. That shape
-// is intentional (see CONTRIBUTING.md); every fallible method returns it.
+// is intentional (see docs/core-verification.md); every fallible method returns
+// it.
 #![allow(clippy::result_large_err)]
 
 pub mod btc;
@@ -31,7 +32,7 @@ mod specs;
 pub use btc::finality::{COINBASE_MATURITY, FinalityStatus, is_checkpoint};
 pub use btc::validation::MEDIAN_TIME_PAST;
 pub use btc::{
-    Coinbase, CoinbaseTag, CoinbaseTags, ConnectOutcome, FinalizedCheckpoints, bip34_height,
+    Coinbase, CoinbaseTag, CoinbaseTags, FinalizedCheckpoints, SubmitBitcoinOutcome, bip34_height,
     header_work,
 };
 pub use core::{
@@ -40,8 +41,8 @@ pub use core::{
 };
 pub use error::Error;
 pub use rsk::{
-    EphemeralChainCheckpoint, FIVE_SIGMA_ALPHA, HeaderRef, RootScore, RskConnectOutcome, RskEntry,
-    RskHeadersBack, Scoreboard, Share, WORK_EQUIVALENT_BLOCKS, min_tags_for_fraud_proof,
+    EphemeralChainCheckpoint, FIVE_SIGMA_ALPHA, HeaderRef, RootScore, RskEntry, RskHeadersBack,
+    RskSubmitOutcome, Scoreboard, Share, WORK_EQUIVALENT_BLOCKS, min_tags_for_fraud_proof,
     oldest_checkpoint, required_endorsements, score,
 };
 pub use rsk_consensus::validation::merged_mining::Tag;

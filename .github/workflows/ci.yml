@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The crates use no `#![feature]`; keep the toolchain fixed so a new stable
+  # release cannot change the result under us.
+  RUST_VERSION: "1.99.1"
+
+jobs:
+  lint:
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      # The vendored crates are reported, not fatal.
+      - name: Clippy (workspace)
+        run: cargo clippy --workspace --all-targets
+
+      - name: Clippy (deny warnings on our crates)
+        run: cargo clippy -p rsk-core -p rsk --all-targets -- -D warnings
+
+  test:
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      - name: Tests
+        run: cargo nextest run --workspace
+
+      # nextest does not run documentation tests.
+      - name: Doc tests
+        run: cargo test --workspace --doc

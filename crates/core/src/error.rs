@@ -24,22 +24,22 @@ pub enum Error {
     #[error("commit error: {0}")]
     Commit(#[from] redb::CommitError),
 
-    #[error("no chain seeded: the store has no anchor and the configuration supplied none")]
-    Unseeded,
+    #[error("no chain: the store has no trusted checkpoints and the configuration supplied none")]
+    NoChain,
 
     #[error(
         "stored checkpoint at height {height} is {stored}; the configuration supplies {configured}"
     )]
-    AnchorMismatch {
+    CheckpointMismatch {
         height: u64,
         stored: BlockHash,
         configured: BlockHash,
     },
 
-    #[error("malformed checkpoint line {line}: {detail}")]
+    #[error("malformed trusted checkpoint line {line}: {detail}")]
     CheckpointFormat { line: usize, detail: String },
 
-    #[error("unknown ancestor {0}: the batch does not link to any stored header or checkpoint")]
+    #[error("unknown ancestor {0}: the batch does not link to any stored header")]
     UnknownAncestor(BlockHash),
 
     #[error("bad proof of work at height {height}: {detail}")]
@@ -66,11 +66,17 @@ pub enum Error {
     #[error("header at height {height} does not link to {expected}")]
     LinkBreak { height: u64, expected: BlockHash },
 
-    #[error("chain was seeded for {seeded}, not {opened}")]
-    NetworkMismatch { seeded: Network, opened: Network },
+    #[error("store was initialized for {stored}, not {opened}")]
+    NetworkMismatch { stored: Network, opened: Network },
+
+    #[error("network {0} is not supported; use mainnet, testnet3, or regtest")]
+    UnsupportedNetwork(Network),
 
     #[error("fork at height {fork} is at or below the finality mark {finalized}")]
     ForkBelowFinalized { fork: u64, finalized: u64 },
+
+    #[error("fork at height {fork} is at or below the checkpoint floor {checkpoint}")]
+    ForkBelowCheckpoint { fork: u64, checkpoint: u64 },
 
     #[error("rootstock: {0}")]
     Rootstock(String),

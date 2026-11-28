@@ -451,7 +451,7 @@ fn commit(core: &Core, entries: &[RskEntry]) -> Result<()> {
     core.propose_checkpoint(root)
         .with_context(|| format!("rooting the IBD header at #{}", root.header.number))?;
     if entries.len() > 1 {
-        core.connect_rsk_headers_without_uncles(&entries[1..])
+        core.submit_rsk_headers_without_uncles(&entries[1..])
             .with_context(|| format!("connecting {} RSK headers", entries.len() - 1))?;
     }
     Ok(())

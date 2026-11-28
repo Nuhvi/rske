@@ -1,9 +1,9 @@
 //! Persistent Bitcoin + Rootstock chain state, backed by redb.
 //!
 //! This is the *state* of the side-effect-free core. The Bitcoin side is a
-//! **tree of chains** (forks), each with a `forkpoint` and a `parent`, plus a
-//! trusted **checkpoint spine** (one header per difficulty period) that makes
-//! the whole chain's work computable without holding every block. The Rootstock
+//! **tree of chains** (forks), each with a `forkpoint` and a `parent`, plus the
+//! **trusted checkpoints** and their table (one header per difficulty period)
+//! that make the whole chain's work computable without holding every block. The Rootstock
 //! side is a **forest** of trees, each rooted at a proposed checkpoint block.
 //! Header validation lives in [`crate::rsk`] and [`crate::btc`]. Tests construct
 //! the store with the redb **in-memory** backend, so the exact same code path

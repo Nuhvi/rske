@@ -1,10 +1,10 @@
 //! The Bitcoin header sync: download, validate and store the tail above the
-//! anchor, overlapping the fetch with validation.
+//! trusted checkpoints, overlapping the fetch with validation.
 //!
 //! Headers come from a small pool of peers, round-robining across all of them
 //! with the next batch prefetched while the current one validates. The store is
 //! durable, so a re-run resumes from the tip. Every header is validated by
-//! [`rsk_core::Core::connect_headers`]; this module only moves bytes.
+//! [`rsk_core::Core::submit_bitcoin_headers`]; this module only moves bytes.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -61,8 +61,8 @@ fn fmt_safety(status: &FinalityStatus) -> String {
 }
 
 /// The finality state a run starts from. The mark is the anchor of the next
-/// requirement: a fresh store starts at the seeded checkpoint, a resumed one at the
-/// newest mark it already finalized.
+/// requirement: a fresh store starts at the initial trusted checkpoint, a
+/// resumed one at the newest mark it already finalized.
 fn log_finality_start(core: &Core, now: u64) -> Result<()> {
     let Some(mark) = core.finalized_height()? else {
         return Ok(());
@@ -74,7 +74,7 @@ fn log_finality_start(core: &Core, now: u64) -> Result<()> {
     let age = fmt_age(now.saturating_sub(header.time as u64));
     if tip == mark {
         info!(
-            "finality: mark #{mark} (age {age}) is the seed checkpoint; \
+            "finality: mark #{mark} (age {age}) is the initial trusted checkpoint; \
              the first requirement is measured from it"
         );
     } else {
@@ -323,15 +323,15 @@ pub(crate) fn run(
 
         let first = core.tip_height()?.unwrap_or(0) + 1;
         let now = unix_now();
-        let out = core.connect_headers(&headers, now)?;
+        let out = core.submit_bitcoin_headers(&headers, now)?;
         stats.batches += 1;
-        stats.total += out.connected;
+        stats.total += out.accepted;
         stats.last_status = out.finality;
         stats
             .works
-            .push(core.chainwork()?.context("chainwork after connect")?);
-        let tip = core.tip_height()?.context("tip after connect")?;
-        let seen = first + out.connected as u64 - 1;
+            .push(core.chainwork()?.context("chainwork after submission")?);
+        let tip = core.tip_height()?.context("tip after submission")?;
+        let seen = first + out.accepted as u64 - 1;
 
         // Every mark advance is reported, whenever it happens. The first one
         // also says whether the run looks partitioned.
@@ -523,9 +523,9 @@ mod tests {
     use super::*;
     use bitcoin::Network;
 
-    /// A temp store anchored on the embedded spine. The temp dir must outlive
-    /// the store.
-    fn anchored() -> (tempfile::TempDir, Core) {
+    /// A temp store initialized with the embedded trusted checkpoints. The temp
+    /// dir must outlive the store.
+    fn initialized() -> (tempfile::TempDir, Core) {
         let dir = tempfile::tempdir().unwrap();
         let core = Core::open(&dir.path().join("chain.redb"), Network::Bitcoin).unwrap();
         (dir, core)
@@ -533,14 +533,17 @@ mod tests {
 
     #[test]
     fn locator_is_the_tip_then_genesis() {
-        let (_dir, core) = anchored();
-        let spine = rsk_core::btc::checkpoints::parse().unwrap();
+        let (_dir, core) = initialized();
+        let checkpoints = rsk_core::btc::checkpoints::parse().unwrap();
 
         // Only the tip boundary is within the last ten heights; genesis is
         // always appended as the fallback.
         let loc = locator(&core).unwrap();
-        assert_eq!(loc.first(), Some(&spine.last().unwrap().1.block_hash()));
-        assert_eq!(loc.last(), Some(&spine[0].1.block_hash()));
+        assert_eq!(
+            loc.first(),
+            Some(&checkpoints.last().unwrap().1.block_hash())
+        );
+        assert_eq!(loc.last(), Some(&checkpoints[0].1.block_hash()));
         assert_eq!(loc.len(), 2);
     }
 }

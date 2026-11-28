@@ -59,9 +59,8 @@ impl Chain {
     pub(crate) fn for_network(network: bitcoin::Network) -> Option<Self> {
         match network {
             bitcoin::Network::Bitcoin => Some(Chain::Mainnet),
-            bitcoin::Network::Testnet | bitcoin::Network::Testnet4 | bitcoin::Network::Signet => {
-                Some(Chain::Testnet)
-            }
+            bitcoin::Network::Testnet => Some(Chain::Testnet),
+            bitcoin::Network::Testnet4 | bitcoin::Network::Signet => None,
             bitcoin::Network::Regtest => None,
         }
     }

@@ -247,6 +247,22 @@ fn cpv_matches(
     None
 }
 
+/// Kani proof for the CPV reach. It runs under `cargo kani`, never under
+/// `cargo test`.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// R6: the oldest CPV sample never sits above the tag that names it.
+    #[kani::proof]
+    fn an_oldest_checkpoint_never_passes_its_tag() {
+        let bn: u32 = kani::any();
+        if let Some(height) = oldest_checkpoint(bn) {
+            assert!(height <= u64::from(bn));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{HeaderRef, oldest_checkpoint, score};

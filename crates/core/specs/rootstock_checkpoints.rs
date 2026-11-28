@@ -47,13 +47,13 @@ fn mine(prev: BlockHash, time: u32, tag: u32) -> BitcoinHeader {
 
 const TAIL_START: u64 = 2016;
 
-/// A regtest chain with a finalized tail `[2016, 3932]`: spine at 0 and 2016,
-/// then easy headers up to 4032.
+/// A regtest chain with a finalized tail `[2016, 3932]`: trusted checkpoints
+/// at 0 and 2016, then easy headers up to 4032.
 fn btc_with_tail() -> Core {
     let g0 = mine(BlockHash::all_zeros(), BASE_TIME, 0);
     let g2016 = mine(g0.block_hash(), BASE_TIME + 1, 1);
     let core =
-        Core::new(Config::in_memory(Network::Regtest).with_anchor(&[(0, g0), (2016, g2016)]))
+        Core::new(Config::in_memory(Network::Regtest).with_checkpoints(&[(0, g0), (2016, g2016)]))
             .expect("in-memory store");
 
     let mut cur = g2016;
@@ -62,8 +62,8 @@ fn btc_with_tail() -> Core {
         cur = mine(cur.block_hash(), BASE_TIME + 2 + i, 0);
         run.push(cur);
     }
-    core.connect_headers(&run, u64::from(BASE_TIME) + 1 + 1_200_000)
-        .expect("connect");
+    core.submit_bitcoin_headers(&run, u64::from(BASE_TIME) + 1 + 1_200_000)
+        .expect("submit");
     core
 }
 
@@ -166,7 +166,7 @@ fn rsk_fixture() -> &'static RskFixture {
     static FIXTURE: OnceLock<RskFixture> = OnceLock::new();
     FIXTURE.get_or_init(|| {
         let core = btc_with_tail();
-        let mark = core.finalized_height().expect("read").expect("seeded");
+        let mark = core.finalized_height().expect("read").expect("initialized");
         let tail_start = core
             .finalized_checkpoint()
             .expect("read")
@@ -433,7 +433,7 @@ impl StateMachineTest for RskMachine {
                 let entry = fixture.entries[*index].to_entry();
                 sut.core.apply(Action::ProposeCheckpoint { entry: &entry })
             }
-            RskTransition::Attempt => sut.core.apply(Action::ConnectRskHeaders { entries: &[] }),
+            RskTransition::Attempt => sut.core.apply(Action::SubmitRskHeaders { entries: &[] }),
             RskTransition::Sync(index) => sut.core.apply(Action::SetRskSyncTip {
                 hash: B256::from(fixture.entries[*index].hash()),
             }),
@@ -457,19 +457,19 @@ impl StateMachineTest for RskMachine {
             (
                 RskPrediction::Attempt(None),
                 RskTransition::Attempt,
-                Ok(Outcome::RskConnected(outcome)),
+                Ok(Outcome::RskSubmitted(outcome)),
             ) => {
                 // R8: an attempt is read-only.
-                assert_eq!(outcome.connected, 0);
+                assert_eq!(outcome.accepted, 0);
                 assert!(outcome.checkpoint.is_none(), "model expected no checkpoint");
                 assert_eq!(before, after, "an attempt mutated state");
             }
             (
                 RskPrediction::Attempt(Some(expected)),
                 RskTransition::Attempt,
-                Ok(Outcome::RskConnected(outcome)),
+                Ok(Outcome::RskSubmitted(outcome)),
             ) => {
-                assert_eq!(outcome.connected, 0);
+                assert_eq!(outcome.accepted, 0);
                 assert_eq!(
                     outcome.checkpoint,
                     Some(EphemeralChainCheckpoint {

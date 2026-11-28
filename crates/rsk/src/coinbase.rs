@@ -641,7 +641,7 @@ mod tests {
             }
             header.nonce = header.nonce.wrapping_add(1);
         }
-        core.connect_headers(&[header], genesis.time as u64 + 100)
+        core.submit_bitcoin_headers(&[header], genesis.time as u64 + 100)
             .unwrap();
 
         let block = Block {

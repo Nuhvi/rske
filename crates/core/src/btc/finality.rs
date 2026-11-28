@@ -16,9 +16,9 @@
 //! below that mark: [`is_checkpoint`]. The mark itself may be *any* height — it
 //! is a reorg depth, not a boundary — and the newest checkpoint is simply the
 //! last period start the mark has reached. The store's `btc_checkpoints` table
-//! is the broader *boundary ladder* — every period start, settled or not —
-//! which is what makes the whole chain's work computable from the spine; only
-//! the part of it at or below the mark is a checkpoint.
+//! is the checkpoint table — every period start, settled or not — which is what
+//! makes the whole chain's work computable; only the part of it at or below the
+//! mark is a checkpoint.
 //!
 //! ## Network-partition safety
 //!
@@ -60,11 +60,12 @@
 //!
 //! ## The anchor is the mark
 //!
-//! The anchor is the finality mark itself, not the compiled-in spine tip. Any
-//! history the node already trusts anchors the next measurement, so a node that
-//! has synced before measures from its own finalized chain, and each advance
-//! re-anchors. The compiled-in spine is the anchor only for a first-ever sync:
-//! it seeds the mark.
+//! The anchor is the finality mark itself, not the tip of the compiled-in
+//! trusted checkpoints. Any history the node already trusts anchors the next
+//! measurement, so a node that has synced before measures from its own
+//! finalized chain, and each advance re-anchors. The compiled-in trusted
+//! checkpoints are the anchor only for a first-ever sync: they set the initial
+//! mark.
 //!
 //! ## The clock
 //!
@@ -129,8 +130,10 @@ pub fn is_checkpoint(height: u64) -> bool {
 /// On mainnet the requirement is the estimated work the network did since the
 /// anchor — the bottom of the price law — floored by the coinbase-maturity
 /// window. A genesis anchor fails closed (`U256::MAX`): the price law is
-/// undefined at the network's birth, so a genesis-only seed cannot price modern
-/// work. A store seeded only from genesis is a development path without the
+/// undefined at the network's birth, so a genesis-only checkpoint set cannot
+/// price modern
+/// work. A store initialized only from genesis is a development path without
+/// the
 /// guarantee.
 ///
 /// Every other network permits minimum-difficulty blocks, so elapsed time is not
@@ -196,9 +199,9 @@ fn estimated_hashrate(t: u64, genesis_time: u64) -> f64 {
     difficulty * (1u64 << 32) as f64 / TARGET_BLOCK_SECONDS as f64
 }
 
-/// Network-partition safety as seen from one connect: what the best chain
+/// Network-partition safety as seen from one submission: what the best chain
 /// carries above the anchor and what the rule demands. Reported on
-/// [`crate::ConnectOutcome`] so a driver can say *why* a boundary has not
+/// [`crate::SubmitBitcoinOutcome`] so a driver can say *why* a boundary has not
 /// settled yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FinalityStatus {
@@ -287,6 +290,50 @@ fn f64_to_u256(value: f64) -> U256 {
     U256::from(value as u128)
 }
 
+/// Kani proofs for the finality requirement. They run under `cargo kani`,
+/// never under `cargo test`.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// E6: outside mainnet the requirement is exactly the tip block's work.
+    /// The price law is a mainnet calibration, so the other networks fall
+    /// back.
+    #[kani::proof]
+    fn a_non_mainnet_requirement_is_the_tip_work() {
+        let tip = Work::from_be_bytes(kani::any());
+        let required = partition_safety_required(
+            Network::Testnet,
+            Work::from_be_bytes(kani::any()),
+            kani::any(),
+            kani::any(),
+            tip,
+            kani::any(),
+        );
+        assert_eq!(required, work_to_u256(tip));
+    }
+
+    /// E6: an anchor at or before genesis cannot price modern work, so the
+    /// rule fails closed at the maximum.
+    #[kani::proof]
+    fn a_genesis_anchor_fails_closed() {
+        let genesis: u64 = kani::any();
+        let anchor: u64 = kani::any();
+        kani::assume(anchor <= genesis);
+        // Concrete work values keep the symbolic state small; only the times
+        // vary.
+        let required = partition_safety_required(
+            Network::Bitcoin,
+            Work::from_be_bytes([0; 32]),
+            anchor,
+            genesis,
+            Work::from_be_bytes([1; 32]),
+            0,
+        );
+        assert_eq!(required, U256::MAX);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,13 +407,14 @@ mod tests {
         );
     }
 
-    /// A month after the shipped spine tip the requirement is a few thousand
+    /// A month after the shipped trusted checkpoint tip the requirement is a few
+    /// thousand
     /// blocks — well below the `T/600` age term, because the bottom law prices
     /// the network below its realised work.
     #[test]
     fn a_modern_anchor_is_priced_below_its_age() {
-        let spine = crate::btc::checkpoints::parse().expect("embedded spine parses");
-        let (_, header) = *spine.last().expect("non-empty spine");
+        let checkpoints = crate::btc::checkpoints::parse().expect("embedded checkpoints parse");
+        let (_, header) = *checkpoints.last().expect("non-empty checkpoints");
         let w0 = header.target().to_work();
         let t0 = header.time as u64;
         let now = t0 + 31 * 86_400;
@@ -406,7 +454,7 @@ mod tests {
         let anchor = work_from_bits(0x207f_ffff);
         let tip = work_from_bits(0x1d00_ffff);
         let t0 = 1_600_000_000;
-        for network in [Network::Testnet, Network::Testnet4, Network::Regtest] {
+        for network in [Network::Testnet, Network::Regtest] {
             assert_eq!(
                 partition_safety_required(network, anchor, t0, GENESIS, tip, t0 + 30 * 86_400),
                 work_to_u256(tip)

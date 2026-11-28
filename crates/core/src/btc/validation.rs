@@ -27,7 +27,6 @@
 //! - **Transaction / merkle validity** — not visible in a header; out of scope.
 //! - **Version rules** (BIP34/65/66/9) — height-activated and of no SPV value.
 
-use bitcoin::Network;
 use bitcoin::block::Header as BitcoinHeader;
 use bitcoin::consensus::Params;
 use bitcoin::pow::{CompactTarget, Target};
@@ -51,7 +50,12 @@ pub fn target_in_range(bits: CompactTarget, params: &Params) -> bool {
     if size > 34 || (mantissa > 0xff && size > 33) || (mantissa > 0xffff && size > 32) {
         return false;
     }
-    Target::from_compact(bits) <= params.max_attainable_target
+    let target = Target::from_compact(bits);
+    // A nonzero mantissa can truncate to zero, for example `0x01000001`.
+    if target == Target::ZERO {
+        return false;
+    }
+    target <= params.max_attainable_target
 }
 
 /// The maximum time a header may lead the caller's clock, in seconds.
@@ -67,11 +71,11 @@ pub const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
 /// spacing after its parent must carry the proof-of-work limit, and any other
 /// header expects the bits of the last non-minimum-difficulty block in the
 /// period (see [`last_normal_bits`](crate::btc)). At a period boundary the
-/// retarget runs; testnet4 starts from the period-start bits (BIP94), every
-/// other network from the parent's, and regtest keeps the parent's.
+/// retarget runs from the parent's bits; regtest keeps the parent's.
 ///
 /// Returns `None` at a boundary without a period-start header. The connect path
-/// treats that as an internal error: a seed at a period boundary makes it
+/// treats that as an internal error: a trusted checkpoint at a period
+/// boundary makes it
 /// unreachable.
 pub fn expected_bits(
     height: u64,
@@ -98,14 +102,11 @@ pub fn expected_bits(
         return Some(parent.bits);
     }
     let first = period_start?;
-    let last_bits = if params.network == Network::Testnet4 {
-        first.bits
-    } else {
-        parent.bits
-    };
     let timespan = u64::from(parent.time).saturating_sub(u64::from(first.time));
     Some(CompactTarget::from_next_work_required(
-        last_bits, timespan, params,
+        parent.bits,
+        timespan,
+        params,
     ))
 }
 
@@ -115,6 +116,86 @@ pub fn expected_bits(
 pub fn median_time_past(mut times: [u32; MEDIAN_TIME_PAST]) -> u32 {
     times.sort_unstable();
     times[MEDIAN_TIME_PAST / 2]
+}
+
+/// Kani proofs for the target rules. They run under `cargo kani`, never under
+/// `cargo test`.
+///
+/// There is no proof of [`median_time_past`]: it sorts eleven elements, and
+/// `sort_unstable` needs a very deep unwind in CBMC. `hdr_07` pins the rule at
+/// its boundaries instead.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+    use bitcoin::Network;
+    use bitcoin::block::Version;
+    use bitcoin::hashes::Hash as _;
+
+    /// A header with the fields that the rule reads set by the caller.
+    fn header(bits: u32, time: u32, nonce: u32) -> BitcoinHeader {
+        BitcoinHeader {
+            version: Version::ONE,
+            prev_blockhash: bitcoin::block::BlockHash::all_zeros(),
+            merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+            time,
+            bits: CompactTarget::from_consensus(bits),
+            nonce,
+        }
+    }
+
+    /// HDR-02: the range check never panics on any 32-bit compact target.
+    #[kani::proof]
+    fn target_in_range_is_total() {
+        let raw: u32 = kani::any();
+        let _ = target_in_range(
+            CompactTarget::from_consensus(raw),
+            &Params::new(Network::Bitcoin),
+        );
+    }
+
+    /// HDR-02: a negative mantissa is always out of range, whatever the
+    /// exponent.
+    #[kani::proof]
+    fn target_range_rejects_a_negative_mantissa() {
+        let exponent: u8 = kani::any();
+        let mantissa: u32 = kani::any();
+        // Keep the sign bit of the mantissa, so the decoder must reject it.
+        let raw = u32::from(exponent) << 24 | (mantissa | 0x0080_0000) & 0x00ff_ffff;
+        assert!(!target_in_range(
+            CompactTarget::from_consensus(raw),
+            &Params::new(Network::Bitcoin),
+        ));
+    }
+
+    /// HDR-04: on mainnet, inside a period, the child must carry the parent's
+    /// bits, for every height that is not a period boundary.
+    #[kani::proof]
+    fn a_mainnet_header_inside_a_period_keeps_the_parent_bits() {
+        let height: u64 = kani::any();
+        kani::assume(!height.is_multiple_of(DIFFICULTY_PERIOD));
+        let parent = header(kani::any(), kani::any(), kani::any());
+        let params = Params::new(Network::Bitcoin);
+        assert!(!params.allow_min_difficulty_blocks);
+        assert_eq!(
+            expected_bits(height, kani::any(), &parent, None, parent.bits, &params),
+            Some(parent.bits)
+        );
+    }
+
+    /// HDR-06: a network that does not retarget keeps the parent's bits at a
+    /// period boundary.
+    #[kani::proof]
+    fn a_network_without_retargeting_keeps_the_parent_bits_at_a_boundary() {
+        let height: u64 = kani::any();
+        kani::assume(height.is_multiple_of(DIFFICULTY_PERIOD));
+        let parent = header(kani::any(), kani::any(), kani::any());
+        let params = Params::new(Network::Regtest);
+        assert!(params.no_pow_retargeting);
+        assert_eq!(
+            expected_bits(height, kani::any(), &parent, None, parent.bits, &params),
+            Some(parent.bits)
+        );
+    }
 }
 
 #[cfg(test)]
@@ -211,36 +292,6 @@ mod tests {
         );
     }
 
-    /// Testnet4 (BIP94) starts the retarget from the period-start bits; testnet3
-    /// starts from the parent's.
-    #[test]
-    fn testnet4_takes_the_retarget_from_the_period_start() {
-        let first = header_with(1_600_000_000, 0x1d00_ffff);
-        let parent = header_with(1_600_000_000 + 1_209_600, 0x1c00_ffff);
-        let testnet3 = Params::new(Network::Testnet);
-        let testnet4 = Params::new(Network::Testnet4);
-        let e3 = expected_bits(
-            DIFFICULTY_PERIOD,
-            parent.time + 1,
-            &parent,
-            Some(&first),
-            parent.bits,
-            &testnet3,
-        );
-        let e4 = expected_bits(
-            DIFFICULTY_PERIOD,
-            parent.time + 1,
-            &parent,
-            Some(&first),
-            parent.bits,
-            &testnet4,
-        );
-        // A full timespan makes the retarget a no-op: the starting bits survive.
-        assert_eq!(e3, Some(parent.bits));
-        assert_eq!(e4, Some(first.bits));
-        assert_ne!(e3, e4);
-    }
-
     /// Regtest never retargets, so a boundary keeps the parent's bits.
     #[test]
     fn regtest_keeps_the_parent_bits() {
@@ -295,6 +346,11 @@ mod tests {
         // A zero mantissa is not a target.
         assert!(!target_in_range(
             CompactTarget::from_consensus(0x1d00_0000),
+            &params
+        ));
+        // A nonzero mantissa that truncates to zero is not a target either.
+        assert!(!target_in_range(
+            CompactTarget::from_consensus(0x0100_0001),
             &params
         ));
         // An exponent past the 256-bit range overflows.

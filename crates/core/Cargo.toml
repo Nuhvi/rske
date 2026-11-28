@@ -16,7 +16,12 @@ thiserror = "2.0.18"
 [lints.clippy]
 unwrap_used = "deny"
 
+[lints.rust]
+# `cfg(kani)` gates the proof module; rustc does not know it by default.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
 [dev-dependencies]
+bolero = "0.13"
 eyre = "0.6"
 proptest = "1"
 # 0.9 is source-identical but requires proptest 1.12; 0.8 keeps the current 1.11.
