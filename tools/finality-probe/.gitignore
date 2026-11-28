@@ -1,0 +1,5 @@
+cache/
+cache-cold/
+__pycache__/
+.three-designs.*
+three-designs.text.json
